@@ -10,8 +10,72 @@
   "categories": ["Other"],
   "extensionKind": ["workspace"],
   "main": "./out/extension.js",
-  "activationEvents": [],
-  "contributes": {},
+  "activationEvents": ["onView:tmuxTerminals.list"],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "tmuxTerminals",
+          "title": "我的终端",
+          "icon": "resources/terminal.svg"
+        }
+      ]
+    },
+    "views": {
+      "tmuxTerminals": [
+        {
+          "id": "tmuxTerminals.list",
+          "name": "终端清单"
+        }
+      ]
+    },
+    "commands": [
+      { "command": "tmuxTerminals.open", "title": "打开终端", "icon": "$(terminal)" },
+      { "command": "tmuxTerminals.add", "title": "新建终端条目", "icon": "$(add)" },
+      { "command": "tmuxTerminals.edit", "title": "编辑", "icon": "$(edit)" },
+      { "command": "tmuxTerminals.duplicate", "title": "复制", "icon": "$(copy)" },
+      { "command": "tmuxTerminals.delete", "title": "删除条目", "icon": "$(trash)" },
+      { "command": "tmuxTerminals.killSession", "title": "杀掉远端 tmux 会话", "icon": "$(stop-circle)" },
+      { "command": "tmuxTerminals.toggleAutoRestore", "title": "切换「参与全部恢复」", "icon": "$(check)" },
+      { "command": "tmuxTerminals.restoreAll", "title": "全部恢复", "icon": "$(history)" },
+      { "command": "tmuxTerminals.refresh", "title": "刷新状态", "icon": "$(refresh)" }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "tmuxTerminals.restoreAll", "when": "view == tmuxTerminals.list", "group": "navigation@1" },
+        { "command": "tmuxTerminals.add", "when": "view == tmuxTerminals.list", "group": "navigation@2" },
+        { "command": "tmuxTerminals.refresh", "when": "view == tmuxTerminals.list", "group": "navigation@3" }
+      ],
+      "view/item/context": [
+        { "command": "tmuxTerminals.open", "when": "view == tmuxTerminals.list", "group": "inline@1" },
+        { "command": "tmuxTerminals.killSession", "when": "view == tmuxTerminals.list && viewItem == aliveSession", "group": "1_kill@1" },
+        { "command": "tmuxTerminals.edit", "when": "view == tmuxTerminals.list", "group": "2_edit@1" },
+        { "command": "tmuxTerminals.duplicate", "when": "view == tmuxTerminals.list", "group": "2_edit@2" },
+        { "command": "tmuxTerminals.toggleAutoRestore", "when": "view == tmuxTerminals.list", "group": "2_edit@3" },
+        { "command": "tmuxTerminals.delete", "when": "view == tmuxTerminals.list", "group": "3_danger@1" }
+      ]
+    },
+    "configuration": {
+      "title": "Tmux Terminals",
+      "properties": {
+        "tmuxTerminals.pollInterval": {
+          "type": "number",
+          "default": 10000,
+          "markdownDescription": "存活状态轮询间隔（毫秒）。设为 `0` 关闭轮询。"
+        },
+        "tmuxTerminals.tmuxPath": {
+          "type": "string",
+          "default": "tmux",
+          "markdownDescription": "tmux 可执行文件路径。不在 PATH 里时填绝对路径。"
+        },
+        "tmuxTerminals.storagePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "条目清单文件路径。留空则使用扩展的远端存储目录。重装扩展会清空该目录，需要长期保留时请指定一个固定路径。"
+        }
+      }
+    }
+  },
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
