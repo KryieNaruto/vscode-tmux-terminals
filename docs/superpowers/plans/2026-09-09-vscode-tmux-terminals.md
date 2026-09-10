@@ -62,7 +62,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "test": "npm run compile && mocha out/test/**/*.test.js",
+    "test": "npm run compile && mocha \"out/test/**/*.test.js\"",
     "package": "vsce package"
   },
   "devDependencies": {
@@ -821,7 +821,7 @@ git commit -m "feat: 条目清单存储（原子写、损坏容错）"
     - `async sendEnter(name: string): Promise<void>`
     - `async waitForShell(name: string, timeoutMs: number): Promise<boolean>`
 
-**说明：** 本任务是唯一带「真跑 tmux」集成测试的，因为这里正是坑最多的地方（精确匹配、pane 目标、静默空输出）。测试会建/删带 `zztest-` 前缀的临时会话，不碰用户既有会话。
+**说明：** 本任务是唯一带「真跑 tmux」集成测试的，因为这里正是坑最多的地方（精确匹配、pane 目标、静默空输出）。测试会建/删带 `tmuxterm-` 前缀的临时会话，不碰用户既有会话。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -835,8 +835,9 @@ import { TmuxClient } from '../src/tmuxClient';
 
 const run = promisify(execFile);
 const client = new TmuxClient('tmux');
-const A = 'zztest-alpha';
-const B = 'zztest-alphabeta'; // 用来验证 A 不会前缀匹配到 B
+// 会话名遵循 tmuxterm-<id> 前缀（见 core/tmux.ts 的 SESSION_PREFIX）
+const A = 'tmuxterm-aaaa1111';
+const B = 'tmuxterm-aaaa1111bbbb'; // 用来验证 A 不会前缀匹配到 B
 
 async function cleanup() {
   for (const n of [A, B]) {
@@ -847,7 +848,11 @@ async function cleanup() {
 describe('TmuxClient（集成，需要本机有 tmux）', function () {
   this.timeout(20000);
 
-  before(async () => {
+  // 每个用例前清场。原计划只有套件级 before/after，多个用例各自
+  // `tmux new-session -s A` 却不清理，第二个建 A 的用例会撞上
+  // `duplicate session` 而失败 —— 实测 9 个用例挂掉，含最关键的
+  //「前缀不误杀」回归项。每个用例必须自己从干净状态出发。
+  beforeEach(async () => {
     await cleanup();
   });
 
@@ -909,7 +914,7 @@ describe('TmuxClient（集成，需要本机有 tmux）', function () {
 
   it('waitForShell 对不存在的会话在超时后返回 false', async () => {
     const t0 = Date.now();
-    assert.strictEqual(await client.waitForShell('zztest-does-not-exist', 600), false);
+    assert.strictEqual(await client.waitForShell('tmuxterm-deadbeef', 600), false);
     assert.ok(Date.now() - t0 >= 500, '应真的等到超时');
   });
 
@@ -942,7 +947,7 @@ describe('TmuxClient（集成，需要本机有 tmux）', function () {
   });
 
   it('killSession 对不存在的会话不抛错', async () => {
-    await client.killSession('zztest-never-existed');
+    await client.killSession('tmuxterm-cafebabe');
   });
 });
 ```
@@ -1072,10 +1077,10 @@ export class TmuxClient {
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `npm test`
-Expected: 全部 PASS。确认结束时 `tmux ls` 里没有 `zztest-` 残留：
+Expected: 全部 PASS。确认结束时 `tmux ls` 里没有 `tmuxterm-` 残留：
 
 ```bash
-tmux ls -F '#{session_name}' | grep -c zztest || echo "无残留 ✓"
+tmux ls -F '#{session_name}' | grep -c tmuxterm || echo "无残留 ✓"
 ```
 
 - [ ] **Step 5: 提交**
