@@ -9,7 +9,7 @@
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],
   "extensionKind": ["workspace"],
-  "main": "./out/extension.js",
+  "main": "./out/src/extension.js",
   "activationEvents": ["onView:tmuxTerminals.list"],
   "contributes": {
     "viewsContainers": {
