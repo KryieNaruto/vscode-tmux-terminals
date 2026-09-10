@@ -68,10 +68,7 @@ describe('package.json 清单一致性', () => {
   it('注册的命令都在 package.json 里声明了', () => {
     const declared = new Set((contributes.commands ?? []).map((c: { command: string }) => c.command));
     const registered = [...EXTENSION_SRC.matchAll(/reg\('([^']+)'/g)].map((m) => m[1]);
-    // batchToggle 是内部命令：只由批量面板的 TreeItem.command 调用。
-    // 注册是为了有 handler；故意不声明，以免它出现在命令面板徒增噪音。
-    const internalOnly = new Set(['tmuxTerminals.batchToggle']);
-    const extra = registered.filter((c) => !declared.has(c) && !internalOnly.has(c));
+    const extra = registered.filter((c) => !declared.has(c));
     assert.deepStrictEqual(extra, [], `注册了但未声明的命令（命令面板里看不到）: ${extra}`);
   });
 

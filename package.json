@@ -45,7 +45,8 @@
       { "command": "tmuxTerminals.batchSetCcr", "title": "设为中转", "icon": "$(cloud)" },
       { "command": "tmuxTerminals.batchSetDirect", "title": "设为直连", "icon": "$(plug)" },
       { "command": "tmuxTerminals.batchSetModel", "title": "批量设置模型…", "icon": "$(chip)" },
-      { "command": "tmuxTerminals.batchClear", "title": "清空选择", "icon": "$(clear-all)" }
+      { "command": "tmuxTerminals.batchClear", "title": "清空选择", "icon": "$(clear-all)" },
+      { "command": "tmuxTerminals.batchToggle", "title": "切换选中（内部）" }
     ],
     "menus": {
       "view/title": [
@@ -66,6 +67,9 @@
         { "command": "tmuxTerminals.duplicate", "when": "view == tmuxTerminals.list", "group": "2_edit@2" },
         { "command": "tmuxTerminals.toggleAutoRestore", "when": "view == tmuxTerminals.list", "group": "2_edit@3" },
         { "command": "tmuxTerminals.delete", "when": "view == tmuxTerminals.list", "group": "3_danger@1" }
+      ],
+      "commandPalette": [
+        { "command": "tmuxTerminals.batchToggle", "when": "false" }
       ]
     },
     "configuration": {
