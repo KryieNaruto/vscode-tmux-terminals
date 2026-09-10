@@ -24,6 +24,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const view = vscode.window.createTreeView('tmuxTerminals.list', {
     treeDataProvider: provider,
+    dragAndDropController: provider,
   });
   context.subscriptions.push(view);
 
