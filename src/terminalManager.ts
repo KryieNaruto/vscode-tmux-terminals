@@ -18,7 +18,8 @@ import {
   NEW_CONVERSATION_LABEL,
   belongsToCwd,
   candidatesForCwd,
-  formatCandidate,
+  formatCandidateWithOwner,
+  ownersOf,
 } from './core/conversation';
 import { isClaudeCommand, resumeFailed } from './core/claude';
 import { readProfileConfig } from './claudeConfig';
@@ -134,7 +135,7 @@ export class TerminalManager {
   private async pickConversation(
     entry: TerminalEntry,
     title: string,
-  ): Promise<{ total: number; picked?: ConversationCandidate; startNew: boolean }> {
+  ): Promise<{ total: number; picked?: ConversationCandidate; owner?: string; startNew: boolean }> {
     const cwd = this.cwdFor(entry);
     return this.enqueuePick(async () => {
       const candidates = candidatesForCwd(await listConversations(this.home()), cwd);
@@ -145,20 +146,16 @@ export class TerminalManager {
 
       // 已被其它条目绑走的对话要标注出来：实测用户 4 条条目共用同一个 cwd，
       // 选重了会让两条会话接进同一条对话，两边同时写同一个 .jsonl。
-      const owners = new Map<string, string>();
-      for (const e of await this.store.load()) {
-        if (e.id !== entry.id && e.conversationId !== undefined && e.conversationId.length > 0) {
-          owners.set(e.conversationId, e.name);
-        }
-      }
+      const owners = ownersOf(await this.store.load(), entry.id);
 
       // 末尾固定跟一项「＋ 新建一条对话」：新对话只能由用户主动选出来
       const newItem = { label: NEW_CONVERSATION_LABEL, candidate: undefined };
       const convoItems = candidates.map((c) => {
         const owner = owners.get(c.id);
         return {
-          label: owner === undefined ? formatCandidate(c) : `${formatCandidate(c)} · 已绑给「${owner}」`,
+          label: formatCandidateWithOwner(c, owner),
           candidate: c,
+          ...(owner !== undefined ? { owner } : {}),
         };
       });
       const pick = await vscode.window.showQuickPick([...convoItems, newItem], {
@@ -168,9 +165,36 @@ export class TerminalManager {
       return {
         total: candidates.length,
         startNew: pick === newItem,
-        ...(pick && pick.candidate ? { picked: pick.candidate } : {}),
+        ...(pick && pick.candidate
+          ? { picked: pick.candidate, ...(pick.owner !== undefined ? { owner: pick.owner } : {}) }
+          : {}),
       };
     });
+  }
+
+  /**
+   * 选中的对话**已经被别的条目绑走**时，弹一次模态确认。
+   *
+   * 标签上的「已绑给「X」」不够：实测这个用户有 4 条条目共用同一个 cwd，
+   * 列表里十几条候选长得都很像，手滑选中别人的是很现实的事 —— 而后果是
+   * 两个 claude 进程同时写同一个 `.jsonl`，与「取消→`--continue`」是同一类
+   * 数据损坏。所以**必须显式确认**才继续。
+   *
+   * 返回 true = 用户确认，继续；false = 放弃（与按 Esc 同侧：什么都不启动）。
+   */
+  private async confirmSharedConversation(
+    entry: TerminalEntry,
+    owner: string | undefined,
+  ): Promise<boolean> {
+    if (owner === undefined) return true;
+    const pick = await vscode.window.showWarningMessage(
+      `该对话已绑给「${owner}」。\n` +
+      `两个终端同时写入同一条对话记录可能损坏它。\n` +
+      `确定让「${entry.name}」也接这条吗？`,
+      { modal: true },
+      '仍然接这条',
+    );
+    return pick === '仍然接这条';
   }
 
   /**
@@ -196,7 +220,15 @@ export class TerminalManager {
     if (bound !== undefined && bound.length > 0) {
       const cwds = await findConversations(this.home(), bound);
       if (cwds.length === 0) {
-        // 还没被创建过（用 `+` 新建的条目就是这种）→ 把它建出来
+        // 还没被创建过 → 把它建出来。两种来源都走这里：
+        //  - 用 `+`/复制新建的条目第一次启动（正常）；
+        //  - 那条 .jsonl 被**外部删掉**了（手动 rm、清理工具）。
+        // 两者在数据上不可区分，但**必须出声**：后者如果静默，用户只会觉得
+        // 「我的对话又没了」。文案对两种情况都要成立。
+        void vscode.window.showInformationMessage(
+          `「${entry.name}」绑定的对话还没有记录，本次新开一条（绑定保持不变）。` +
+          `首次启动时这属正常；若这条对话本应存在，说明它的记录已被删除。`,
+        );
         return { kind: 'new', conversationId: bound };
       }
       if (cwds.some((c) => belongsToCwd(c, cwd))) {
@@ -211,7 +243,7 @@ export class TerminalManager {
       return undefined;
     }
 
-    const { total, picked, startNew } = await this.pickConversation(
+    const { total, picked, owner, startNew } = await this.pickConversation(
       entry, `「${entry.name}」接回哪条对话？`,
     );
     if (total === 0) {
@@ -232,6 +264,15 @@ export class TerminalManager {
       );
       return undefined;
     }
+    // 选中的是**别人已经绑着**的对话 → 必须显式确认，否则两个 claude 会
+    // 同时写同一条 .jsonl。取消与 Esc 同侧：什么都不启动。
+    if (!(await this.confirmSharedConversation(entry, owner))) {
+      void vscode.window.showInformationMessage(
+        `「${entry.name}」未接回对话（该对话已绑给「${owner}」）。` +
+        `右键该条目选「选择要接回的对话…」可另选一条。`,
+      );
+      return undefined;
+    }
 
     await this.store.update(entry.id, { conversationId: picked.id });
     return { kind: 'resume', conversationId: picked.id };
@@ -244,11 +285,19 @@ export class TerminalManager {
    * 对的，不必也不该去打断正在跑的 claude。
    */
   async bindConversationInteractive(entry: TerminalEntry): Promise<void> {
-    const { total, picked, startNew } = await this.pickConversation(
+    const { total, picked, owner, startNew } = await this.pickConversation(
       entry, `为「${entry.name}」选择要接回的对话`,
     );
 
     if (picked !== undefined) {
+      // 绑到别人的对话上同样会造成两个 claude 写同一条记录 —— 显式命令也
+      // 不能例外，一样要确认。
+      if (!(await this.confirmSharedConversation(entry, owner))) {
+        void vscode.window.showInformationMessage(
+          `「${entry.name}」未改绑定（该对话已绑给「${owner}」）。`,
+        );
+        return;
+      }
       await this.store.update(entry.id, { conversationId: picked.id });
       void vscode.window.showInformationMessage(
         `「${entry.name}」已绑定对话 ${picked.id.slice(0, 8)}…，下次启动 claude 时会接回它。`,

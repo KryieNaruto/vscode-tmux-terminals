@@ -149,3 +149,44 @@ export function formatCandidate(c: ConversationCandidate): string {
  * 取消是没有结论，不是「给我开一条新的」。
  */
 export const NEW_CONVERSATION_LABEL = '＋ 新建一条对话（不复用任何历史）';
+
+/** 一条「条目 ↔ 对话」绑定关系的最小视角（只取判归属要用的字段）。 */
+export interface BindingView {
+  id: string;
+  name: string;
+  conversationId?: string;
+}
+
+/**
+ * 收集「这个对话 id 已经被哪个条目绑走了」。
+ *
+ * 用途：在候选列表里把别人的对话标出来，并在选中时要求二次确认 ——
+ * 两个终端接同一条对话会让两个 claude 进程同时写同一个 `.jsonl`。
+ *
+ * - **跳过自己**：自己当然绑着这条，不是冲突。
+ * - 跳过未绑定的（undefined / 空串）。
+ * - 同一个 id 被多条条目绑着时取**先出现**的那个：顺序稳定，不随列表
+ *   抖动而变化。
+ */
+export function ownersOf(
+  entries: readonly BindingView[],
+  selfId: string,
+): Map<string, string> {
+  const owners = new Map<string, string>();
+  for (const e of entries) {
+    if (e.id === selfId) continue;
+    const id = e.conversationId;
+    if (id === undefined || id.length === 0) continue;
+    if (!owners.has(id)) owners.set(id, e.name);
+  }
+  return owners;
+}
+
+/**
+ * 选择框里的一行：普通候选就是 `formatCandidate`，已被别的条目绑走时
+ * 附上归属者 —— 让用户能看出「这是别人的」，而不是选完才知道。
+ */
+export function formatCandidateWithOwner(c: ConversationCandidate, owner?: string): string {
+  const base = formatCandidate(c);
+  return owner === undefined ? base : `${base} · 已绑给「${owner}」`;
+}
