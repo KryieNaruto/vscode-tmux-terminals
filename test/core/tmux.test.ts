@@ -1,5 +1,43 @@
 import * as assert from 'assert';
-import { sessionTarget, paneTarget, parseSessionList, shellQuote, isShellReady } from '../../src/core/tmux';
+import {
+  sessionTarget,
+  paneTarget,
+  parseSessionList,
+  shellQuote,
+  isShellReady,
+  sessionNameFor,
+  escapeSessionName,
+  SESSION_PREFIX,
+} from '../../src/core/tmux';
+
+describe('sessionNameFor / escapeSessionName', () => {
+  it('会话名由 id 派生并带固定前缀', () => {
+    assert.strictEqual(sessionNameFor('a1b2c3'), SESSION_PREFIX + 'a1b2c3');
+  });
+  it('派生出的名字通过格式守卫', () => {
+    assert.strictEqual(escapeSessionName(sessionNameFor('deadbeef1234')), true);
+  });
+  it('守卫拒绝含换行的名字（回归：会解析出幽灵会话）', () => {
+    assert.strictEqual(escapeSessionName('tmuxterm-a\nb'), false);
+  });
+  it('守卫拒绝含冒号/点号/纯数字的名字', () => {
+    assert.strictEqual(escapeSessionName('tmuxterm-a:b'), false);
+    assert.strictEqual(escapeSessionName('tmuxterm-a.b'), false);
+    assert.strictEqual(escapeSessionName('123'), false);
+  });
+  it('守卫拒绝没有前缀的名字', () => {
+    assert.strictEqual(escapeSessionName('paint-pc'), false);
+  });
+  it('关键：用户能起出含换行的显示名，但派生出的会话名不含换行', () => {
+    // 回归此前的 bug —— 显示名曾是会话名，tmux 允许换行，导致
+    // parseSessionList 把一个会话切成两行、凭空多出一个幽灵会话
+    const hostileDisplayName = 'evil\nghost';
+    const derived = sessionNameFor('abc123');
+    assert.strictEqual(hostileDisplayName.includes('\n'), true);
+    assert.strictEqual(derived.includes('\n'), false);
+    assert.deepStrictEqual(parseSessionList(derived + '\n'), [derived]);
+  });
+});
 
 describe('sessionTarget / paneTarget', () => {
   it('session 目标加 = 前缀强制精确匹配', () => {
