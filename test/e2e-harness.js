@@ -18,12 +18,15 @@
 const Module = require('module');
 const path = require('path');
 const fs = require('fs');
-const { execFile, spawn } = require('child_process');
+const { execFile } = require('child_process');
 const { promisify } = require('util');
 const run = promisify(execFile);
 
 // ---- 1. 注入 vscode stub ----
 const calls = { terminals: [], messages: [], warns: [], errors: [], literals: [], newSessions: [] };
+
+// 让某一节可以控制下一个 modal 弹窗的应答；默认 undefined（= 用户取消）。
+let modalAnswer;
 
 class TreeItem {
   constructor(label) { this.label = label; }
@@ -45,10 +48,10 @@ const vscodeStub = {
   ThemeColor,
   MarkdownString,
   window: {
-    // openEntry 的「按名复用守卫」会读 window.terminals。这里给一个空数组：
-    // 现有 1–4 节模拟的是「扩展宿主重启后 Map 已空、面板也没存活」的场景，
-    // 必须让守卫查不到已存面板，才能继续走「重新 attach」路径并断言安全闸门。
-    // 不要把 createTerminal 塞进这里 —— 那会改变现有各节的断言语义。
+    // openEntry 的「按名复用守卫」会读 window.terminals。它是可变数组：
+    // 某一节可往里塞「存活面板」再清空（见第 6 节）。默认空 —— 这样 1–4 节
+    // 模拟的「扩展宿主重启后 Map 已空、面板也没存活」场景里，守卫查不到
+    // 已存面板，继续走「重新 attach」路径并断言安全闸门。
     terminals: [],
     createTerminal(opts) {
       const t = {
@@ -56,15 +59,16 @@ const vscodeStub = {
         cwd: opts && opts.cwd,
         sent: [],
         shown: 0,
+        disposed: 0,
         show() { this.shown++; },
         sendText(text, addNewline) { this.sent.push({ text, addNewline }); },
-        dispose() {},
+        dispose() { this.disposed++; },
       };
       calls.terminals.push(t);
       return t;
     },
     onDidCloseTerminal() { return { dispose() {} }; },
-    showWarningMessage(m) { calls.warns.push(m); return Promise.resolve(undefined); },
+    showWarningMessage(m) { calls.warns.push(m); return Promise.resolve(modalAnswer); },
     showErrorMessage(m) { calls.errors.push(m); return Promise.resolve(undefined); },
     showInformationMessage(m) { calls.messages.push(m); return Promise.resolve(undefined); },
     showInputBox() { return Promise.resolve(undefined); },
@@ -111,7 +115,8 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
   const ID_A = 'e2e0000a';
   const ID_B = 'e2e0000ab';      // 与 A 互为前缀，验证互不干扰
   const ID_KILL = 'e2ekill0001';
-  const ALL = [ID_A, ID_B, ID_KILL];
+  const ID_REUSE = 'e2ereuse01';
+  const ALL = [ID_A, ID_B, ID_KILL, ID_REUSE];
   const store = {
     entries: [],
     async load() { return this.entries; },
@@ -197,37 +202,63 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
   chk('B 的创建没有把命令送进 A 会话', !calls.literals.some((l) => l.name === S(ID_A)),
     JSON.stringify(calls.literals));
 
-  console.log('\n=== 5. 杀会话：会话销毁且无残留客户端 ===');
+  console.log('\n=== 5. 杀会话编排：detach→kill→dispose→Map 清理 ===');
   {
+    const entryKill = { id: ID_KILL, name: 'KILL', cwd: '/tmp', profile: 'ccr', autoRestore: true, order: 0 };
     const s = S(ID_KILL);
-    await tmux.newSession(s, '/tmp');
 
-    // 起一个真实 pty 客户端附着，模拟 VS Code 终端里的 tmux attach
-    const client = spawn('script', ['-qec', `tmux attach -t =${s}`, '/dev/null'], {
-      stdio: 'ignore', detached: true,
-    });
-    await sleep(1500);
+    calls.terminals.length = 0;
+    await tmux.newSession(s, '/tmp');   // 先建真会话，openEntry 只 attach、不派发命令
+    await mgr.openEntry(entryKill);      // 把面板塞进 mgr 的内部 Map
+    const killTerm = calls.terminals[calls.terminals.length - 1];
+    chk('openEntry 建出了代表该会话的终端', !!killTerm && killTerm.name === 'KILL');
 
-    await tmux.detachClients(s);
-    await tmux.killSession(s);
-    await sleep(800);
+    // 记录 detach/kill 的真实调用顺序：先 push 名字，再委派给真实现。
+    // 这是「先摘客户端再杀」的关键判别断言——颠倒或漏掉 detach 都会失败。
+    const order = [];
+    const origDetach = tmux.detachClients.bind(tmux);
+    const origKill = tmux.killSession.bind(tmux);
+    tmux.detachClients = async (name) => { order.push('detachClients'); return origDetach(name); };
+    tmux.killSession = async (name) => { order.push('killSession'); return origKill(name); };
 
-    chk('会话必须已被杀掉', (await tmux.hasSession(s)) === false);
+    modalAnswer = '杀掉';
+    await mgr.killSession(entryKill);
+    modalAnswer = undefined;
 
-    // list-clients 在「无 server / 无客户端」时退出码非 0，视为「无客户端」
-    let clientsOut = '';
-    try {
-      ({ stdout: clientsOut } = await run('tmux', ['list-clients', '-F', '#{client_session}']));
-    } catch {
-      clientsOut = '';
-    }
-    chk('不应残留指向该会话的客户端', !clientsOut.includes(s), `实际：${clientsOut}`);
+    chk('顺序为 detach→kill（不可颠倒）',
+      JSON.stringify(order) === JSON.stringify(['detachClients', 'killSession']),
+      `实际顺序 ${JSON.stringify(order)}`);
+    chk('会话确实已被杀掉', (await tmux.hasSession(s)) === false);
+    chk('代表该会话的终端被 dispose', killTerm.disposed === 1, `实际 dispose ${killTerm.disposed} 次`);
 
-    // 清掉进程组，避免留下游离的 script / tmux attach
-    try { process.kill(-client.pid); } catch {}
+    // 行为式断言 Map 已清理：再点一次应新建终端，而不是复用旧 Map 里的面板。
+    calls.terminals.length = 0;
+    await mgr.openEntry(entryKill);
+    chk('Map 已清理：再次 openEntry 新建了终端', calls.terminals.length === 1,
+      `实际新终端数 ${calls.terminals.length}`);
   }
 
-  console.log('\n=== 6. 清理 ===');
+  console.log('\n=== 6. openEntry 复用守卫：Map 空但面板存活 ===');
+  {
+    const entryReuse = { id: ID_REUSE, name: 'REUSE', cwd: '/tmp', profile: 'ccr', autoRestore: true, order: 0 };
+
+    // 全新 manager（内部 Map 空），模拟扩展宿主重启；面板却仍存活在 window.terminals
+    const mgrReuse = new TerminalManager(store, tmux);
+    calls.terminals.length = 0;
+
+    const survivor = { name: 'REUSE', shown: 0, show() { this.shown++; }, dispose() {} };
+    vscodeStub.window.terminals.push(survivor);
+
+    await mgrReuse.openEntry(entryReuse);
+
+    chk('未新建终端（复用了存活面板）', calls.terminals.length === 0,
+      `实际新终端数 ${calls.terminals.length}`);
+    chk('对存活面板执行了 show()', survivor.shown === 1, `实际 show ${survivor.shown} 次`);
+
+    vscodeStub.window.terminals.length = 0;   // 清掉，避免污染清理节
+  }
+
+  console.log('\n=== 7. 清理 ===');
   await killAll(ALL);
   const left = (await tmux.listSessions()).filter((s) => s.startsWith('tmuxterm-e2e'));
   chk('无残留测试会话', left.length === 0, left.join(', '));
