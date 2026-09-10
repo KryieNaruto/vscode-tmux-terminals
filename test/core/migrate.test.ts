@@ -59,3 +59,26 @@ describe('migrateEntry', () => {
     assert.deepStrictEqual(migrateEntry(v2, 0), v2);
   });
 });
+
+describe('conversationId 迁移 —— 保留已有绑定，绝不编造', () => {
+  it('v2 条目带 conversationId → 原样保留（不能被迁移吞掉）', () => {
+    const id = '7af4c86a-ea5d-4f25-9d9c-8ba7e620a5a0';
+    const v2 = { id: 'a', name: 'n', cwd: '/t', profile: 'ccr', autoRestore: true, order: 1, conversationId: id };
+    assert.strictEqual(migrateEntry(v2, 0)?.conversationId, id);
+  });
+
+  it('★ v2 条目没有 conversationId → 保持 undefined（不猜、不编造）', () => {
+    const v2 = { id: 'a', name: 'n', cwd: '/t', profile: 'ccr', autoRestore: true, order: 1 };
+    assert.strictEqual(migrateEntry(v2, 0)?.conversationId, undefined);
+  });
+
+  it('v1 条目（本来就没有这个概念）→ undefined', () => {
+    assert.strictEqual(migrateEntry(v1({ commands: [] }), 0)?.conversationId, undefined);
+  });
+
+  it('非字符串 / 空串的 conversationId 视为未绑定（手改坏了不至于崩）', () => {
+    const base = { id: 'a', name: 'n', cwd: '/t', profile: 'ccr', autoRestore: true, order: 1 };
+    assert.strictEqual(migrateEntry({ ...base, conversationId: 42 }, 0)?.conversationId, undefined);
+    assert.strictEqual(migrateEntry({ ...base, conversationId: '' }, 0)?.conversationId, undefined);
+  });
+});

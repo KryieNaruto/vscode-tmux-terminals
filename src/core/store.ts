@@ -9,6 +9,17 @@ export function newId(): string {
   return crypto.randomBytes(6).toString('hex');
 }
 
+/**
+ * 生成一条新对话的 id（UUID v4）。
+ *
+ * 必须是**真 UUID**：它既是 `claude --session-id` 的参数，也会成为
+ * `~/.claude/projects/<目录>/<uuid>.jsonl` 的文件名，还是 `--resume` 的
+ * 唯一凭据。所以用 crypto.randomUUID 而不是自己拼，避免格式不符。
+ */
+export function newConversationId(): string {
+  return crypto.randomUUID();
+}
+
 export class EntryStore {
   constructor(
     private readonly filePath: string,

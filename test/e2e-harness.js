@@ -6,14 +6,16 @@
  * TerminalManager.openEntry 对着**真 tmux** 驱动起来，从而自动验证
  * 几条最核心的不变量：
  *
- *   1. 会话不存在 → 新建，并发送 profile 派生的启动命令
- *   2. 会话已存在 → 接回，**绝不发送任何命令**（本项目最重要的一条）
- *   3. 重复点击 → 复用已有终端，不新开
- *   4. 前缀相近的会话互不干扰
- *   5. 陈旧面板（宿主重启前留下的）不得被当成「已恢复」：会话已死要重建、
- *      0 附着要 attach；面板状态不明或有命令在跑时绝不往里打字
+ *   1. 会话不存在 → 新建，并发送与该条目**绑定**的那条对话的启动命令
+ *   2. 会话已存在且 claude 还在跑 → 只接回，**绝不发送任何命令**
+ *   3. 会话已死 / claude 已退出 → 接回**它自己那条**对话（--resume），
+ *      绝不新开一条把它顶掉
+ *   4. 陈旧面板不得被当成「已恢复」；状态不明的面板绝不往里打字
+ *   5. 前缀相近的会话互不干扰
  *
- * 只使用 `tmuxterm-e2e*` 前缀的会话，跑完必清，绝不碰用户已有会话。
+ * 隔离：**用假的 HOME**（/tmp/tmuxterm-e2e-home）驱动对话枚举，因此
+ * 全程不读也不写用户真实的 ~/.claude。会话只用 `tmuxterm-e2e*` 前缀，
+ * 跑完必清，绝不碰用户已有的会话。
  *
  * 用法：node test/e2e-harness.js
  */
@@ -22,15 +24,20 @@
 const Module = require('module');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const run = promisify(execFile);
 
 // ---- 1. 注入 vscode stub ----
-const calls = { terminals: [], messages: [], warns: [], errors: [], literals: [], newSessions: [] };
+const calls = {
+  terminals: [], messages: [], warns: [], errors: [], literals: [], newSessions: [], quickPicks: [],
+};
 
-// 让某一节可以控制下一个 modal 弹窗的应答；默认 undefined（= 用户取消）。
+// 让某一节可以控制下一个 modal / QuickPick 弹窗的应答；
+// 两者默认都是 undefined（= 用户取消）。
 let modalAnswer;
+let quickPickAnswer;
 
 class TreeItem {
   constructor(label) { this.label = label; }
@@ -43,15 +50,15 @@ class EventEmitter {
   fire(e) { for (const cb of [...this.listeners]) cb(e); }
   dispose() { this.listeners.length = 0; }
 }
+class ThemeIcon { constructor(id, color) { this.id = id; this.color = color; } }
+class ThemeColor { constructor(id) { this.id = id; } }
+class MarkdownString { constructor(v) { this.value = v; } }
 
 // shell integration 的「有命令开始/结束」事件。真实 VS Code（1.93+，本机
 // 已开启 shell integration）靠它回答「某个面板里在跑什么」——这是
 // TerminalManager 判断「能否安全复用这个面板」的唯一依据，必须能驱动。
 const shellExecutionStart = new EventEmitter();
 const shellExecutionEnd = new EventEmitter();
-class ThemeIcon { constructor(id, color) { this.id = id; this.color = color; } }
-class ThemeColor { constructor(id) { this.id = id; } }
-class MarkdownString { constructor(v) { this.value = v; } }
 
 const vscodeStub = {
   TreeItem,
@@ -61,10 +68,8 @@ const vscodeStub = {
   ThemeColor,
   MarkdownString,
   window: {
-    // openEntry 的「按名复用守卫」会读 window.terminals。它是可变数组：
-    // 某一节可往里塞「存活面板」再清空（见第 6 节）。默认空 —— 这样 1–4 节
-    // 模拟的「扩展宿主重启后 Map 已空、面板也没存活」场景里，守卫查不到
-    // 已存面板，继续走「重新 attach」路径并断言安全闸门。
+    // openEntry 的候选面板守卫会读 window.terminals。它是可变数组：
+    // 某一节可往里塞「陈旧面板」再清空（见第 10 节）。默认空。
     terminals: [],
     createTerminal(opts) {
       const t = {
@@ -90,7 +95,12 @@ const vscodeStub = {
     showErrorMessage(m) { calls.errors.push(m); return Promise.resolve(undefined); },
     showInformationMessage(m) { calls.messages.push(m); return Promise.resolve(undefined); },
     showInputBox() { return Promise.resolve(undefined); },
-    showQuickPick() { return Promise.resolve(undefined); },
+    showQuickPick(items, opts) {
+      calls.quickPicks.push({ items, opts });
+      return Promise.resolve(
+        typeof quickPickAnswer === 'function' ? quickPickAnswer(items, opts) : quickPickAnswer,
+      );
+    },
   },
   workspace: {
     getConfiguration() { return { get: (_k, d) => d }; },
@@ -110,6 +120,9 @@ require.cache['vscode-stub'] = { id: 'vscode-stub', filename: 'vscode-stub', loa
 // ---- 2. 加载被测代码 ----
 const ROOT = path.resolve(__dirname, '..');
 const { TerminalManager } = require(path.join(ROOT, 'out/src/terminalManager.js'));
+const { TmuxClient } = require(path.join(ROOT, 'out/src/tmuxClient.js'));
+const { listConversations } = require(path.join(ROOT, 'out/src/conversationFiles.js'));
+const { candidatesForCwd } = require(path.join(ROOT, 'out/src/core/conversation.js'));
 
 // ---- 3. 断言辅助 ----
 let fail = 0;
@@ -119,6 +132,25 @@ const chk = (label, ok, extra) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const S = (id) => `tmuxterm-${id}`;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * 假的 HOME。对话枚举读 `$HOME/.claude/projects/**`，用假 HOME 才能做到
+ * 「测试完全不碰用户真实的会话文件」—— 实测用户那儿有 292 个会话、404 MB。
+ */
+const HOME = '/tmp/tmuxterm-e2e-home';
+/** 干净 cwd：没有任何历史对话 —— 用来验证「无候选 → 开新对话并绑定」。 */
+const SCRATCH = '/tmp/tmuxterm-e2e-cwd';
+/** 有历史对话的 cwd —— 用来验证老条目的「选择要接回的对话」。 */
+const CONV_CWD = '/tmp/tmuxterm-e2e-convcwd';
+const EXISTING_CONV = '11111111-2222-3333-4444-555555555555';
+const PICKED_CONV = '99999999-8888-7777-6666-555555555555';
+
+/** 名为 claude 的假进程：pane 前台进程名就是 claude（cp 二进制，comm=文件名）。 */
+const BIN_DIR = '/tmp/tmuxterm-e2e-bin';
+const FAKE_CLAUDE = path.join(BIN_DIR, 'claude');
+/** 收到一行输入就退出的假 claude —— 用来驱动「切 profile 会重启 claude」。 */
+const FAKE_CLAUDE_EXITING = path.join(BIN_DIR, 'claude-once');
 
 async function killAll(ids) {
   for (const id of ids) {
@@ -165,29 +197,110 @@ function makeSurvivor(name, opts) {
 const attachedTo = (term) =>
   !!term && term.sent.some((s) => String(s.text).includes('tmux attach'));
 
-// ccr profile 派生的启动命令（见 src/core/command.ts 的 commandFor）
-const CCR_COMMAND = 'claude --dangerously-skip-permissions';
+/**
+ * 建一个 pane 前台是「claude」的会话（模拟 claude 还在跑）。
+ *
+ * **必须先起 shell、再在 shell 里敲 claude。** 不能把 claude 直接当成
+ * session 的启动命令：那样 claude 一退出，整个 tmux 会话就跟着没了 ——
+ * 而真实情况是 claude 退出后回到 shell，那正是「接回对话」要处理的场景。
+ */
+async function newSessionWithClaude(id, binary, args) {
+  const target = `=${S(id)}:`;
+  await run('tmux', ['new-session', '-d', '-s', S(id), '-c', SCRATCH]);
+  await sleep(500);
+  await run('tmux', ['send-keys', '-l', '-t', target, `${binary} ${args}`]);
+  await run('tmux', ['send-keys', '-t', target, 'Enter']);
+  await sleep(700);
+}
+
+/** 造一个「历史对话」文件，让某个 cwd 下出现候选。 */
+async function writeConversation(projectDir, uuid, cwd, summary) {
+  const dir = path.join(HOME, '.claude', 'projects', projectDir);
+  await fs.promises.mkdir(dir, { recursive: true });
+  await fs.promises.writeFile(
+    path.join(dir, `${uuid}.jsonl`),
+    [
+      JSON.stringify({ type: 'mode', sessionId: uuid }),
+      JSON.stringify({ type: 'attachment', cwd }),
+      JSON.stringify({
+        type: 'user', userType: 'external', isSidechain: false, cwd,
+        message: { role: 'user', content: summary },
+      }),
+    ].join('\n'),
+    'utf8',
+  );
+}
 
 (async () => {
-  const ID_A = 'e2e0000a';
-  const ID_B = 'e2e0000ab';      // 与 A 互为前缀，验证互不干扰
+  const ID_NEW = 'e2enew0001';       // 无绑定 + 无候选 → --session-id 新建并绑定
+  const ID_RESUME = 'e2eresume01';   // 存活（claude 已退出）+ 已绑定 → --resume
+  const ID_ALIVE = 'e2ealive001';    // 存活 + claude 在跑 → 只 attach
+  const ID_SHELL = 'e2eshell001';    // 存活 + claude 已退出 → --resume
+  const ID_LEGACY = 'e2elegacy01';   // 老条目无绑定 + 有候选 → 询问
+  const ID_LEGACY2 = 'e2elegacy02';  // 同上，但用户取消 → --continue
   const ID_KILL = 'e2ekill0001';
   const ID_REFUSE = 'e2erefus01';
-  const ALL = [ID_A, ID_B, ID_KILL, ID_REFUSE];
+  const ID_B = 'e2e0000ab';          // 与 ID_PREFIX 互为前缀，验证互不干扰
+  const ID_PREFIX = 'e2e0000a';
+  const ALL = [ID_NEW, ID_RESUME, ID_ALIVE, ID_SHELL, ID_LEGACY, ID_LEGACY2,
+    ID_KILL, ID_REFUSE, ID_B, ID_PREFIX];
+
+  // 清场：上一次跑残留的会话、假 HOME、假 claude、scratch 目录
+  await killAll(ALL);
+  await detachRealClient();
+  await fs.promises.rm(HOME, { recursive: true, force: true });
+  await fs.promises.rm(BIN_DIR, { recursive: true, force: true });
+  for (const d of [SCRATCH, CONV_CWD]) {
+    await fs.promises.rm(d, { recursive: true, force: true });
+    await fs.promises.mkdir(d, { recursive: true });
+  }
+  await fs.promises.mkdir(BIN_DIR, { recursive: true });
+  // 用 cp 出来的二进制当假 claude：comm 就是文件名，pane 前台进程名即 claude
+  await fs.promises.copyFile('/bin/sleep', FAKE_CLAUDE);
+  await fs.promises.copyFile('/bin/head', FAKE_CLAUDE_EXITING);
+  await fs.promises.chmod(FAKE_CLAUDE, 0o755);
+  await fs.promises.chmod(FAKE_CLAUDE_EXITING, 0o755);
+
+  // 老条目要挑的那两条历史对话
+  await writeConversation('-tmp-tmuxterm-e2e-convcwd', PICKED_CONV, CONV_CWD, '把那个 bug 修了');
+  await writeConversation('-tmp-tmuxterm-e2e-convcwd', EXISTING_CONV, CONV_CWD, '另一个终端的历史');
+
   const store = {
     entries: [],
-    async load() { return this.entries; },
-    async save(e) { this.entries = e; },
-    async add(e) { this.entries.push(e); },
+    async load() { return this.entries.map((e) => ({ ...e })); },
+    async save(e) { this.entries = e.map((x) => ({ ...x })); },
     async append(e) { this.entries.push({ ...e, order: this.entries.length }); },
-    async update() {}, async remove() {}, async findByName() {}, async reorder() {},
+    async update(id, patch) {
+      const i = this.entries.findIndex((e) => e.id === id);
+      if (i >= 0) this.entries[i] = { ...this.entries[i], ...patch };
+    },
+    async remove() {}, async findByName() {}, async reorder() {},
   };
-  const { TmuxClient } = require(path.join(ROOT, 'out/src/tmuxClient.js'));
-  const tmux = new TmuxClient('tmux');
+  const fresh = (id) => store.entries.find((e) => e.id === id);
+  const bound = (id) => fresh(id) && fresh(id).conversationId;
+  const literalsTo = (session) =>
+    calls.literals.filter((l) => l.name === session).map((l) => l.text);
+  const resetCalls = () => {
+    calls.terminals.length = 0; calls.literals.length = 0;
+    calls.newSessions.length = 0; calls.quickPicks.length = 0;
+  };
 
-  // 记录「真正把命令送进 pane」的调用：openEntry 走 tmux.sendLiteral，
-  // 不走 terminal.sendText（后者只发 `tmux attach`）。这里包一层以断言
-  // 命令有没有被发送、发到了哪个会话。
+  const mk = (id, name, cwd, extra) => ({
+    id, name, cwd, profile: 'ccr', autoRestore: true, order: 0, ...extra,
+  });
+  store.entries = [
+    mk(ID_NEW, 'NEW', SCRATCH),
+    mk(ID_RESUME, 'RESUME', SCRATCH),
+    mk(ID_ALIVE, 'ALIVE', SCRATCH),
+    mk(ID_SHELL, 'SHELL', SCRATCH),
+    mk(ID_LEGACY, 'LEGACY', CONV_CWD),
+    mk(ID_LEGACY2, 'LEGACY2', CONV_CWD),
+    mk(ID_KILL, 'KILL', SCRATCH),
+    mk(ID_B, 'B', SCRATCH),
+    mk(ID_PREFIX, 'A', SCRATCH),
+  ];
+
+  const tmux = new TmuxClient('tmux');
   const origSendLiteral = tmux.sendLiteral.bind(tmux);
   tmux.sendLiteral = async (name, text) => {
     calls.literals.push({ name, text });
@@ -199,95 +312,178 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
     return origNewSession(name, cwd);
   };
 
-  const mgr = new TerminalManager(store, tmux);
+  /** 每个用例用全新的 manager（内部 Map 空），并把 HOME 指向假目录。 */
+  const newManager = () => {
+    const m = new TerminalManager(store, tmux);
+    m.home = () => HOME;   // 隔离：对话枚举只读假 HOME
+    return m;
+  };
 
-  await killAll(ALL);
-
-  const entryA = { id: ID_A, name: 'A', cwd: '/tmp', profile: 'ccr', autoRestore: true, order: 0 };
-  const entryB = { id: ID_B, name: 'B', cwd: '/tmp', profile: 'ccr', autoRestore: true, order: 0 };
-
-  console.log('=== 1. 会话不存在 → 新建并发送 profile 派生的命令 ===');
-  await mgr.openEntry(entryA);
-  await sleep(2500);
-  const t1 = calls.terminals[calls.terminals.length - 1];
-  chk('创建了终端', calls.terminals.length === 1);
-  chk('终端名为显示名', t1.name === 'A', `实际 ${t1.name}`);
-  chk('cwd 为展开后的目录', t1.cwd === '/tmp', `实际 ${t1.cwd}`);
-  chk('发送的是 tmux attach（会话已由扩展 detached 建好）',
-    t1.sent.some((s) => s.text.includes('tmux attach') && s.text.includes(S(ID_A))),
-    JSON.stringify(t1.sent.map((s) => s.text)));
-  chk('会话已建立', await tmux.hasSession(S(ID_A)));
-  chk('create 发送了 profile 派生的命令到 A 会话',
-    calls.literals.some((l) => l.name === S(ID_A) && l.text === CCR_COMMAND),
-    JSON.stringify(calls.literals));
-
-  console.log('\n=== 2. 会话已存在 → 接回，绝不发送任何命令（核心不变量） ===');
-  // 换一个 manager 模拟「SSH 断线重连后」的新会话
-  const mgr2 = new TerminalManager(store, tmux);
-  calls.terminals.length = 0;
-  calls.literals.length = 0;
-  calls.newSessions.length = 0;
-  await mgr2.openEntry(entryA);
-  await sleep(1200);
-  const t2 = calls.terminals[0];
-  chk('接回的是已有会话', t2.sent.some((s) => s.text.includes('tmux attach')));
-  chk('★ 接回时未发送任何命令（安全闸门）', calls.literals.length === 0,
-    '命令污染了用户正在运行的进程 stdin！' + JSON.stringify(calls.literals));
-  chk('接回未重建会话', calls.newSessions.length === 0,
-    JSON.stringify(calls.newSessions));
-
-  console.log('\n=== 3. 已恢复的会话：重复点击只 show，不新建也不重复 attach ===');
-  calls.terminals.length = 0;
-  const mgr3 = new TerminalManager(store, tmux);
-  await mgr3.openEntry(entryA);
-  const countAfterFirst = calls.terminals.length;
-  const firstTerm = calls.terminals[0];
-
-  // 第一次点击后，面板里的 `tmux attach` 在真实机器上确实会附着上去。
-  // 用真客户端把这一步补上 —— 「已经有人在看这个会话」才是重复点击
-  // 该走 show-only 的前提（判据是 #{session_attached}，不是内存 Map）。
-  await attachRealClient(S(ID_A));
-  const attachedNow = await tmux.attachedClients(S(ID_A));
-  chk('会话已有客户端附着（判据就绪）', attachedNow !== null && attachedNow >= 1,
-    `实际 attached=${attachedNow}`);
-  const sentBefore = firstTerm.sent.length;
-
-  await mgr3.openEntry(entryA);
-  chk('第二次点击未新建终端', calls.terminals.length === countAfterFirst,
-    `第一次 ${countAfterFirst} 个，第二次后 ${calls.terminals.length} 个`);
-  chk('第二次点击执行了 show()', firstTerm.shown >= 2, `实际 show ${firstTerm.shown} 次`);
-  chk('已恢复的会话不再重复 attach（不往面板重复打字）',
-    firstTerm.sent.length === sentBefore,
-    JSON.stringify(firstTerm.sent.slice(sentBefore)));
-
-  await detachRealClient();
-
-  console.log('\n=== 4. 前缀相近的会话互不干扰 ===');
-  calls.literals.length = 0;
-  calls.newSessions.length = 0;
-  const mgr4 = new TerminalManager(store, tmux);
-  await mgr4.openEntry(entryB);
-  await sleep(2500);
-  chk('B 的会话已建立', await tmux.hasSession(S(ID_B)));
-  chk('A 的会话仍在（未被 B 影响）', await tmux.hasSession(S(ID_A)));
-  chk('B 执行了自己的命令', calls.literals.some((l) => l.name === S(ID_B)),
-    JSON.stringify(calls.literals));
-  chk('B 的创建没有把命令送进 A 会话', !calls.literals.some((l) => l.name === S(ID_A)),
-    JSON.stringify(calls.literals));
-
-  console.log('\n=== 5. 杀会话编排：detach→kill→dispose→Map 清理 ===');
+  console.log('=== 0. 对话枚举确实能读出用户真实的会话（只读，不写） ===');
   {
-    const entryKill = { id: ID_KILL, name: 'KILL', cwd: '/tmp', profile: 'ccr', autoRestore: true, order: 0 };
-    const s = S(ID_KILL);
+    const all = await listConversations(os.homedir());
+    chk('读到了用户真实的会话文件', all.length > 0, `实际 ${all.length} 条`);
+    chk('cwd 取自文件内字段（能按 cwd 精确筛出候选）',
+      all.some((c) => candidatesForCwd([c], c.cwd).length === 1));
+  }
 
-    calls.terminals.length = 0;
-    await tmux.newSession(s, '/tmp');   // 先建真会话，openEntry 只 attach、不派发命令
-    await mgr.openEntry(entryKill);      // 把面板塞进 mgr 的内部 Map
+  console.log('\n=== 1. 会话不存在 + 未绑定 → --session-id 新建并永久绑定 ===');
+  {
+    resetCalls();
+    const mgr = newManager();
+    await mgr.openEntry(fresh(ID_NEW));
+    await sleep(2500);
+
+    const t1 = calls.terminals[calls.terminals.length - 1];
+    chk('创建了终端并 attach', attachedTo(t1));
+    chk('会话已建立', await tmux.hasSession(S(ID_NEW)));
+    const sent = literalsTo(S(ID_NEW));
+    chk('发了一条 --session-id 启动命令',
+      sent.length === 1 && sent[0].includes('--session-id'), JSON.stringify(sent));
+    chk('★ 没有用裸 claude 开新对话顶掉什么（显式指定了 id）',
+      !/--resume|--continue/.test(sent[0] || ''), JSON.stringify(sent));
+    chk('★ uuid 落到了条目上（从此条目 ↔ 对话永久绑定）', UUID_RE.test(bound(ID_NEW) || ''),
+      `实际 ${JSON.stringify(bound(ID_NEW))}`);
+    chk('发的 id 就是落盘的那个', (sent[0] || '').includes(bound(ID_NEW)));
+  }
+
+  console.log('\n=== 2. 会话已死 + 已绑定 → --resume 接回它自己那条对话（核心） ===');
+  {
+    const boundId = bound(ID_NEW);
+    await run('tmux', ['kill-session', '-t', `=${S(ID_NEW)}`]);   // 模拟会话消失
+    resetCalls();
+    const mgr = newManager();
+    await mgr.openEntry(fresh(ID_NEW));
+    await sleep(2500);
+
+    chk('会话被重建', await tmux.hasSession(S(ID_NEW)));
+    const sent = literalsTo(S(ID_NEW));
+    chk('★ 发的是 --resume 且用的就是绑定的那个 id',
+      sent.some((t) => t.includes(`--resume '${boundId}'`)), JSON.stringify(sent));
+    chk('★ 绝不重开一条新对话顶替它（没有 --session-id）',
+      !sent.some((t) => t.includes('--session-id')), JSON.stringify(sent));
+    chk('会话原本已死 → 新建了 tmux 会话', calls.newSessions.length === 1);
+  }
+
+  console.log('\n=== 3. 会话存活且 claude 还在跑 → 只 attach，绝不发送（铁律） ===');
+  {
+    await newSessionWithClaude(ID_ALIVE, FAKE_CLAUDE, 300);
+    const front = await tmux.currentCommand(S(ID_ALIVE));
+    chk('前置条件：pane 前台就是 claude', front === 'claude', `实际 ${front}`);
+
+    resetCalls();
+    const mgr = newManager();
+    await mgr.openEntry({ ...fresh(ID_ALIVE), conversationId: EXISTING_CONV });
+    await sleep(1200);
+
+    chk('接回了已有会话', calls.terminals.some(attachedTo));
+    chk('★ claude 在跑时未发送任何命令（对话原样在跑，绝不能打扰）',
+      calls.literals.length === 0,
+      '命令污染了用户正在运行的进程 stdin！' + JSON.stringify(calls.literals));
+    chk('未重建会话', calls.newSessions.length === 0);
+  }
+
+  console.log('\n=== 4. 会话存活但 claude 已退出（pane 回到 shell）→ 接回它自己的对话 ===');
+  {
+    await tmux.newSession(S(ID_SHELL), SCRATCH);   // pane 就是登录 shell
+    chk('前置条件：pane 前台是登录 shell', (await tmux.currentCommand(S(ID_SHELL))) === 'bash');
+
+    resetCalls();
+    const mgr = newManager();
+    await mgr.openEntry({ ...fresh(ID_SHELL), conversationId: EXISTING_CONV });
+    await sleep(1500);
+
+    const sent = literalsTo(S(ID_SHELL));
+    chk('★ claude 已退出 → 发 --resume 接回它自己的对话',
+      sent.some((t) => t.includes(`--resume '${EXISTING_CONV}'`)), JSON.stringify(sent));
+    chk('会话没被重建（原本就活着）', calls.newSessions.length === 0);
+    chk('仍然 attach 了面板', calls.terminals.some(attachedTo));
+  }
+
+  console.log('\n=== 5. 老条目（无绑定）+ 有历史对话 → 问用户挑一次，挑中即永久绑定 ===');
+  {
+    resetCalls();
+    quickPickAnswer = (items) => items.find((i) => i.candidate.id === PICKED_CONV);
+    const mgr = newManager();
+    await mgr.openEntry(fresh(ID_LEGACY));
+    await sleep(2500);
+    quickPickAnswer = undefined;
+
+    chk('弹了选择框', calls.quickPicks.length === 1, `实际 ${calls.quickPicks.length} 次`);
+    const items = (calls.quickPicks[0] || {}).items || [];
+    chk('候选只含该 cwd 的对话（2 条）', items.length === 2, `实际 ${items.length}`);
+    chk('每项显示 时间 · 摘要 · 体积',
+      items.every((i) => /·/.test(i.label) && /KB|MB|B/.test(i.label)),
+      JSON.stringify(items.map((i) => i.label)));
+    chk('★ 选中的对话被永久绑定到条目', bound(ID_LEGACY) === PICKED_CONV,
+      `实际 ${JSON.stringify(bound(ID_LEGACY))}`);
+    chk('★ 用 --resume 接回选中的那条（不是新开）',
+      literalsTo(S(ID_LEGACY)).some((t) => t.includes(`--resume '${PICKED_CONV}'`)),
+      JSON.stringify(literalsTo(S(ID_LEGACY))));
+  }
+
+  console.log('\n=== 6. 老条目 + 用户取消选择 → 退回 --continue，且不绑定（下次还会问） ===');
+  {
+    resetCalls();
+    quickPickAnswer = undefined;   // 取消
+    const mgr = newManager();
+    await mgr.openEntry(fresh(ID_LEGACY2));
+    await sleep(2500);
+
+    chk('未绑定（绝不替用户猜一条）', bound(ID_LEGACY2) === undefined,
+      `实际 ${JSON.stringify(bound(ID_LEGACY2))}`);
+    const sent = literalsTo(S(ID_LEGACY2));
+    chk('退回 --continue', sent.some((t) => t.includes('--continue')), JSON.stringify(sent));
+    chk('没有开一条新对话顶掉（没有 --session-id）',
+      !sent.some((t) => t.includes('--session-id')), JSON.stringify(sent));
+  }
+
+  console.log('\n=== 7. 切 profile 重启 claude：有绑定必须 --resume（不能一律 --continue） ===');
+  {
+    // 假 claude 收到一行输入就退出 → 模拟 /exit 后回到 shell，让 restartClaude 走完
+    await newSessionWithClaude(ID_RESUME, FAKE_CLAUDE_EXITING, '-n 1');
+    const front = await tmux.currentCommand(S(ID_RESUME));
+    chk('前置条件：pane 前台是 claude', front.startsWith('claude'), `实际 ${front}`);
+
+    resetCalls();
+    const mgr = newManager();
+    await mgr.applyProfile({ ...fresh(ID_RESUME), conversationId: EXISTING_CONV }, 'direct');
+    await sleep(1500);
+
+    const sent = literalsTo(S(ID_RESUME));
+    chk('★ 重启时用 --resume 接回绑定对话',
+      sent.some((t) => t.includes(`--resume '${EXISTING_CONV}'`)), JSON.stringify(sent));
+    chk('★ 而不是 --continue（共用 cwd 的条目会全部接到同一条对话上去）',
+      !sent.some((t) => t.includes('--continue')), JSON.stringify(sent));
+    chk('profile 已落盘为 direct', fresh(ID_RESUME).profile === 'direct');
+  }
+
+  console.log('\n=== 8. 前缀相近的会话互不干扰 ===');
+  {
+    // A 的会话名是 B 的前缀，先让 A 存在，再看 B 的整套动作会不会碰到 A
+    await tmux.newSession(S(ID_PREFIX), SCRATCH);
+    resetCalls();
+    const mgr = newManager();
+    await mgr.openEntry(fresh(ID_B));
+    await sleep(2500);
+    chk('B 的会话已建立', await tmux.hasSession(S(ID_B)));
+    chk('B 执行了自己的启动命令', literalsTo(S(ID_B)).length === 1, JSON.stringify(calls.literals));
+    chk('A 的会话未被 B 影响', await tmux.hasSession(S(ID_PREFIX)));
+    chk('B 的启动没有把命令送进 A 会话', literalsTo(S(ID_PREFIX)).length === 0,
+      JSON.stringify(calls.literals));
+  }
+
+  console.log('\n=== 9. 杀会话编排：detach→kill→dispose→Map 清理 ===');
+  {
+    const s = S(ID_KILL);
+    resetCalls();
+    await tmux.newSession(s, SCRATCH);   // 先建真会话
+    const mgr = newManager();
+    await mgr.openEntry(fresh(ID_KILL));
+    await sleep(1500);
     const killTerm = calls.terminals[calls.terminals.length - 1];
     chk('openEntry 建出了代表该会话的终端', !!killTerm && killTerm.name === 'KILL');
 
-    // 记录 detach/kill 的真实调用顺序：先 push 名字，再委派给真实现。
-    // 这是「先摘客户端再杀」的关键判别断言——颠倒或漏掉 detach 都会失败。
     const order = [];
     const origDetach = tmux.detachClients.bind(tmux);
     const origKill = tmux.killSession.bind(tmux);
@@ -295,7 +491,7 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
     tmux.killSession = async (name) => { order.push('killSession'); return origKill(name); };
 
     modalAnswer = '杀掉';
-    await mgr.killSession(entryKill);
+    await mgr.killSession(fresh(ID_KILL));
     modalAnswer = undefined;
 
     chk('顺序为 detach→kill（不可颠倒）',
@@ -305,164 +501,149 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
     chk('代表该会话的终端被 dispose', killTerm.disposed === 1, `实际 dispose ${killTerm.disposed} 次`);
 
     // 行为式断言 Map 已清理：再点一次应新建终端，而不是复用旧 Map 里的面板。
-    calls.terminals.length = 0;
-    await mgr.openEntry(entryKill);
+    resetCalls();
+    await mgr.openEntry(fresh(ID_KILL));
+    await sleep(1500);
     chk('Map 已清理：再次 openEntry 新建了终端', calls.terminals.length === 1,
       `实际新终端数 ${calls.terminals.length}`);
   }
 
-  console.log('\n=== 6. 陈旧面板不得被当成「已恢复」（2026-09-10 订正） ===');
+  console.log('\n=== 10. 陈旧面板不得被当成「已恢复」（2026-09-10 订正） ===');
   {
     // 旧实现：Map 空、但 window.terminals 里有同名面板 → 直接 show() 并
-    // return。它既不验证会话是否还在，也不验证有没有客户端附着。真实后果
-    // 就是用户描述的「批量恢复没用，只能恢复到 cd 那一层，不会调用 claude」：
-    // 面板当初是以 {cwd} 建的，tmux 客户端一退出就退回该目录下的裸 shell。
-    // 下面四种组合逐一钉死新行为。
+    // return。它既不验证会话是否还在，也不验证有没有客户端附着。
     const staleIds = ['e2estale01', 'e2estale02', 'e2estale03', 'e2estale04'];
-    await killAll(staleIds);   // 上一次跑残留的，先清
+    await killAll(staleIds);
+    for (const id of staleIds) store.entries.push(mk(id, `STALE${id.slice(-2)}`, SCRATCH));
+    const nm = (i) => `STALE${staleIds[i].slice(-2)}`;
 
-    const mkEntry = (id, name) => ({ id, name, cwd: '/tmp', profile: 'ccr', autoRestore: true, order: 0 });
-
-    // ---- 6a. 会话已死 + 同名陈旧面板（旧实现：完全 no-op）----
+    // ---- 10a. 会话已死 + 同名陈旧面板（旧实现：完全 no-op）----
     {
-      const entry = mkEntry(staleIds[0], 'STALEDEAD');
-      const mgrStale = new TerminalManager(store, tmux);
-      calls.terminals.length = 0;
-      calls.literals.length = 0;
-      calls.newSessions.length = 0;
-
-      const stale = makeSurvivor('STALEDEAD');   // 无 shellIntegration → 判不出空闲
+      resetCalls();
+      const mgr = newManager();
+      const stale = makeSurvivor(nm(0));   // 无 shellIntegration → 判不出空闲
       vscodeStub.window.terminals.push(stale);
 
-      await mgrStale.openEntry(entry);
-      await sleep(1200);
+      await mgr.openEntry(fresh(staleIds[0]));
+      await sleep(2500);
 
-      chk('6a 会话已死 + 陈旧面板：会话被重新建出来',
+      chk('10a 会话已死 + 陈旧面板：会话被重新建出来',
         await tmux.hasSession(S(staleIds[0])), '旧实现完全 no-op，什么都不做');
-      const fresh = calls.terminals[calls.terminals.length - 1];
-      chk('6a ★ 确实发了 tmux attach（不再停在 cd 那一层的裸 shell）', attachedTo(fresh),
-        JSON.stringify(calls.terminals.map((t) => t.sent)));
-      chk('6a 未把 attach 打进状态不明的陈旧面板（安全闸门）', stale.sent.length === 0,
+      chk('10a ★ 确实发了启动命令（不再停在 cd 那一层的裸 shell）',
+        literalsTo(S(staleIds[0])).length === 1, JSON.stringify(calls.literals));
+      chk('10a 未把 attach 打进状态不明的陈旧面板（安全闸门）', stale.sent.length === 0,
         JSON.stringify(stale.sent));
-
       vscodeStub.window.terminals.length = 0;
     }
 
-    // ---- 6b. 会话存活但 0 附着 + 同名陈旧面板（旧实现：只 show）----
+    // ---- 10b. 会话存活但 0 附着 + 陈旧面板（旧实现：只 show）----
     {
-      const entry = mkEntry(staleIds[1], 'STALEALIVE');
-      await tmux.newSession(S(staleIds[1]), '/tmp');   // 存活，但没有任何客户端附着
-      const mgrStale = new TerminalManager(store, tmux);
-      calls.terminals.length = 0;
-      calls.literals.length = 0;
-      calls.newSessions.length = 0;
-
-      const stale = makeSurvivor('STALEALIVE');
+      await tmux.newSession(S(staleIds[1]), SCRATCH);
+      resetCalls();
+      const mgr = newManager();
+      const stale = makeSurvivor(nm(1));
       vscodeStub.window.terminals.push(stale);
 
-      await mgrStale.openEntry(entry);
-      await sleep(1200);
+      await mgr.openEntry({ ...fresh(staleIds[1]), conversationId: EXISTING_CONV });
+      await sleep(1500);
 
-      chk('6b 会话仍存在（未误重建）', await tmux.hasSession(S(staleIds[1])));
-      chk('6b 未新建 tmux 会话', calls.newSessions.length === 0, JSON.stringify(calls.newSessions));
-      chk('6b ★ 0 附着 → 必须 attach（旧实现只 show()，claude 在后台跑着却看不见）',
+      chk('10b 会话仍存在（未误重建）', await tmux.hasSession(S(staleIds[1])));
+      chk('10b 未新建 tmux 会话', calls.newSessions.length === 0, JSON.stringify(calls.newSessions));
+      chk('10b ★ 0 附着 → 必须 attach（旧实现只 show()，claude 在后台跑着却看不见）',
         calls.terminals.some(attachedTo), JSON.stringify(calls.terminals.map((t) => t.sent)));
-      chk('6b 未把 attach 打进状态不明的陈旧面板', stale.sent.length === 0, JSON.stringify(stale.sent));
-
+      chk('10b 未把 attach 打进状态不明的陈旧面板', stale.sent.length === 0, JSON.stringify(stale.sent));
       vscodeStub.window.terminals.length = 0;
     }
 
-    // ---- 6c. 会话存活 + 0 附着 + 可证明空闲的同名面板 → 复用该面板 ----
+    // ---- 10c. 存活 + 0 附着 + 可证明空闲的同名面板 → 复用该面板 ----
     {
-      const entry = mkEntry(staleIds[2], 'STALEIDLE');
-      await tmux.newSession(S(staleIds[2]), '/tmp');
-      const mgrStale = new TerminalManager(store, tmux);
-      calls.terminals.length = 0;
-
-      // shellIntegration 在场 + 没有命令在跑 = 已证明空闲停在提示符上
-      const idleSurvivor = makeSurvivor('STALEIDLE', { shellIntegration: {} });
+      await tmux.newSession(S(staleIds[2]), SCRATCH);
+      resetCalls();
+      const mgr = newManager();
+      const idleSurvivor = makeSurvivor(nm(2), { shellIntegration: {} });
       vscodeStub.window.terminals.push(idleSurvivor);
 
-      await mgrStale.openEntry(entry);
-      await sleep(1200);
+      await mgr.openEntry({ ...fresh(staleIds[2]), conversationId: EXISTING_CONV });
+      await sleep(1500);
 
-      chk('6c ★ 证明空闲的面板被复用（不再多开一个）', calls.terminals.length === 0,
+      chk('10c ★ 证明空闲的面板被复用（不再多开一个）', calls.terminals.length === 0,
         `实际新终端数 ${calls.terminals.length}`);
-      chk('6c 向复用的面板发了 tmux attach', attachedTo(idleSurvivor),
+      chk('10c 向复用的面板发了 tmux attach', attachedTo(idleSurvivor),
         JSON.stringify(idleSurvivor.sent));
-      chk('6c 对复用的面板执行了 show()', idleSurvivor.shown === 1,
+      chk('10c 对复用的面板执行了 show()', idleSurvivor.shown === 1,
         `实际 show ${idleSurvivor.shown} 次`);
-
       vscodeStub.window.terminals.length = 0;
     }
 
-    // ---- 6d. 面板里正在跑命令（shell integration 报忙）→ 绝不往里打字 ----
+    // ---- 10d. 面板里正在跑命令（shell integration 报忙）→ 绝不往里打字 ----
     {
-      const entry = mkEntry(staleIds[3], 'BUSYPANEL');
-      await tmux.newSession(S(staleIds[3]), '/tmp');
-      const mgrStale = new TerminalManager(store, tmux);
-      calls.terminals.length = 0;
-
-      const busySurvivor = makeSurvivor('BUSYPANEL', { shellIntegration: {} });
+      await tmux.newSession(S(staleIds[3]), SCRATCH);
+      resetCalls();
+      const mgr = newManager();
+      const busySurvivor = makeSurvivor(nm(3), { shellIntegration: {} });
       vscodeStub.window.terminals.push(busySurvivor);
-      // 模拟用户在面板里跑着编译：shell integration 报「命令开始」
-      shellExecutionStart.fire({ terminal: busySurvivor });
+      shellExecutionStart.fire({ terminal: busySurvivor });   // 模拟用户正在跑编译
 
-      await mgrStale.openEntry(entry);
-      await sleep(1200);
+      await mgr.openEntry({ ...fresh(staleIds[3]), conversationId: EXISTING_CONV });
+      await sleep(1500);
 
-      chk('6d ★ 面板里有命令在跑 → 不往里打字（宁可多开一个面板）',
+      chk('10d ★ 面板里有命令在跑 → 不往里打字（宁可多开一个面板）',
         busySurvivor.sent.length === 0,
         '把 tmux attach 塞进了用户正在跑的进程 stdin！' + JSON.stringify(busySurvivor.sent));
-      chk('6d 改为新建面板并 attach', calls.terminals.length === 1 && attachedTo(calls.terminals[0]),
-        `新终端 ${calls.terminals.length} 个，sent=${JSON.stringify(calls.terminals.map((t) => t.sent))}`);
+      chk('10d 改为新建面板并 attach',
+        calls.terminals.length === 1 && attachedTo(calls.terminals[0]),
+        `新终端 ${calls.terminals.length} 个`);
 
-      shellExecutionEnd.fire({ terminal: busySurvivor });   // 收尾，别把忙态留给后面
+      shellExecutionEnd.fire({ terminal: busySurvivor });
       vscodeStub.window.terminals.length = 0;
     }
 
     await killAll(staleIds);
   }
 
-  console.log('\n=== 7. applyModel 拒绝路径：前台不是 claude → 不发序列、不改配置 ===');
+  console.log('\n=== 11. applyModel 拒绝路径：前台不是 claude → 不发序列、不改配置 ===');
   {
     const s = S(ID_REFUSE);
     const { EntryStore } = require(path.join(ROOT, 'out/src/core/store.js'));
     const refuseFile = `/tmp/vscode-tmux-terminals-e2e-refuse-${process.pid}.json`;
     await fs.promises.rm(refuseFile, { force: true }).catch(() => {});
     const refuseStore = new EntryStore(refuseFile);
-    await refuseStore.append({ id: ID_REFUSE, name: 'REFUSE', cwd: '/tmp', profile: 'ccr', autoRestore: true });
+    await refuseStore.append({
+      id: ID_REFUSE, name: 'REFUSE', cwd: SCRATCH, profile: 'ccr', autoRestore: true,
+    });
     const entryRefuse = (await refuseStore.load()).find((e) => e.id === ID_REFUSE);
 
     // 前台进程是 sleep（非 claude），模拟用户正在跑的非 claude 程序。
-    // 此时发 /model 会把字符打进 sleep 的 stdin —— 必须被守卫拦下。
     await run('tmux', ['new-session', '-d', '-s', s, 'sleep 600']);
+    resetCalls();
 
-    calls.literals.length = 0;
-    calls.errors.length = 0;
-
-    const mgrRefuse = new TerminalManager(refuseStore, tmux);
-    await mgrRefuse.applyModel(entryRefuse, 'some-model');
+    const mgr = new TerminalManager(refuseStore, tmux);
+    mgr.home = () => HOME;
+    await mgr.applyModel(entryRefuse, 'some-model');
 
     const after = (await refuseStore.load()).find((e) => e.id === ID_REFUSE);
     chk('★ 拒绝时未发送任何控制序列（/model 未打进 sleep 进程）',
-      calls.literals.length === 0,
-      JSON.stringify(calls.literals));
-    chk('★ 拒绝时未写配置（model 保持未设）',
-      after.model === undefined,
+      calls.literals.length === 0, JSON.stringify(calls.literals));
+    chk('★ 拒绝时未写配置（model 保持未设）', after.model === undefined,
       `实际 model=${JSON.stringify(after.model)}`);
     chk('拒绝已向用户呈现（error message 记录）',
-      calls.errors.some((m) => String(m).includes('不是 claude')),
-      JSON.stringify(calls.errors));
+      calls.errors.some((m) => String(m).includes('不是 claude')), JSON.stringify(calls.errors));
 
     await fs.promises.rm(refuseFile, { force: true }).catch(() => {});
   }
 
-  console.log('\n=== 8. 清理 ===');
-  await detachRealClient();          // 摘掉 3 节借来造附着客户端的 helper 会话
+  console.log('\n=== 12. 清理 ===');
+  await detachRealClient();
   await killAll(ALL);
+  await killAll(['e2estale01', 'e2estale02', 'e2estale03', 'e2estale04']);
   const left = (await tmux.listSessions()).filter((s) => s.startsWith('tmuxterm-e2e'));
   chk('无残留测试会话', left.length === 0, left.join(', '));
+  const fakeHomeBefore = fs.existsSync(HOME);
+  await fs.promises.rm(HOME, { recursive: true, force: true });
+  await fs.promises.rm(BIN_DIR, { recursive: true, force: true });
+  for (const d of [SCRATCH, CONV_CWD]) await fs.promises.rm(d, { recursive: true, force: true });
+  chk('假 HOME / 假 claude / scratch 目录已清理',
+    fakeHomeBefore && !fs.existsSync(HOME) && !fs.existsSync(BIN_DIR) && !fs.existsSync(SCRATCH));
 
   console.log(`\n${fail === 0 ? '端到端全部通过 ✓' : `${fail} 项失败`}`);
   process.exit(fail ? 1 : 0);

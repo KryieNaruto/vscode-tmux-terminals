@@ -91,6 +91,11 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "tmuxTerminals.bindConversation",
+        "title": "选择要接回的对话…",
+        "icon": "$(comment-discussion)"
+      },
+      {
         "command": "tmuxTerminals.setModel",
         "title": "设置模型…",
         "icon": "$(chip)"
@@ -198,6 +203,11 @@
           "command": "tmuxTerminals.toggleAutoRestore",
           "when": "view == tmuxTerminals.list",
           "group": "2_edit@3"
+        },
+        {
+          "command": "tmuxTerminals.bindConversation",
+          "when": "view == tmuxTerminals.list",
+          "group": "2_edit@4"
         },
         {
           "command": "tmuxTerminals.delete",
