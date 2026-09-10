@@ -16,6 +16,7 @@
 - **所有 tmux 目标必须精确匹配**：session 级命令用 `=name`，pane 级命令用 `=name:`。不加 `=` 会前缀匹配（实测 `has-session -t zzver` 能匹配 `zzverify`），会导致 attach 到错误会话、`kill-session` 误杀。- 见 Task 1/3。
 - **预设命令只在「新建会话」分支执行**。会话存活时 attach，`commands` 必须为空数组，否则会把命令当键盘输入送进用户正在运行的进程 stdin。
 - tmux 目标一律经 `sessionTarget()` / `paneTarget()` 生成，**不要**在别处手拼 `=` 和 `:`。
+- **tmux 会话名一律经 `sessionNameFor(entry.id)` 派生**（形如 `tmuxterm-<id>`），**绝不用条目显示名**。tmux 允许会话名含换行，用显示名会让 `tmux ls -F` 输出错行、解析出幽灵会话。
 - `execFile` 传 argv 数组不经过 shell → 传给 tmux 的参数**不做** shell 引用。`shellQuote()` 只用于「要塞进终端执行的命令行字符串」。
 - 会话名规则：非空、不含 `:` 和 `.`、非纯数字、不与他条重名。
 - 目标 VS Code ≥ 1.85。Node ≥ 18。
@@ -496,11 +497,11 @@ Expected: 编译失败，找不到 `../../src/core/plan`。
 创建 `src/core/types.ts`：
 
 ```ts
-/** 侧边栏的一个终端条目。name 同时是 tmux 会话名，二者一一对应。 */
+/** 侧边栏的一个终端条目。 */
 export interface TerminalEntry {
-  /** 短随机串，重命名时保持不变 */
+  /** 短随机串，重命名时保持不变。**tmux 会话名由它派生** */
   id: string;
-  /** 显示名 + tmux 会话名 */
+  /** 显示名。不再是 tmux 会话名，见 core/tmux.ts 的 sessionNameFor */
   name: string;
   /** 远端路径，支持 ~ */
   cwd: string;
@@ -510,6 +511,13 @@ export interface TerminalEntry {
   autoRestore: boolean;
 }
 ```
+
+> **实现后修订（2026-09-09）**：原设计是「条目 name 直接当 tmux 会话名」。
+> 对抗性核验发现 tmux 允许会话名含换行，会让 `tmux ls -F` 的一个会话
+> 占两行、解析出幽灵会话。现改为**会话名由 id 派生**（`sessionNameFor(id)`
+> → `tmuxterm-<id>`），从根上排除；`escapeSessionName()` 作纵深防御。
+> 连带影响：`validateName` 解禁 `:`、`.`、纯数字（显示名不再进 tmux
+> 目标语法），仍拦换行与重名。
 
 创建 `src/core/plan.ts`：
 
