@@ -144,7 +144,7 @@ describe('EntryStore', () => {
 });
 
 describe('EntryStore v1 迁移', () => {
-  it('v1 文件能读出 v2 条目且一条不丢（回归：曾会被 isEntry 静默过滤）', async () => {
+  it('v1 文件能读出 v2 条目且一条不丢（回归：曾会被静默过滤）', async () => {
     const f = tmpFile();
     fs.writeFileSync(f, JSON.stringify([
       { id: '9b96d6ac7a3f', name: '统筹者', cwd: '/w', commands: ['claude --dangerously-skip-permissions'], autoRestore: true },

@@ -31,8 +31,14 @@ export class EntryStore {
   /**
    * 载入条目。
    *
-   * **顺序至关重要：先迁移，再过滤。** v2 的 isEntry 不再接受 commands
-   * 字段，若先过滤，v1 的条目会被全部静默丢弃（远端实测 6 条）。
+   * **迁移即校验：没有单独的过滤阶段。** migrateEntry 是唯一的守门人 ——
+   * 它把 v1 条目迁移到 v2、把损坏/缺字段的条目判为不可迁移（返回
+   * undefined，此处丢弃）。正因如此，「先迁移后过滤」的顺序在这里
+   * **不可能被写错**：根本没有一个能在迁移之前跑掉的过滤器。
+   *
+   * 若未来有人把校验单独抽出来（例如一个只认 v2 形态的过滤器）并放到
+   * 迁移之前，v1 的条目会被全部静默丢弃（远端实测 6 条）——那正是本任务
+   * 要防的数据丢失。
    *
    * 读取不改写文件 —— 迁移结果只存在于内存，等用户下次真实改动时才落盘。
    * 「打开个扩展就改了用户文件」是不可接受的副作用。
@@ -171,19 +177,4 @@ export class EntryStore {
     const all = await this.load();
     return all.find((e) => e.name === name);
   }
-}
-
-/** v2 形态校验。注意不再接受 commands 字段。 */
-function isEntry(v: unknown): v is TerminalEntry {
-  if (typeof v !== 'object' || v === null) return false;
-  const o = v as Record<string, unknown>;
-  return (
-    typeof o.id === 'string' &&
-    typeof o.name === 'string' &&
-    typeof o.cwd === 'string' &&
-    (o.profile === 'ccr' || o.profile === 'direct') &&
-    (o.model === undefined || typeof o.model === 'string') &&
-    typeof o.autoRestore === 'boolean' &&
-    typeof o.order === 'number'
-  );
 }
