@@ -260,6 +260,8 @@ async function projectDirs() {
   const ID_LEGACY = 'e2elegacy01';     // 老条目 + 有候选 → 选中 → 绑定 + --resume
   const ID_LEGACY_NEW = 'e2elegacyn1'; // 老条目 + 有候选 → 选「＋ 新建一条对话」
   const ID_LEGACY_ESC = 'e2elegacye1'; // 老条目 + 有候选 → Esc → 什么都不启动
+  const ID_SHARE = 'e2eshare0001';     // 老条目，选中「已绑给别人」的对话 → 二次确认
+  const ID_SHARE2 = 'e2eshare0002';    // 同上，但走显式命令「选择要接回的对话…」
   const ID_RESTART = 'e2erestart1';    // 切 profile：有绑定 → --resume
   const ID_NOBIND = 'e2enobind01';     // 切 profile：无绑定 → 拒绝
   const ID_RESUMEFAIL = 'e2eresfail1'; // --resume 报 No conversation found → 必须看得见
@@ -270,8 +272,8 @@ async function projectDirs() {
   const ID_PREFIX = 'e2e0000a';
   const STALE_IDS = ['e2estale01', 'e2estale02', 'e2estale03', 'e2estale04'];
   const ALL = [ID_NEW, ID_FRESH, ID_DEAD, ID_ALIVE, ID_SHELL, ID_LEGACY, ID_LEGACY_NEW,
-    ID_LEGACY_ESC, ID_RESTART, ID_NOBIND, ID_RESUMEFAIL, ID_CONFLICT, ID_KILL, ID_REFUSE,
-    ID_B, ID_PREFIX, ...STALE_IDS];
+    ID_LEGACY_ESC, ID_SHARE, ID_SHARE2, ID_RESTART, ID_NOBIND, ID_RESUMEFAIL, ID_CONFLICT, ID_KILL,
+    ID_REFUSE, ID_B, ID_PREFIX, ...STALE_IDS];
 
   const projectsBefore = await projectDirs();
 
@@ -350,6 +352,8 @@ async function projectDirs() {
     mk(ID_LEGACY, 'LEGACY', CONV_CWD),                            // 老条目：无 conversationId
     mk(ID_LEGACY_NEW, 'LEGACYNEW', CONV_CWD),
     mk(ID_LEGACY_ESC, 'LEGACYESC', CONV_CWD),
+    mk(ID_SHARE, 'SHARE', CONV_CWD),
+    mk(ID_SHARE2, 'SHARE2', CONV_CWD),
     mk(ID_RESTART, 'RESTART', BOUND_CWD, { conversationId: CONV_RESTART }),
     mk(ID_NOBIND, 'NOBIND', BOUND_CWD, { conversationId: CONV_RESTART2 }),
     mk(ID_RESUMEFAIL, 'RESUMEFAIL', BOUND_CWD, { conversationId: CONV_FAIL }),
@@ -440,6 +444,9 @@ async function projectDirs() {
     chk('★ 用 --session-id 把绑定的那条建出来（它还不存在，不能用 --resume）',
       sent.length === 1 && sent[0].includes(`--session-id '${CONV_FRESH}'`), JSON.stringify(sent));
     chk('绑定的 id 没有被改掉', bound(ID_FRESH) === CONV_FRESH);
+    chk('★ 出声了：提醒这条对话没有记录、本次新开一条（不再静默）',
+      calls.messages.some((m) => String(m).includes('还没有记录') && String(m).includes('新开一条')),
+      JSON.stringify(calls.messages));
   }
 
   console.log('\n=== 3. 会话已死 + 已绑定（对话存在）→ --resume 接回它自己那条（核心） ===');
@@ -515,6 +522,78 @@ async function projectDirs() {
     chk('★ 用 --resume 接回选中的那条（不是新开）',
       literalsTo(S(ID_LEGACY)).some((t) => t.includes(`--resume '${PICKED_CONV}'`)),
       JSON.stringify(literalsTo(S(ID_LEGACY))));
+  }
+
+  console.log('\n=== 6b. 选中「已绑给别的条目」的对话 → 必须二次确认 ===');
+  {
+    const pickShared = (items) => items.find((i) => i.candidate && i.candidate.id === PICKED_CONV);
+
+    // 先确认标签上写明了归属
+    resetCalls();
+    quickPickAnswer = (items) => { quickPickAnswer = undefined; return undefined; };  // 只看列表内容
+    const mgrPeek = newManager();
+    await mgrPeek.openEntry(fresh(ID_SHARE));
+    await sleep(2500);
+    // 注意：本用例里 CONV_CWD 下还有另一条已绑给 CONFLICT 的对话，
+    // 所以必须按 id 取到 PICKED_CONV 那一项，而不是「第一个带归属的」。
+    const shared = ((calls.quickPicks[0] || {}).items || [])
+      .find((i) => i.candidate && i.candidate.id === PICKED_CONV);
+    chk('★ 候选列表里标出了归属（「已绑给「LEGACY」」）',
+      !!shared && shared.label.includes('已绑给「LEGACY」'), String(shared && shared.label));
+
+    // 6b-1：用户取消确认 → 不绑定、什么都不启动
+    resetCalls();
+    quickPickAnswer = pickShared;
+    modalAnswer = undefined;                       // 取消
+    const mgr1 = newManager();
+    await mgr1.openEntry(fresh(ID_SHARE));
+    await sleep(2500);
+    modalAnswer = undefined;
+    chk('★ 拒绝确认后未绑定（绝不悄悄共写同一条对话）', bound(ID_SHARE) === undefined,
+      `实际 ${JSON.stringify(bound(ID_SHARE))}`);
+    chk('★ 拒绝确认后未启动任何东西', calls.literals.length === 0, JSON.stringify(calls.literals));
+    chk('给了说明（该对话已绑给别人）',
+      calls.messages.some((m) => String(m).includes('已绑给')), JSON.stringify(calls.messages));
+
+    // 6b-2：用户确认 → 绑定 + --resume
+    resetCalls();
+    quickPickAnswer = pickShared;
+    modalAnswer = '仍然接这条';
+    const mgr2 = newManager();
+    await mgr2.openEntry(fresh(ID_SHARE));
+    await sleep(2500);
+    modalAnswer = undefined;
+    quickPickAnswer = undefined;
+    chk('★ 确认后才绑定', bound(ID_SHARE) === PICKED_CONV, `实际 ${JSON.stringify(bound(ID_SHARE))}`);
+    chk('★ 确认后接回这条', literalsTo(S(ID_SHARE)).some((t) => t.includes(`--resume '${PICKED_CONV}'`)),
+      JSON.stringify(literalsTo(S(ID_SHARE))));
+  }
+
+  console.log('\n=== 6c. 显式命令「选择要接回的对话…」：绑到别人的对话上同样要确认 ===');
+  {
+    const pickShared = (items) => items.find((i) => i.candidate && i.candidate.id === PICKED_CONV);
+    const mgr = newManager();
+
+    // 6c-1：取消确认 → 绑定不变
+    resetCalls();
+    quickPickAnswer = pickShared;
+    modalAnswer = undefined;
+    await mgr.bindConversationInteractive(fresh(ID_SHARE2));
+    await sleep(400);
+    chk('★ 取消确认后绑定未被改动', bound(ID_SHARE2) === undefined,
+      `实际 ${JSON.stringify(bound(ID_SHARE2))}`);
+    chk('给了说明（未改绑定）',
+      calls.messages.some((m) => String(m).includes('未改绑定')), JSON.stringify(calls.messages));
+
+    // 6c-2：确认 → 绑定生效
+    resetCalls();
+    modalAnswer = '仍然接这条';
+    await mgr.bindConversationInteractive(fresh(ID_SHARE2));
+    await sleep(400);
+    modalAnswer = undefined;
+    quickPickAnswer = undefined;
+    chk('★ 确认后绑定生效', bound(ID_SHARE2) === PICKED_CONV,
+      `实际 ${JSON.stringify(bound(ID_SHARE2))}`);
   }
 
   console.log('\n=== 7. 老条目 + 用户主动选「＋ 新建一条对话」→ 开新对话并绑定 ===');

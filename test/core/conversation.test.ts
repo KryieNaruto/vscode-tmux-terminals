@@ -5,6 +5,8 @@ import {
   candidatesForCwd,
   formatBytes,
   formatCandidate,
+  formatCandidateWithOwner,
+  ownersOf,
   parseConversationHead,
 } from '../../src/core/conversation';
 
@@ -152,5 +154,41 @@ describe('formatBytes / formatCandidate —— QuickPick 显示', () => {
   });
   it('没有摘要时明说，不显示空档', () => {
     assert.ok(formatCandidate(c({ summary: '' })).includes('（无摘要）'));
+  });
+});
+
+describe('ownersOf —— 哪些对话已经被别的条目绑走', () => {
+  const E = (id: string, name: string, conversationId?: string) => ({ id, name, conversationId });
+
+  it('收集「别的条目 → 它绑的对话」', () => {
+    const m = ownersOf([E('a', '甲', 'conv-1'), E('b', '乙', 'conv-2')], 'self');
+    assert.strictEqual(m.get('conv-1'), '甲');
+    assert.strictEqual(m.get('conv-2'), '乙');
+  });
+
+  it('★ 跳过自己（自己当然绑着这条）', () => {
+    const m = ownersOf([E('self', '我', 'conv-1')], 'self');
+    assert.strictEqual(m.get('conv-1'), undefined);
+  });
+
+  it('跳过未绑定 / 空串 / 缺字段的条目', () => {
+    const m = ownersOf([E('a', '甲'), E('b', '乙', ''), { id: 'c', name: '丙' }], 'self');
+    assert.strictEqual(m.size, 0);
+  });
+
+  it('多条条目绑了同一个 id 时取先出现的（顺序稳定，不随后续条目抖动）', () => {
+    const m = ownersOf([E('a', '甲', 'conv-1'), E('b', '乙', 'conv-1')], 'self');
+    assert.strictEqual(m.get('conv-1'), '甲');
+  });
+});
+
+describe('formatCandidateWithOwner —— 选择框里标注归属', () => {
+  it('没人绑过时与普通行完全一致', () => {
+    assert.strictEqual(formatCandidateWithOwner(c()), formatCandidate(c()));
+  });
+  it('已被绑走时附上归属者，用户能看出「这是别人的」', () => {
+    const s = formatCandidateWithOwner(c(), 'UI_Worker-01');
+    assert.ok(s.includes('已绑给「UI_Worker-01」'), s);
+    assert.ok(s.startsWith(formatCandidate(c())), s);
   });
 });
