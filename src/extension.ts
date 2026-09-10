@@ -108,6 +108,8 @@ export function activate(context: vscode.ExtensionContext): void {
     provider.refresh();
   });
 
+  // setModel 不 poll：改模型不改变会话存活状态，无需刷新存活标记
+  //（setProfile 会重启会话，故需要 poll 刷新存活）。
   reg('tmuxTerminals.setModel', async (arg: unknown) => {
     const it = item(arg);
     if (it) await manager.setModelInteractive(it.entry);

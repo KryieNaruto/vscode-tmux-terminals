@@ -195,7 +195,8 @@ export class TerminalManager {
     // 等回到 shell —— 用既有轮询而非固定 sleep
     if (!(await this.tmux.waitForShell(session, SHELL_READY_TIMEOUT_MS))) {
       void vscode.window.showWarningMessage(
-        `「${entry.name}」未在 ${SHELL_READY_TIMEOUT_MS / 1000}s 内回到 shell，已中止切换。`,
+        `「${entry.name}」未在 ${SHELL_READY_TIMEOUT_MS / 1000}s 内回到 shell。` +
+        `claude 可能已经退出，配置未改动 —— 请在该终端里重开（或杀掉会话）。`,
       );
       return false;
     }
@@ -214,10 +215,13 @@ export class TerminalManager {
    * 未运行的会话：只改配置。下次 openEntry 由 commandFor 带出 `--model`
    * （实测 `--model` 启动参数**不**污染全局默认）。
    *
-   * 运行中的会话：发 `/model <名称>` 立即生效。但实测 `/model` 会**顺带改写
-   * `~/.claude/settings.json` 的全局默认**。所以当目标恰好是该 profile 的
-   * 默认模型（含「清空」）时，改走「重启且不带 --model」：行为等价
-   * （都回到默认），但没有副作用。
+   * 运行中的会话：发 `/model <目标>` 立即生效。这是**唯一**能改掉一个活
+   * 对话当前模型的机制（实测 bare `claude --continue` 会保留原对话的模型，
+   * 命令行 `--model` 也盖不过 resumed 会话），代价是 `/model` 会顺带改写
+   * `~/.claude/settings.json` 的全局默认 —— 这是用户显式接受的取舍。
+   *
+   * 清空（model 未给）时回落到该 profile 的默认模型；读不到默认则只落
+   * 配置、提示下次启动生效。
    */
   async applyModel(entry: TerminalEntry, model: string | undefined): Promise<void> {
     const session = sessionNameFor(entry.id);
@@ -229,21 +233,26 @@ export class TerminalManager {
       return;
     }
 
+    // 目标模型：显式给出就用它；清空则回落到该 profile 的默认模型。
     const cfg = await readProfileConfig(entry.profile, this.home());
-    const isProfileDefault = normalized !== undefined && normalized === cfg.defaultModel;
+    const target = normalized ?? cfg.defaultModel;
 
-    if (normalized !== undefined && !isProfileDefault) {
-      if (!(await this.canSendControl(session))) {
-        this.refuse(entry, '切模型');
-        return;
-      }
-      await this.tmux.sendLiteral(session, `/model ${normalized}`);
-      await this.tmux.sendEnter(session);
-    } else {
-      // 目标就是 profile 默认（含清空）：重启且不带 --model，避免写全局默认
-      const ok = await this.restartClaude(entry, { ...entry, model: undefined }, false);
-      if (!ok) return; // 被拒绝时不动配置，避免配置与实际不一致
+    if (target === undefined) {
+      // 清空且读不到默认（无 models / 无 model 键）→ 无法发 /model，
+      // 只落配置，下次启动时生效。
+      await this.store.update(entry.id, { model: normalized });
+      void vscode.window.showInformationMessage(
+        `「${entry.name}」未读到 ${entry.profile} 的默认模型，已保存为「下次启动生效」。`,
+      );
+      return;
     }
+
+    if (!(await this.canSendControl(session))) {
+      this.refuse(entry, '切模型');
+      return;
+    }
+    await this.tmux.sendLiteral(session, `/model ${target}`);
+    await this.tmux.sendEnter(session);
     await this.store.update(entry.id, { model: normalized });
   }
 
