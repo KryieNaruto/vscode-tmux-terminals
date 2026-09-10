@@ -3,7 +3,10 @@ import * as vscode from 'vscode';
 import { expandHome, validateName } from './core/paths';
 import { planRestore } from './core/plan';
 import { sessionNameFor, shellQuote } from './core/tmux';
-import { TerminalEntry } from './core/types';
+import { Profile, TerminalEntry } from './core/types';
+import { commandFor } from './core/command';
+import { isClaudeCommand } from './core/claude';
+import { readProfileConfig } from './claudeConfig';
 import { EntryStore, newId } from './core/store';
 import { TmuxClient } from './tmuxClient';
 
@@ -144,6 +147,164 @@ export class TerminalManager {
         await new Promise((r) => setTimeout(r, 50));
       }
     })();
+  }
+
+  // ---- 切模型 / 切 profile（运行中立即生效） ----
+
+  /**
+   * 判断能否向该会话发送控制序列（`/model ...`、`/exit`）。
+   *
+   * **安全闸门。** 目标不是 claude 时，这些字符会变成键盘输入打进用户正在
+   * 跑的进程 —— 一条 `/exit` 能毁掉一次编译。判据见 core/claude.ts：严格
+   * 要求基名以 claude 开头，绝不把 node 当作 claude。
+   */
+  private async canSendControl(session: string): Promise<boolean> {
+    return isClaudeCommand(await this.tmux.currentCommand(session));
+  }
+
+  /** 拒绝执行并说明原因。绝不静默跳过、绝不盲发。 */
+  private refuse(entry: TerminalEntry, what: string): void {
+    void vscode.window.showErrorMessage(
+      `「${entry.name}」当前前台进程不是 claude，已拒绝${what}。` +
+      `请先在该终端里退出正在运行的程序（或直接杀掉会话），再试。`,
+    );
+  }
+
+  /**
+   * 退出当前 claude 并按 `launch` 的配置重新启动。
+   *
+   * `launch` 与 `entry` 分开传：调用方常需要「改某个字段后再启动」
+   * （如清掉 model 以回落到 profile 默认），而提示语仍要用原条目的名字。
+   *
+   * 返回 false 表示被安全守卫拒绝。
+   */
+  private async restartClaude(
+    entry: TerminalEntry,
+    launch: TerminalEntry,
+    resume: boolean,
+  ): Promise<boolean> {
+    const session = sessionNameFor(entry.id);
+    if (!(await this.canSendControl(session))) {
+      this.refuse(entry, '重启 claude');
+      return false;
+    }
+
+    await this.tmux.sendLiteral(session, '/exit');
+    await this.tmux.sendEnter(session);
+
+    // 等回到 shell —— 用既有轮询而非固定 sleep
+    if (!(await this.tmux.waitForShell(session, SHELL_READY_TIMEOUT_MS))) {
+      void vscode.window.showWarningMessage(
+        `「${entry.name}」未在 ${SHELL_READY_TIMEOUT_MS / 1000}s 内回到 shell，已中止切换。`,
+      );
+      return false;
+    }
+
+    const base = commandFor(launch);
+    // --continue 接回原对话：两个 profile 共用 ~/.claude/projects/（实测）
+    const cmd = resume ? `${base} --continue` : base;
+    await this.tmux.sendLiteral(session, cmd);
+    await this.tmux.sendEnter(session);
+    return true;
+  }
+
+  /**
+   * 把模型设置应用到一条条目。
+   *
+   * 未运行的会话：只改配置。下次 openEntry 由 commandFor 带出 `--model`
+   * （实测 `--model` 启动参数**不**污染全局默认）。
+   *
+   * 运行中的会话：发 `/model <名称>` 立即生效。但实测 `/model` 会**顺带改写
+   * `~/.claude/settings.json` 的全局默认**。所以当目标恰好是该 profile 的
+   * 默认模型（含「清空」）时，改走「重启且不带 --model」：行为等价
+   * （都回到默认），但没有副作用。
+   */
+  async applyModel(entry: TerminalEntry, model: string | undefined): Promise<void> {
+    const session = sessionNameFor(entry.id);
+    const normalized = model && model.length > 0 ? model : undefined;
+    const alive = await this.tmux.hasSession(session);
+
+    if (!alive) {
+      await this.store.update(entry.id, { model: normalized });
+      return;
+    }
+
+    const cfg = await readProfileConfig(entry.profile, this.home());
+    const isProfileDefault = normalized !== undefined && normalized === cfg.defaultModel;
+
+    if (normalized !== undefined && !isProfileDefault) {
+      if (!(await this.canSendControl(session))) {
+        this.refuse(entry, '切模型');
+        return;
+      }
+      await this.tmux.sendLiteral(session, `/model ${normalized}`);
+      await this.tmux.sendEnter(session);
+    } else {
+      // 目标就是 profile 默认（含清空）：重启且不带 --model，避免写全局默认
+      const ok = await this.restartClaude(entry, { ...entry, model: undefined }, false);
+      if (!ok) return; // 被拒绝时不动配置，避免配置与实际不一致
+    }
+    await this.store.update(entry.id, { model: normalized });
+  }
+
+  /**
+   * 切换 profile（ccr ↔ direct），即换鉴权来源与端点。
+   *
+   * 重启 CLI 并用 `--continue` 接回原对话 —— 两个 profile 共用
+   * `~/.claude/projects/`（实测 direct.json 不覆盖该目录）。
+   *
+   * model 一并清空：两个 profile 的模型命名空间不同（deepseek-* vs
+   * claude-*），沿用旧值几乎必然无效，回落到新 profile 的默认才正确。
+   */
+  async applyProfile(entry: TerminalEntry, profile: Profile): Promise<void> {
+    if (entry.profile === profile) return;
+    const session = sessionNameFor(entry.id);
+
+    if (await this.tmux.hasSession(session)) {
+      const ok = await this.restartClaude(
+        entry,
+        { ...entry, profile, model: undefined },
+        true,
+      );
+      if (!ok) return; // 被拒绝时不动配置
+    }
+    await this.store.update(entry.id, { profile });
+  }
+
+  /** 单条：选一个模型。清单来自 profile 的 settings；读不到则允许手输。 */
+  async setModelInteractive(entry: TerminalEntry): Promise<void> {
+    const { models } = await readProfileConfig(entry.profile, this.home());
+    const MANUAL = '$(pencil) 手动输入…';
+    const pick = await vscode.window.showQuickPick([...models, MANUAL], {
+      title: `为「${entry.name}」设置模型（${entry.profile}）`,
+      placeHolder: entry.model ?? '（当前用 profile 默认）',
+    });
+    if (pick === undefined) return;
+
+    let model: string | undefined = pick === MANUAL ? undefined : pick;
+    if (pick === MANUAL) {
+      const typed = await vscode.window.showInputBox({
+        title: '模型名',
+        prompt: '留空 = 用 profile 默认模型',
+        value: entry.model ?? '',
+      });
+      if (typed === undefined) return;
+      model = typed.trim().length > 0 ? typed.trim() : undefined;
+    }
+    await this.applyModel(entry, model);
+  }
+
+  /** 单条：在 ccr / direct 之间切换。 */
+  async setProfileInteractive(entry: TerminalEntry): Promise<void> {
+    const target: Profile = entry.profile === 'direct' ? 'ccr' : 'direct';
+    const label = target === 'direct' ? '🟠 direct（官方直连）' : '🔵 ccr（本地中转）';
+    const pick = await vscode.window.showWarningMessage(
+      `把「${entry.name}」切到 ${label}？运行中的 claude 会重启（用 --continue 接回原对话）。`,
+      { modal: true },
+      '切换',
+    );
+    if (pick !== '切换') return;
+    await this.applyProfile(entry, target);
   }
 
   // ---- 交互式增删改 ----

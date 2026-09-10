@@ -65,6 +65,16 @@ describe('package.json 清单一致性', () => {
     assert.deepStrictEqual(missing, [], `声明了但未注册的命令（点了没反应）: ${missing}`);
   });
 
+  it('每条声明过的命令都在 extension.ts 里注册（防「声明了但没注册」）', () => {
+    const src = EXTENSION_SRC;
+    for (const c of contributes.commands ?? []) {
+      const id: string = c.command;
+      // 两种引号都认 —— 注册处可能用单引号也可能用双引号
+      const registered = src.includes(`'${id}'`) || src.includes(`"${id}"`);
+      assert.ok(registered, `package.json 声明了 ${id}，但 extension.ts 里找不到`);
+    }
+  });
+
   it('注册的命令都在 package.json 里声明了', () => {
     const declared = new Set((contributes.commands ?? []).map((c: { command: string }) => c.command));
     const registered = [...EXTENSION_SRC.matchAll(/reg\('([^']+)'/g)].map((m) => m[1]);

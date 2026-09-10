@@ -108,6 +108,19 @@ export function activate(context: vscode.ExtensionContext): void {
     provider.refresh();
   });
 
+  reg('tmuxTerminals.setModel', async (arg: unknown) => {
+    const it = item(arg);
+    if (it) await manager.setModelInteractive(it.entry);
+    provider.refresh();
+  });
+
+  reg('tmuxTerminals.setProfile', async (arg: unknown) => {
+    const it = item(arg);
+    if (it) await manager.setProfileInteractive(it.entry);
+    await poll();
+    provider.refresh();
+  });
+
   reg('tmuxTerminals.restoreAll', async () => {
     await manager.restoreAll();
     await poll();
