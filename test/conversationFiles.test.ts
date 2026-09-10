@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { listConversations } from '../src/conversationFiles';
+import { findConversations, listConversations } from '../src/conversationFiles';
 
 /**
  * 枚举 `~/.claude/projects/**` 下可接回的对话。
@@ -97,5 +97,46 @@ describe('listConversations', () => {
     assert.strictEqual(list.length, 1);
     assert.strictEqual(list[0].cwd, '/a/b', 'cwd 在文件开头，必须被读到');
     assert.strictEqual(list[0].summary, '', '首条用户消息超出头部读取上限时摘要为空，但不得报错');
+  });
+});
+
+describe('findConversations —— 按 id 直查（判断该用 --session-id 还是 --resume）', () => {
+  const homes: string[] = [];
+  const mk = async (files: Record<string, string>) => {
+    const h = await makeHome(files);
+    homes.push(h);
+    return h;
+  };
+  after(async () => {
+    for (const h of homes) await fs.rm(h, { recursive: true, force: true });
+  });
+
+  it('命中时返回它记录的 cwd', async () => {
+    const home = await mk({
+      [`-ssd-foo/${UUID}.jsonl`]: [line({ type: 'attachment', cwd: '/ssd/foo' }), userLine('hi', '/ssd/foo')].join('\n'),
+    });
+    assert.deepStrictEqual(await findConversations(home, UUID), ['/ssd/foo']);
+  });
+
+  it('这条对话还没被创建过 → 空数组（调用方据此用 --session-id 建出来）', async () => {
+    const home = await mk({});
+    assert.deepStrictEqual(await findConversations(home, UUID), []);
+  });
+
+  it('★ 同一个 id 出现在多个 cwd 下时全部返回（调用方要判断有没有落在本条目 cwd 下的）', async () => {
+    const home = await mk({
+      [`-a/${UUID}.jsonl`]: line({ type: 'attachment', cwd: '/a' }),
+      [`-b/${UUID}.jsonl`]: line({ type: 'attachment', cwd: '/b' }),
+    });
+    assert.deepStrictEqual((await findConversations(home, UUID)).sort(), ['/a', '/b']);
+  });
+
+  it('只认 .jsonl，且 projects 目录不存在时不抛', async () => {
+    const home = await mk({ [`-a/${UUID}.txt`]: line({ type: 'attachment', cwd: '/a' }) });
+    assert.deepStrictEqual(await findConversations(home, UUID), []);
+
+    const empty = await fs.mkdtemp(path.join(os.tmpdir(), 'tmuxterm-conv-none-'));
+    homes.push(empty);
+    assert.deepStrictEqual(await findConversations(empty, UUID), []);
   });
 });

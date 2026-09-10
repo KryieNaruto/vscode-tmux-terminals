@@ -52,10 +52,13 @@ describe('conversationCommand —— 条目 ↔ 对话绑定', () => {
     );
   });
 
-  it('continue：未绑定的退路（接该 cwd 下最近一条）', () => {
-    assert.strictEqual(
-      conversationCommand(e(), { kind: 'continue' }),
-      'claude --dangerously-skip-permissions --continue',
+  it('★ 不存在 continue 这条退路：共用 cwd 下会一起接到同一条最新对话上去', () => {
+    // 规格已删掉该分支（类型层面也没有了）。这里以运行时兜底守住回归：
+    // 一旦有人把 `--continue` 加回来，这条会失败。
+    assert.throws(
+      () => conversationCommand(e(), { kind: 'continue' } as never),
+      /未知的 LaunchSpec/,
+      '--continue 分支必须已从 conversationCommand 中删除',
     );
   });
 

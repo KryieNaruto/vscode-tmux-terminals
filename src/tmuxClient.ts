@@ -125,6 +125,24 @@ export class TmuxClient {
     }
   }
 
+  /**
+   * 抓取 pane **可视区域**的文本（不含 scrollback），只读。
+   *
+   * 刻意不带 `-S`：带了就会把历史滚屏也抓进来，而这些历史里可能正好有
+   * 用户自己 grep 过的同名字串，会让「--resume 失败了吗」的判断误报。
+   * 读不到（会话已死、目标写错）返回空串，由调用方按「没失败」保守处理。
+   */
+  async capturePane(name: string): Promise<string> {
+    try {
+      const { stdout } = await run(this.tmuxPath, [
+        'capture-pane', '-p', '-t', paneTarget(name),
+      ]);
+      return stdout;
+    } catch {
+      return '';
+    }
+  }
+
   /** 以字面量模式发送文本（不解释键名，也不做 shell 引用）。 */
   async sendLiteral(name: string, text: string): Promise<void> {
     await run(this.tmuxPath, ['send-keys', '-l', '-t', paneTarget(name), text]);
