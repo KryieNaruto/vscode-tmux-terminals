@@ -80,6 +80,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "test": "npm run compile && mocha \"out/test/**/*.test.js\"",
+    "e2e": "npm run compile && node test/e2e-harness.js",
     "package": "vsce package"
   },
   "devDependencies": {
