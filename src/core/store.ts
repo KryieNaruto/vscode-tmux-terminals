@@ -10,7 +10,58 @@ export function newId(): string {
 }
 
 export class EntryStore {
-  constructor(private readonly filePath: string) {}
+  constructor(
+    private readonly filePath: string,
+    /**
+     * 文件「存在但不可用」、已在被覆盖前另存为 `<file>.corrupt` 时回调。
+     * 宿主（extension.ts）据此提示用户 —— core 层不依赖 vscode。
+     */
+    private readonly onCorrupt?: (corruptPath: string) => void,
+  ) {}
+
+  /**
+   * 若目标文件**存在但不是一份可用的条目数组**（解析失败，或 JSON 合法却
+   * 不是数组），在它被覆盖之前，把原文原子地另存为 `<file>.corrupt`。
+   *
+   * 为什么：readRaw 把「不存在」「读不到」「存在但不可用」一律当成
+   * undefined，load() 随即返回 []；此时任何一次写入都会用一份新数组盖掉
+   * 用户的原始数据。而 `.bak` 只在 v1 迁移时生成，损坏场景下根本没有备份
+   * —— 本分支在**读路径**上拼命保住用户的 6 条条目，写路径却没有对称的
+   * 保护，一次 append 就能把 `{oooo` 变成一条空清单。
+   *
+   * 已存在的 `.corrupt` 不覆盖：第一份才是用户的原始数据。
+   * 返回 true 表示本次真的写出了恢复文件（供宿主提示一次）。
+   */
+  private async preserveIfCorrupt(): Promise<boolean> {
+    let text: string;
+    try {
+      text = await fs.readFile(this.filePath, 'utf8');
+    } catch {
+      return false; // 不存在（或读不到）→ 正常的空启动，无需保护
+    }
+    try {
+      if (Array.isArray(JSON.parse(text))) return false; // 可用 → 无需保护
+    } catch {
+      // 解析失败 → 落到下面，按损坏处理
+    }
+    const corrupt = `${this.filePath}.corrupt`;
+    try {
+      await fs.access(corrupt);
+      return false; // 已有恢复文件，不覆盖
+    } catch {
+      // 不存在 → 建它
+    }
+    // 原子写：先写唯一临时名再 rename，避免中途崩溃留下半份恢复文件
+    const tmp = `${corrupt}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    try {
+      await fs.writeFile(tmp, text, 'utf8');
+      await fs.rename(tmp, corrupt);
+    } catch (err) {
+      await fs.rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
+    return true;
+  }
 
   /** 读原始 JSON，宽容失败。返回 undefined 表示文件不存在或不是数组。 */
   private async readRaw(): Promise<unknown[] | undefined> {
@@ -51,9 +102,11 @@ export class EntryStore {
       const m = migrateEntry(item, i);
       if (m !== undefined) migrated.push(m);
     });
-    // 按 order 升序；order 相同时保持原下标顺序（稳定排序）
+    // 按 order 升序；order 相同时保持原下标顺序（稳定排序）。
+    // 负数 order 只可能来自手改文件（spec 规定从 0 递增），钳到 0 —— 否则
+    // 一个 -1 会永远排在最前，而后续写入又会把它重编号，状态自相矛盾。
     return migrated
-      .map((e, i) => ({ e, i }))
+      .map((e, i) => ({ e: { ...e, order: Math.max(0, e.order) }, i }))
       .sort((a, b) => (a.e.order - b.e.order) || (a.i - b.i))
       .map((x) => x.e);
   }
@@ -63,6 +116,10 @@ export class EntryStore {
    *
    * 只在真的要迁移时备份，且**已存在的备份不覆盖** —— 第一次的备份才是
    * 用户的原始数据，后续覆盖会让它失去意义。
+   *
+   * 注意备份名 `<file>.bak` **不带版本号**：将来若出现 v3 迁移，它必须改用
+   * 带版本的后缀（如 `.v2.bak`），否则 v3 的迁移会撞上这里"备份已存在"的
+   * 判断而静默跳过，让更晚（更接近现状）的那份状态失去保护。
    */
   async migrateAndBackup(): Promise<boolean> {
     const raw = await this.readRaw();
@@ -81,6 +138,12 @@ export class EntryStore {
   }
 
   async save(entries: TerminalEntry[]): Promise<void> {
+    // 覆盖之前先抢救。所有写路径（add/append/update/remove/reorder）都汇到
+    // 这里，是唯一需要守卫的咽喉 —— 放到 readRaw 里太早（读不动写时才知道
+    // 要不要保），放到各写方法里又会漏。
+    if (await this.preserveIfCorrupt()) {
+      this.onCorrupt?.(`${this.filePath}.corrupt`);
+    }
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
     // 临时名必须每次唯一。曾用固定的 `filePath + '.tmp'`，两次 save 交错时
     // 先完成者把 .tmp rename 走，后完成者 rename 时源已不存在 → ENOENT。

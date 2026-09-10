@@ -54,6 +54,59 @@ describe('EntryStore', () => {
     assert.deepStrictEqual(await store.load(), []);
   });
 
+  // 回归：损坏的存储文件曾被一次 append 直接覆盖，用户条目尽失，且没有
+  // 任何 .bak 可恢复（.bak 只在 v1 迁移时生成）。现在写路径必须在覆盖
+  // 之前把原文抢救到 <file>.corrupt。
+  it('不可解析的文件在写入前被另存为 .corrupt（不丢用户数据）', async () => {
+    const file = tmpFile();
+    const original = '{oooo';
+    fs.writeFileSync(file, original);
+    const store = new EntryStore(file);
+
+    await store.append({ id: 'a', name: 'a', cwd: '/w', profile: 'ccr', autoRestore: true });
+
+    assert.strictEqual(fs.readFileSync(file + '.corrupt', 'utf8'), original,
+      '.corrupt 必须原样保存损坏前的字节');
+    assert.deepStrictEqual((await store.load()).map((e) => e.name), ['a'],
+      '写入仍应正常进行（load 的宽容契约不变）');
+  });
+
+  it('.corrupt 已存在时不覆盖（第一份才是原始数据）', async () => {
+    const file = tmpFile();
+    fs.writeFileSync(file, '{first-broken');
+    fs.writeFileSync(file + '.corrupt', 'PRIOR');
+    const store = new EntryStore(file);
+    await store.append({ id: 'a', name: 'a', cwd: '/w', profile: 'ccr', autoRestore: true });
+    assert.strictEqual(fs.readFileSync(file + '.corrupt', 'utf8'), 'PRIOR');
+  });
+
+  it('文件不存在时不写 .corrupt（正常的空启动）', async () => {
+    const file = tmpFile();
+    const store = new EntryStore(file);
+    await store.append({ id: 'a', name: 'a', cwd: '/w', profile: 'ccr', autoRestore: true });
+    assert.strictEqual(fs.existsSync(file + '.corrupt'), false);
+  });
+
+  it('损坏时回调一次，携带 .corrupt 路径（供宿主提示用户）', async () => {
+    const file = tmpFile();
+    fs.writeFileSync(file, '{oooo');
+    const seen: string[] = [];
+    const store = new EntryStore(file, (p) => seen.push(p));
+    await store.append({ id: 'a', name: 'a', cwd: '/w', profile: 'ccr', autoRestore: true });
+    assert.deepStrictEqual(seen, [file + '.corrupt']);
+  });
+
+  it('负数 order 被钳到 0（手改文件也不能破坏排序契约）', async () => {
+    const file = tmpFile();
+    fs.writeFileSync(file, JSON.stringify([
+      { id: 'a', name: 'a', cwd: '/w', profile: 'ccr', autoRestore: true, order: -5 },
+      { id: 'b', name: 'b', cwd: '/w', profile: 'ccr', autoRestore: true, order: 1 },
+    ]));
+    const all = await new EntryStore(file).load();
+    assert.deepStrictEqual(all.map((e) => e.order), [0, 1]);
+    assert.deepStrictEqual(all.map((e) => e.name), ['a', 'b']);
+  });
+
   it('自动创建父目录', async () => {
     const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tmuxstore-')), 'a', 'b', 'terminals.json');
     const store = new EntryStore(file);

@@ -1,5 +1,4 @@
 import * as vscode from 'vscode';
-import * as os from 'os';
 import * as path from 'path';
 import { EntryStore } from './core/store';
 import { TmuxClient } from './tmuxClient';
@@ -21,7 +20,15 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   const tmux = new TmuxClient(cfg().get<string>('tmuxPath', 'tmux'));
-  const store = new EntryStore(storageFile());
+  // 清单文件被覆盖前若发现它已损坏/不可解析，store 会先把原文另存为
+  // `<file>.corrupt`。这里只负责把这件事告诉用户 —— 否则数据被抢救了
+  // 却无人知晓，用户会以为条目"自己没了"。
+  const store = new EntryStore(storageFile(), (corruptPath) => {
+    void vscode.window.showWarningMessage(
+      `终端清单文件无法解析，原始内容已保留为 ${corruptPath}。` +
+      `清单已按空列表继续，可从中手动恢复条目。`,
+    );
+  });
   const provider = new EntryTreeProvider(store);
   const manager = new TerminalManager(store, tmux);
 
@@ -135,10 +142,14 @@ export function activate(context: vscode.ExtensionContext): void {
     await poll();
   });
 
+  // 批量面板缓存自己的 entries 快照（entriesFor 读它），单条改动后不同步
+  // 刷新，批量操作就会基于过期数据：batchSetModel 按旧 profile 取模型清单，
+  // applyProfile 又会对「其实没切过」的条目提前返回。三者都需一并刷新。
   reg('tmuxTerminals.toggleAutoRestore', async (arg: unknown) => {
     const it = item(arg);
     if (it) await manager.toggleAutoRestore(it.entry);
     provider.refresh();
+    batchProvider.refresh();
   });
 
   // setModel 不 poll：改模型不改变会话存活状态，无需刷新存活标记
@@ -147,6 +158,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const it = item(arg);
     if (it) await manager.setModelInteractive(it.entry);
     provider.refresh();
+    batchProvider.refresh();
   });
 
   reg('tmuxTerminals.setProfile', async (arg: unknown) => {
@@ -154,6 +166,7 @@ export function activate(context: vscode.ExtensionContext): void {
     if (it) await manager.setProfileInteractive(it.entry);
     await poll();
     provider.refresh();
+    batchProvider.refresh();
   });
 
   reg('tmuxTerminals.restoreAll', async () => {
@@ -200,7 +213,7 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
     // 候选取第一条的 profile：批量场景下用户的心智是「这批统一成某个模型」
-    const { models } = await readProfileConfig(targets[0].profile, os.homedir());
+    const { models } = await readProfileConfig(targets[0].profile, manager.home());
     const CLEAR = '（清空，用 profile 默认）';
     const pick = await vscode.window.showQuickPick([...models, CLEAR], {
       title: `批量设置模型（${targets.length} 条）`,

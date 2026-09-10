@@ -150,11 +150,16 @@ export class EntryTreeProvider
     const draggedIds = item.value as string[];
     if (!Array.isArray(draggedIds) || draggedIds.length === 0) return;
 
+    // 拖到自身（或所选集合内任一条）上是 no-op。被拖的 id 会先从 ids 里
+    // 滤掉，于是 indexOf 目标返回 -1，若不拦就会落到「追加到末尾」——
+    // 把条目无端挪到队尾（模拟：[a,b,c,d] 把 a 拖到 a 会变成 [b,c,d,a]）。
+    const targetId = target instanceof EntryTreeItem ? target.entry.id : undefined;
+    if (targetId !== undefined && draggedIds.includes(targetId)) return;
+
     const all = await this.store.load();
     const ids = all.map((e) => e.id).filter((id) => !draggedIds.includes(id));
 
     // 目标未定义 = 拖到空白处 → 追加到末尾
-    const targetId = target instanceof EntryTreeItem ? target.entry.id : undefined;
     const at = targetId === undefined ? ids.length : ids.indexOf(targetId);
     const insertAt = at === -1 ? ids.length : at;
 
