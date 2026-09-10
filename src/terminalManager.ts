@@ -49,6 +49,15 @@ export class TerminalManager {
       return;
     }
 
+    // Map 是内存态，扩展宿主重启后会清空，而终端面板仍在。没有这道守卫
+    // 就会出现「两个面板连着同一个会话」，并再次制造 UI 与实际不符。
+    const reused = vscode.window.terminals.find((t) => t.name === entry.name);
+    if (reused) {
+      this.terminals.set(session, reused);
+      reused.show();
+      return;
+    }
+
     const cwd = this.cwdFor(entry);
     const wasAlive = await this.tmux.hasSession(session);
 
@@ -193,12 +202,27 @@ export class TerminalManager {
 
   async killSession(entry: TerminalEntry): Promise<void> {
     const pick = await vscode.window.showWarningMessage(
-      `杀掉远端 tmux 会话「${entry.name}」？其中正在运行的进程会一并终止。`,
+      `杀掉远端 tmux 会话「${entry.name}」？其中正在运行的进程会一并终止，对应终端也会关闭。`,
       { modal: true },
       '杀掉',
     );
     if (pick !== '杀掉') return;
-    await this.tmux.killSession(sessionNameFor(entry.id));
+
+    const session = sessionNameFor(entry.id);
+
+    // 顺序不能变：先摘客户端，再杀会话。否则「终端里的 attach」与「kill」
+    // 之间的时序窗口会让面板停在 tmux 界面，造成 UI 与实际不符。
+    await this.tmux.detachClients(session);
+    await this.tmux.killSession(session);
+
+    // 关掉面板并从 Map 清掉 —— 否则 Map 与 UI 不一致，下次点击会以为
+    // 「没有终端」而重新 attach，看起来就像「杀不掉」。
+    const term = this.terminals.get(session);
+    if (term) {
+      this.terminals.delete(session);
+      term.dispose();
+    }
+
     vscode.window.showInformationMessage(`已杀掉会话「${entry.name}」。`);
   }
 

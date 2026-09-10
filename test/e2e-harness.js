@@ -18,7 +18,7 @@
 const Module = require('module');
 const path = require('path');
 const fs = require('fs');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const { promisify } = require('util');
 const run = promisify(execFile);
 
@@ -45,6 +45,11 @@ const vscodeStub = {
   ThemeColor,
   MarkdownString,
   window: {
+    // openEntry 的「按名复用守卫」会读 window.terminals。这里给一个空数组：
+    // 现有 1–4 节模拟的是「扩展宿主重启后 Map 已空、面板也没存活」的场景，
+    // 必须让守卫查不到已存面板，才能继续走「重新 attach」路径并断言安全闸门。
+    // 不要把 createTerminal 塞进这里 —— 那会改变现有各节的断言语义。
+    terminals: [],
     createTerminal(opts) {
       const t = {
         name: opts && opts.name,
@@ -105,7 +110,8 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
 (async () => {
   const ID_A = 'e2e0000a';
   const ID_B = 'e2e0000ab';      // 与 A 互为前缀，验证互不干扰
-  const ALL = [ID_A, ID_B];
+  const ID_KILL = 'e2ekill0001';
+  const ALL = [ID_A, ID_B, ID_KILL];
   const store = {
     entries: [],
     async load() { return this.entries; },
@@ -191,7 +197,37 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
   chk('B 的创建没有把命令送进 A 会话', !calls.literals.some((l) => l.name === S(ID_A)),
     JSON.stringify(calls.literals));
 
-  console.log('\n=== 5. 清理 ===');
+  console.log('\n=== 5. 杀会话：会话销毁且无残留客户端 ===');
+  {
+    const s = S(ID_KILL);
+    await tmux.newSession(s, '/tmp');
+
+    // 起一个真实 pty 客户端附着，模拟 VS Code 终端里的 tmux attach
+    const client = spawn('script', ['-qec', `tmux attach -t =${s}`, '/dev/null'], {
+      stdio: 'ignore', detached: true,
+    });
+    await sleep(1500);
+
+    await tmux.detachClients(s);
+    await tmux.killSession(s);
+    await sleep(800);
+
+    chk('会话必须已被杀掉', (await tmux.hasSession(s)) === false);
+
+    // list-clients 在「无 server / 无客户端」时退出码非 0，视为「无客户端」
+    let clientsOut = '';
+    try {
+      ({ stdout: clientsOut } = await run('tmux', ['list-clients', '-F', '#{client_session}']));
+    } catch {
+      clientsOut = '';
+    }
+    chk('不应残留指向该会话的客户端', !clientsOut.includes(s), `实际：${clientsOut}`);
+
+    // 清掉进程组，避免留下游离的 script / tmux attach
+    try { process.kill(-client.pid); } catch {}
+  }
+
+  console.log('\n=== 6. 清理 ===');
   await killAll(ALL);
   const left = (await tmux.listSessions()).filter((s) => s.startsWith('tmuxterm-e2e'));
   chk('无残留测试会话', left.length === 0, left.join(', '));
