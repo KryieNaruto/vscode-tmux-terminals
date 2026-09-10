@@ -26,7 +26,8 @@
         {
           "id": "tmuxTerminals.list",
           "name": "终端清单"
-        }
+        },
+        { "id": "tmuxTerminals.batch", "name": "批量操作" }
       ]
     },
     "commands": [
@@ -40,13 +41,21 @@
       { "command": "tmuxTerminals.restoreAll", "title": "全部恢复", "icon": "$(history)" },
       { "command": "tmuxTerminals.refresh", "title": "刷新状态", "icon": "$(refresh)" },
       { "command": "tmuxTerminals.setModel", "title": "设置模型…", "icon": "$(chip)" },
-      { "command": "tmuxTerminals.setProfile", "title": "切换直连/中转", "icon": "$(plug)" }
+      { "command": "tmuxTerminals.setProfile", "title": "切换直连/中转", "icon": "$(plug)" },
+      { "command": "tmuxTerminals.batchSetCcr", "title": "设为中转", "icon": "$(cloud)" },
+      { "command": "tmuxTerminals.batchSetDirect", "title": "设为直连", "icon": "$(plug)" },
+      { "command": "tmuxTerminals.batchSetModel", "title": "批量设置模型…", "icon": "$(chip)" },
+      { "command": "tmuxTerminals.batchClear", "title": "清空选择", "icon": "$(clear-all)" }
     ],
     "menus": {
       "view/title": [
         { "command": "tmuxTerminals.restoreAll", "when": "view == tmuxTerminals.list", "group": "navigation@1" },
         { "command": "tmuxTerminals.add", "when": "view == tmuxTerminals.list", "group": "navigation@2" },
-        { "command": "tmuxTerminals.refresh", "when": "view == tmuxTerminals.list", "group": "navigation@3" }
+        { "command": "tmuxTerminals.refresh", "when": "view == tmuxTerminals.list", "group": "navigation@3" },
+        { "command": "tmuxTerminals.batchSetCcr", "when": "view == tmuxTerminals.batch", "group": "navigation@1" },
+        { "command": "tmuxTerminals.batchSetDirect", "when": "view == tmuxTerminals.batch", "group": "navigation@2" },
+        { "command": "tmuxTerminals.batchSetModel", "when": "view == tmuxTerminals.batch", "group": "navigation@3" },
+        { "command": "tmuxTerminals.batchClear", "when": "view == tmuxTerminals.batch", "group": "navigation@4" }
       ],
       "view/item/context": [
         { "command": "tmuxTerminals.open", "when": "view == tmuxTerminals.list", "group": "inline@1" },
