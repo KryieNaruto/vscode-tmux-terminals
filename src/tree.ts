@@ -1,36 +1,50 @@
 import * as vscode from 'vscode';
 import { commandFor } from './core/command';
+import { shortLabels } from './core/labels';
 import { sessionNameFor } from './core/tmux';
 import { TerminalEntry } from './core/types';
+
+/** profile 对应的徽标颜色。ccr=蓝（本地中转），direct=橙（官方直连）。 */
+function profileColor(entry: TerminalEntry): vscode.ThemeColor {
+  return new vscode.ThemeColor(
+    entry.profile === 'direct' ? 'charts.orange' : 'charts.blue',
+  );
+}
 
 /**
  * 清单里的一行。
  *
  * `contextValue` 决定右键菜单显隐：`killSession` 只在存活时出现，
  * 见 package.json 里 `viewItem == aliveSession` 的 when 条件。
+ *
+ * 存活与否用**图标形状**表示，profile 用**颜色**表示 —— 两个维度互不覆盖。
  */
 export class EntryTreeItem extends vscode.TreeItem {
   constructor(
     public readonly entry: TerminalEntry,
     public readonly alive: boolean,
+    /** 由 shortLabels() 算好的短路径，冲突时带父目录 */
+    public readonly shortPath: string,
   ) {
     super(entry.name, vscode.TreeItemCollapsibleState.None);
     this.id = entry.id;
     this.contextValue = alive ? 'aliveSession' : 'deadSession';
-    this.description = alive ? entry.cwd : `${entry.cwd}（无会话）`;
+    this.description = alive ? shortPath : `${shortPath}（无会话）`;
     this.tooltip = new vscode.MarkdownString(
       [
         `**${entry.name}**`,
         '',
         `- 目录：\`${entry.cwd}\``,
-        `- 状态：${alive ? '🟢 会话存活，点击接回原进程' : '⚪ 无会话，点击新建并执行预设命令'}`,
-        `- 预设命令：\`${commandFor(entry)}\``,
+        `- profile：${entry.profile === 'direct' ? '🟠 direct（官方直连）' : '🔵 ccr（本地中转）'}`,
+        `- 模型：${entry.model && entry.model.length > 0 ? `\`${entry.model}\`` : '（profile 默认）'}`,
+        `- 启动命令：\`${commandFor(entry)}\``,
+        `- 状态：${alive ? '🟢 会话存活，点击接回原进程' : '⚪ 无会话，点击新建并启动'}`,
         `- 参与全部恢复：${entry.autoRestore ? '是' : '否'}`,
       ].join('\n'),
     );
     this.iconPath = new vscode.ThemeIcon(
       alive ? 'circle-filled' : 'circle-outline',
-      alive ? new vscode.ThemeColor('terminal.ansiGreen') : undefined,
+      profileColor(entry),
     );
     this.command = {
       command: 'tmuxTerminals.open',
@@ -86,8 +100,9 @@ export class EntryTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     if (element) return [];
     this.entries = await this.store.load();
     if (this.entries.length === 0) return [new EmptyTreeItem()];
+    const labels = shortLabels(this.entries.map((e) => e.cwd));
     return this.entries.map(
-      (e) => new EntryTreeItem(e, this.alive.has(sessionNameFor(e.id))),
+      (e, i) => new EntryTreeItem(e, this.alive.has(sessionNameFor(e.id)), labels[i]),
     );
   }
 
