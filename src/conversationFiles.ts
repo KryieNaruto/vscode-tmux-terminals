@@ -69,6 +69,41 @@ async function readHead(file: string, bytes: number): Promise<string> {
 }
 
 /**
+ * 按 id 直查这条对话存在于哪些 cwd 下。
+ *
+ * 用途：判断该用 `--session-id`（把这条对话建出来）还是 `--resume`（接回它）。
+ * **按文件名直查，不做全量枚举** —— 全量枚举要读 292 个文件的头部（实测
+ * 冷启 3.5 s），而这里只需要 readdir 一层目录 + 读命中的那一个文件的头部。
+ *
+ * 返回**全部**命中的 cwd 而不是第一个：同一个 id 有可能出现在不同 cwd 的
+ * project 目录下，调用方要判断「有没有落在本条目的 cwd 下的」——`--resume`
+ * 是按 cwd 作用域的（见 core/conversation.ts 顶部注释）。
+ */
+export async function findConversations(home: string, id: string): Promise<string[]> {
+  const root = path.join(home, '.claude', 'projects');
+  let dirs: string[];
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    dirs = entries.filter((d) => d.isDirectory()).map((d) => d.name);
+  } catch {
+    return [];
+  }
+
+  const file = `${id}.jsonl`;
+  const found = await mapLimited(dirs, CONCURRENCY, async (dir) => {
+    const full = path.join(root, dir, file);
+    try {
+      const head = await readHead(full, HEAD_BYTES);   // 不存在会抛，跳过
+      return parseConversationHead(head).cwd;
+    } catch {
+      return undefined;
+    }
+  });
+
+  return found.filter((cwd): cwd is string => cwd !== undefined);
+}
+
+/**
  * 读出所有候选对话。
  *
  * 每一步都独立容错：某个 project 目录读不动、某个文件读不动，跳过即可，

@@ -254,8 +254,9 @@ Map 未命中时，先按终端名在 `vscode.window.terminals` 里查找同名�
    退出时会把用户困在裸 shell 里，见 §15。）*
 10. **有 `conversationId` 就必须 `--resume` 那一条，绝不重开新对话顶替**
     （§15）
-11. **没有绑定就不要猜。** 该 cwd 下有候选对话时问一次用户并永久记住；
-    用户取消 → 退回 `--continue` 且**不绑定**
+11. **没有绑定就不要猜。** 该 cwd 下有候选对话时问一次用户并永久记住。
+    用户按 Esc 取消 = **什么都不启动**（会话照常建/照常 attach），绝不退回
+    `--continue`（共用 cwd 下会一起接到同一条最新对话）
 
 ## 12. 验证方式
 
@@ -325,6 +326,28 @@ Map 未命中时，先按终端名在 `vscode.window.terminals` 里查找同名�
   conversationId、cwd 归属退化成前缀匹配、从不询问、去掉 shell-ready 闸门）
   均被对应测试捕获。
 
+### 订正（2026-09-10，第三次）：删掉 `--continue`，新条目在创建时绑定
+
+上一轮把「用户取消选择」退化成 `--continue`，并把「新建条目」和「老条目」
+都留在「无 conversationId」这一种状态里。审查后两处都改：
+
+- **`--continue` 兜底彻底删除**（连同 `restartClaude` 里的那一处）。理由见
+  §15.4：条目共用 cwd 时它会带着几个终端一起接到同一条最新对话上，两个
+  claude 同时写同一个 `.jsonl`。取消 = 什么都不启动；新对话只能由用户在
+  选择框里主动选「＋ 新建一条对话」；切 profile 时无绑定则拒绝重启。
+- **新条目在 `addEntryInteractive` / `duplicateEntry` 时分配 `conversationId`**，
+  于是「无 conversationId」此后只剩「本功能上线前的老条目」一种含义，
+  问它就是完全正确的；新建条目永远不会被弹选择框。
+- 由此引出「已绑定 ≠ 对话已存在」，用 `findConversations()` 按 id 直查来区分
+  `--session-id`（建出来）与 `--resume`（接回），不引入额外的状态字段。
+- **`--resume` 失败要看得见**（§15.4 末段），否则用户只会觉得「又没接上」。
+
+- **验证**：`npm test` 220 passing；`node test/e2e-harness.js` 全绿（15 节，
+  含「新建条目不问且用 --session-id」「Esc → 零发送」「无绑定切 profile → 拒绝」
+  「--resume 报错可见」「绑定对话在别的 cwd → 拒绝且不另开」）；
+  六处变异测试（Esc 隐式开新对话、无绑定不拒绝、不看 pane、忽略 cwd 匹配、
+  不区分「尚未创建」、cwd 冲突照发 --resume）均被对应断言捕获。
+
 
 ## 15. 条目 ↔ 对话绑定（2026-09-10 追加）
 
@@ -359,26 +382,50 @@ Map 未命中时，先按终端名在 `vscode.window.terminals` 里查找同名�
 
 `TerminalEntry` 增加 `conversationId?: string`（UUID）。
 
-- **未设** = 从未启动过 claude，或者从未绑定过的老条目（两者在数据上不可
-  区分，因此都走「问一次」的流程）。
+- **未设只表示「本功能上线前就存在的老条目」**（唯一需要问一次用户的场合）。
+  `addEntryInteractive` 在**创建条目时**就分配一个 id，所以新建的条目永远不会
+  被弹选择框。
 - 迁移（`core/migrate.ts`）**原样带过去，缺字段就保持 undefined，绝不编造**。
   `migrateEntry` 是 `EntryStore.load()` 的唯一守门人，漏一行就会**静默吞掉**
   用户已有的绑定，下一次恢复又变回「新开一条顶掉原来的」。
-- `duplicateEntry` **必须丢掉** `conversationId`：复制品是另一个终端，该有
-  自己的对话；照抄会让两条会话接进同一条对话，两边同时写同一个 `.jsonl`。
+- `duplicateEntry` **必须重新生成**一个：照抄会让两条会话接进同一条对话，
+  两边同时写同一个 `.jsonl`；留空则会被当成「老条目」而在下次恢复时弹选择框。
+- **「已绑定」不等于「那条对话已经存在」**：新建条目一出生就带 id，而对话要等
+  首次启动才被创建。因此发 `--session-id`（建出来）还是 `--resume`（接回它），
+  由 `findConversations()` 按 id 直查文件是否存在决定 —— 不靠额外字段记状态。
 
 ### 15.4 决策：`resolveLaunchSpec`
 
 | 情况 | 动作 |
 |---|---|
-| 已绑定 `conversationId` | `--resume <它>` |
-| 未绑定 + 该 cwd 下有候选对话 | 弹一次 QuickPick，选中 → 存为该条目的 id 并 `--resume` |
+| 已绑定，且那条对话**存在**（在条目 cwd 下） | `--resume <它>` |
+| 已绑定，但那条对话**还没被创建** | `--session-id <同一个 id>`（把它建出来） |
+| 已绑定，但那条对话**在别的 cwd 下** | **什么都不启动** + 报错指向「选择要接回的对话…」 |
+| 未绑定 + 该 cwd 下有候选对话 | 弹一次 QuickPick：选中对话 → 绑定并 `--resume`；选「＋ 新建一条对话」→ 绑定新 uuid 并 `--session-id` |
 | 未绑定 + 无候选 | `--session-id <新 uuid>`，并把新 id **落到条目上** |
-| 用户取消选择 | `--continue`，**不绑定**（下次还会问） |
+| 用户按 Esc 取消 | **什么都不启动**（会话照常建/照常 attach），给一条指向右键命令的提示；**不绑定** |
 
 候选 = `~/.claude/projects/*/*.jsonl` 中**文件内 `cwd` 字段精确等于**条目 cwd
 的那些，按 mtime 倒序；每项显示 `时间 · 首条用户消息摘要 · 体积`。
 已被其它条目绑走的对话在标签上标注「已绑给「X」」，避免选重。
+
+**为什么没有 `--continue` 兜底**（2026-09-10 二次修订删掉）：`claude --continue`
+接的是「该 cwd 下**最近**的一条对话」。条目共用 cwd 时（实测 4 条同目录），
+若几个条目都走它，就会一起接到同一条对话上，两个 claude 进程同时写同一个
+`.jsonl` —— 数据损坏级。所以「接哪条」要么由绑定决定，要么由用户当场指定：
+**新对话只能由用户主动选「＋ 新建一条对话」产生**，取消是没有结论，不是
+「给我开一条新的」。
+
+同理，`restartClaude`（切 profile 用的重启）在**没有绑定**时不再退回复
+`--continue`，而是**拒绝并提示先绑定** —— 宁可这次不重启，也不能接到错的
+对话上去。`LaunchSpec` 类型里已经没有 `continue` 分支，`conversationCommand`
+对未知 kind 直接抛错。
+
+**`--resume` 失败必须看得见**：会话文件不在该 cwd 下时 claude 会打印
+`No conversation found` 然后退出，pane 退回裸 shell。发完 `--resume` 后只读地
+轮询 `capture-pane` 最多 2.5 s（**只看可视区域末尾 5 行**，见
+`core/claude.ts#resumeFailed`；pane 更早的位置可能有用户自己 grep 过的同名
+字串，只看底部才不误报），命中则报错并指向「选择要接回的对话…」。
 
 **何时才允许发送**（唯一的闸门，见 §11 第 9 条）：`isShellReady(pane 前台进程)`。
 会话刚建好、或 claude 已退出回到 shell → 发；claude 还在跑 → 只 attach。
@@ -413,3 +460,6 @@ Map 未命中时，先按终端名在 `vscode.window.terminals` 里查找同名�
 - **删除 `src/core/plan.ts`**：它把「会话存活 → 不发命令」+`commandFor(entry)`
   （裸 claude，会开新对话顶掉原来的）写成了单一动作，语义已被这次订正取代；
   现在的闸门是 `core/tmux.ts#isShellReady`
+- `TmuxClient.capturePane`（只读抓 pane 可视区域）+ `core/claude.ts#resumeFailed`
+- `conversationFiles.ts#findConversations`（按 id 直查，判断该 `--session-id` 还是
+  `--resume`）

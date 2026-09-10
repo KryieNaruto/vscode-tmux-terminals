@@ -13,14 +13,28 @@ import { decideOpen } from './core/restore';
 import { isShellReady, sessionNameFor, shellQuote } from './core/tmux';
 import { Profile, TerminalEntry } from './core/types';
 import { LaunchSpec, conversationCommand } from './core/command';
-import { ConversationCandidate, candidatesForCwd, formatCandidate } from './core/conversation';
-import { isClaudeCommand } from './core/claude';
+import {
+  ConversationCandidate,
+  NEW_CONVERSATION_LABEL,
+  belongsToCwd,
+  candidatesForCwd,
+  formatCandidate,
+} from './core/conversation';
+import { isClaudeCommand, resumeFailed } from './core/claude';
 import { readProfileConfig } from './claudeConfig';
-import { listConversations } from './conversationFiles';
+import { findConversations, listConversations } from './conversationFiles';
 import { EntryStore, newConversationId, newId } from './core/store';
 import { TmuxClient } from './tmuxClient';
 
 const SHELL_READY_TIMEOUT_MS = 3000;
+
+/**
+ * 发完 `--resume` 后盯 pane 的时长与间隔。claude 接不上时会立刻打印
+ * `No conversation found` 并退出，2.5 s 足够；成功时下一次轮询就会看到
+ * 前台进程变成 claude，提前退出，不会白等。
+ */
+const RESUME_CHECK_TIMEOUT_MS = 2500;
+const RESUME_CHECK_INTERVAL_MS = 250;
 
 export class TerminalManager {
   /**
@@ -114,17 +128,20 @@ export class TerminalManager {
    * 候选 = `~/.claude/projects` 下**文件里记录的 cwd 精确等于该条目 cwd** 的
    * 对话，按 mtime 倒序。绝不靠目录名反推归属（转义规则不可靠）。
    *
-   * 返回 `total` 是为了让调用方区分「根本没有候选」与「用户取消」——
-   * 两者后续动作完全不同，不能都当成 undefined 一笔带过。
+   * 列表**末尾固定跟一项「＋ 新建一条对话」**：新对话只能由用户主动选出来，
+   * 绝不由「取消」隐式产生（见 resolveLaunchSpec）。
    */
   private async pickConversation(
     entry: TerminalEntry,
     title: string,
-  ): Promise<{ total: number; picked?: ConversationCandidate }> {
+  ): Promise<{ total: number; picked?: ConversationCandidate; startNew: boolean }> {
     const cwd = this.cwdFor(entry);
     return this.enqueuePick(async () => {
       const candidates = candidatesForCwd(await listConversations(this.home()), cwd);
-      if (candidates.length === 0) return { total: 0 };
+      if (candidates.length === 0) {
+        // 没有任何可接回的 → 没有列表可弹，调用方直接开一条新的
+        return { total: 0, startNew: false, picked: undefined };
+      }
 
       // 已被其它条目绑走的对话要标注出来：实测用户 4 条条目共用同一个 cwd，
       // 选重了会让两条会话接进同一条对话，两边同时写同一个 .jsonl。
@@ -135,44 +152,86 @@ export class TerminalManager {
         }
       }
 
-      const items = candidates.map((c) => {
+      // 末尾固定跟一项「＋ 新建一条对话」：新对话只能由用户主动选出来
+      const newItem = { label: NEW_CONVERSATION_LABEL, candidate: undefined };
+      const convoItems = candidates.map((c) => {
         const owner = owners.get(c.id);
         return {
           label: owner === undefined ? formatCandidate(c) : `${formatCandidate(c)} · 已绑给「${owner}」`,
           candidate: c,
         };
       });
-      const pick = await vscode.window.showQuickPick(items, {
+      const pick = await vscode.window.showQuickPick([...convoItems, newItem], {
         title,
         placeHolder: `${cwd} 下有 ${candidates.length} 条可接回的对话`,
       });
-      return { total: candidates.length, ...(pick ? { picked: pick.candidate } : {}) };
+      return {
+        total: candidates.length,
+        startNew: pick === newItem,
+        ...(pick && pick.candidate ? { picked: pick.candidate } : {}),
+      };
     });
   }
 
   /**
-   * 决定「该给这条条目发哪条启动命令」。顺序即优先级：
+   * 决定「该给这条条目发哪条启动命令」。返回 undefined = **什么都不启动**
+   * （会话照常建/照常 attach，pane 停在登录 shell，等用户主动处理）。
    *
-   *  1. 已绑定对话 → **必须** `--resume` 接回那一条（绝不重开一条顶替它，
-   *     那正是用户抱怨的「会话全部清空」）；
-   *  2. 未绑定 + 该 cwd 下有可接回的对话 → 问用户挑一次，挑中即永久绑定
-   *     （老条目：**不要猜**）；
-   *  3. 未绑定 + 无候选 → 用 `--session-id` 开一条新的并立刻绑定，
-   *     从此该条目就有自己的对话，多个条目共用同一 cwd 也不会串；
-   *  4. 用户取消选择 → 退回 `--continue`，不绑定（下次还会问）。
+   * 顺序即优先级：
+   *
+   *  1. 已绑定 → 该用 `--resume` 还是 `--session-id`，取决于那条对话**是否
+   *     已经存在**（`--session-id` 建出来 vs `--resume` 接回）。用 `+` 新建的
+   *     条目一出生就带 id，但那条对话还没被创建过，必须走前者。
+   *     对话存在、却不在本条目的 cwd 下 → `--resume` 按 cwd 作用域必然失败，
+   *     而**绝不替用户另开一条**，故返回 undefined 并说明原委。
+   *  2. 未绑定（只可能是本功能上线前的老条目）+ 该 cwd 下有候选 → 问用户挑
+   *     一次，挑中即永久绑定；列表末尾可选「＋ 新建一条对话」。
+   *  3. 未绑定 + 无候选 → 用 `--session-id` 开一条新的并立刻绑定。
+   *  4. 用户按 Esc 取消 → 返回 undefined，**什么都不启动**，并按提示可随时
+   *     右键重来。
    */
-  private async resolveLaunchSpec(entry: TerminalEntry): Promise<LaunchSpec> {
-    if (entry.conversationId !== undefined && entry.conversationId.length > 0) {
-      return { kind: 'resume', conversationId: entry.conversationId };
+  private async resolveLaunchSpec(entry: TerminalEntry): Promise<LaunchSpec | undefined> {
+    const cwd = this.cwdFor(entry);
+    const bound = entry.conversationId;
+    if (bound !== undefined && bound.length > 0) {
+      const cwds = await findConversations(this.home(), bound);
+      if (cwds.length === 0) {
+        // 还没被创建过（用 `+` 新建的条目就是这种）→ 把它建出来
+        return { kind: 'new', conversationId: bound };
+      }
+      if (cwds.some((c) => belongsToCwd(c, cwd))) {
+        return { kind: 'resume', conversationId: bound };
+      }
+      // 存在，但不在这个目录下 —— `--resume` 是按 cwd 作用域的，必然失败。
+      // 此时**绝不**换一条新对话把它顶掉，交给用户处理。
+      void vscode.window.showErrorMessage(
+        `「${entry.name}」绑定的对话不在 ${cwd} 下，无法接回（claude 的 --resume 只在原目录有效）。` +
+        `右键该条目选「选择要接回的对话…」可改绑本目录下的对话。`,
+      );
+      return undefined;
     }
 
-    const { total, picked } = await this.pickConversation(entry, `「${entry.name}」接回哪条对话？`);
+    const { total, picked, startNew } = await this.pickConversation(
+      entry, `「${entry.name}」接回哪条对话？`,
+    );
     if (total === 0) {
       const conversationId = newConversationId();
       await this.store.update(entry.id, { conversationId });
       return { kind: 'new', conversationId };
     }
-    if (picked === undefined) return { kind: 'continue' };
+    if (startNew) {
+      const conversationId = newConversationId();
+      await this.store.update(entry.id, { conversationId });
+      return { kind: 'new', conversationId };
+    }
+    if (picked === undefined) {
+      // 用户按 Esc：什么都不启动。绝不退回 `--continue` —— 条目共用 cwd 时
+      // 那会让几个终端一起接到同一条最新对话上去，两边同时写同一个 .jsonl。
+      void vscode.window.showInformationMessage(
+        `「${entry.name}」未接回对话。右键该条目选「选择要接回的对话…」可随时接回。`,
+      );
+      return undefined;
+    }
 
     await this.store.update(entry.id, { conversationId: picked.id });
     return { kind: 'resume', conversationId: picked.id };
@@ -185,21 +244,33 @@ export class TerminalManager {
    * 对的，不必也不该去打断正在跑的 claude。
    */
   async bindConversationInteractive(entry: TerminalEntry): Promise<void> {
-    const { total, picked } = await this.pickConversation(
+    const { total, picked, startNew } = await this.pickConversation(
       entry, `为「${entry.name}」选择要接回的对话`,
     );
-    if (picked === undefined) {
-      if (total === 0) {
-        void vscode.window.showInformationMessage(
-          `在 ${this.cwdFor(entry)} 下没有找到可接回的 claude 对话。`,
-        );
-      }
+
+    if (picked !== undefined) {
+      await this.store.update(entry.id, { conversationId: picked.id });
+      void vscode.window.showInformationMessage(
+        `「${entry.name}」已绑定对话 ${picked.id.slice(0, 8)}…，下次启动 claude 时会接回它。`,
+      );
       return;
     }
-    await this.store.update(entry.id, { conversationId: picked.id });
-    void vscode.window.showInformationMessage(
-      `「${entry.name}」已绑定对话 ${picked.id.slice(0, 8)}…，下次启动 claude 时会接回它。`,
-    );
+    if (startNew) {
+      const conversationId = newConversationId();
+      await this.store.update(entry.id, { conversationId });
+      void vscode.window.showInformationMessage(
+        `「${entry.name}」将开一条新对话 ${conversationId.slice(0, 8)}…，下次启动 claude 时使用。`,
+      );
+      return;
+    }
+    if (total === 0) {
+      // 这个目录下压根没有可接回的。**不替用户生成一条新对话** ——
+      // 这条命令的语义是「挑一条历史接回」，没有历史就说没有。
+      void vscode.window.showInformationMessage(
+        `在 ${this.cwdFor(entry)} 下没有找到可接回的 claude 对话。`,
+      );
+    }
+    // 其余情况 = 用户按 Esc 取消，什么都不改
   }
 
   private cwdFor(entry: TerminalEntry): string {
@@ -320,10 +391,40 @@ export class TerminalManager {
 
     // 在条目自己的 cwd 里启动 —— `--resume` 是按 cwd 作用域的，
     // 而会话本就是 `-c cwd` 建的，pane 的 cwd 与之一致。
-    // resolveLaunchSpec 可能弹一次 QuickPick（老条目没有绑定时）。
+    // resolveLaunchSpec 可能弹一次 QuickPick（老条目没有绑定时），也可能
+    // 返回 undefined 表示「这次什么都不启动」（用户取消 / 绑定与本目录冲突）。
     const spec = await this.resolveLaunchSpec(entry);
+    if (spec === undefined) return;
+
     await this.tmux.sendLiteral(session, conversationCommand(entry, spec));
     await this.tmux.sendEnter(session);
+
+    if (spec.kind === 'resume') await this.warnIfResumeFailed(session, entry);
+  }
+
+  /**
+   * 发完 `--resume` 后盯一眼 pane：claude 找不到那条对话时会打印
+   * `No conversation found` 然后退出，pane 退回裸 shell。不主动看的话，
+   * 用户只会觉得「又没接上」，无从知道原因，也无从知道该怎么办。
+   *
+   * **只读**，只看 pane 可视区域的末尾几行（见 core/claude.ts#resumeFailed），
+   * 绝不往 pane 里写任何东西。成功时会在下一次轮询就发现前台变成了 claude，
+   * 提前退出，不白等。
+   */
+  private async warnIfResumeFailed(session: string, entry: TerminalEntry): Promise<void> {
+    const deadline = Date.now() + RESUME_CHECK_TIMEOUT_MS;
+    for (;;) {
+      if (isClaudeCommand(await this.tmux.currentCommand(session))) return; // 起来了
+      if (resumeFailed(await this.tmux.capturePane(session))) {
+        void vscode.window.showErrorMessage(
+          `「${entry.name}」的对话没能接回（原对话不在该目录下）。` +
+          `右键该条目选「选择要接回的对话…」可手动指定。`,
+        );
+        return;
+      }
+      if (Date.now() >= deadline) return;
+      await new Promise((r) => setTimeout(r, RESUME_CHECK_INTERVAL_MS));
+    }
   }
 
   /**
@@ -380,10 +481,11 @@ export class TerminalManager {
    * 退出当前 claude 并按 `launch` 的配置重新启动，**接回原来那条对话**
    * （两个 profile 共用 ~/.claude/projects/，实测）。
    *
-   * 接回方式：有 `conversationId` 就 `--resume <它>`，没有才退回 `--continue`。
-   * **不能一律 `--continue`** —— 实测用户 4 个条目共用同一个 cwd，全部
-   * `--continue` 会一起接到同一条最新的对话上去（两边的 claude 还会同时
-   * 写同一个 .jsonl）—— 这正是本次要修的「串台」。
+   * 接回方式：**必须** `--resume <绑定的那条>`。没有绑定就**拒绝**，
+   * 提示用户先绑定 —— 绝不退回 `--continue`：实测用户 4 个条目共用同一个
+   * cwd，`--continue` 接的是「该 cwd 下最近的一条」，几个条目会一起接到
+   * 同一条对话上去，两边的 claude 同时写同一个 .jsonl，是数据损坏级的
+   * 问题。宁可这次不重启，也不能接到错的对话上去。
    *
    * `launch` 与 `entry` 分开传：调用方常需要「改某个字段后再启动」
    * （如清掉 model 以回落到 profile 默认），而提示语仍要用原条目的名字。
@@ -395,6 +497,14 @@ export class TerminalManager {
     launch: TerminalEntry,
   ): Promise<boolean> {
     const session = sessionNameFor(entry.id);
+    const bound = launch.conversationId;
+    if (bound === undefined || bound.length === 0) {
+      void vscode.window.showErrorMessage(
+        `「${entry.name}」还没有绑定对话，已拒绝重启 —— 无法确定该接回哪一条。` +
+        `请先用右键菜单「选择要接回的对话…」绑定，再切 profile。`,
+      );
+      return false;
+    }
     if (!(await this.canSendControl(session))) {
       this.refuse(entry, '重启 claude');
       return false;
@@ -412,16 +522,9 @@ export class TerminalManager {
       return false;
     }
 
-    // 有绑定就必须 --resume 那条对话；没有绑定才退回 --continue。
-    const bound = launch.conversationId;
-    const cmd = conversationCommand(
-      launch,
-      bound !== undefined && bound.length > 0
-        ? { kind: 'resume', conversationId: bound }
-        : { kind: 'continue' },
-    );
-    await this.tmux.sendLiteral(session, cmd);
+    await this.tmux.sendLiteral(session, conversationCommand(launch, { kind: 'resume', conversationId: bound }));
     await this.tmux.sendEnter(session);
+    await this.warnIfResumeFailed(session, entry);
     return true;
   }
 
@@ -492,8 +595,9 @@ export class TerminalManager {
   /**
    * 切换 profile（ccr ↔ direct），即换鉴权来源与端点。
    *
-   * 重启 CLI 并用 `--continue` 接回原对话 —— 两个 profile 共用
-   * `~/.claude/projects/`（实测 direct.json 不覆盖该目录）。
+   * 重启 CLI 并用 `--resume <该条目绑定的对话>` 接回原对话 —— 两个 profile
+   * 共用 `~/.claude/projects/`（实测 direct.json 不覆盖该目录）。
+   * 没有绑定则拒绝重启（见 restartClaude）：绝不退回复 `--continue`。
    *
    * model 一并清空：两个 profile 的模型命名空间不同（deepseek-* vs
    * claude-*），沿用旧值几乎必然无效，回落到新 profile 的默认才正确。
@@ -586,7 +690,7 @@ export class TerminalManager {
     const target: Profile = entry.profile === 'direct' ? 'ccr' : 'direct';
     const label = target === 'direct' ? '🟠 direct（官方直连）' : '🔵 ccr（本地中转）';
     const pick = await vscode.window.showWarningMessage(
-      `把「${entry.name}」切到 ${label}？运行中的 claude 会重启（用 --continue 接回原对话）。`,
+      `把「${entry.name}」切到 ${label}？运行中的 claude 会重启，并接回该条目绑定的对话。`,
       { modal: true },
       '切换',
     );
@@ -609,7 +713,13 @@ export class TerminalManager {
     const autoRestore = await this.askAutoRestore(true);
     if (autoRestore === undefined) return;
 
-    await this.store.append({ id: newId(), name, cwd, profile: 'ccr', autoRestore });
+    // 一出生就分配 conversationId：这样「无 conversationId」此后**只**表示
+    // 「本功能上线前的老条目」，新建的条目永远不会被弹选择框。
+    // 首次启动用 `--session-id <它>` 把这条对话建出来（见 resolveLaunchSpec）。
+    await this.store.append({
+      id: newId(), name, cwd, profile: 'ccr', autoRestore,
+      conversationId: newConversationId(),
+    });
   }
 
   async editEntryInteractive(entry: TerminalEntry): Promise<void> {
@@ -635,10 +745,13 @@ export class TerminalManager {
     // 用 append 而非 add：order 必须在 store 的锁内分配。
     // 直接复制 entry.order 会与源条目相同，排序随即不确定。
     //
-    // conversationId **必须丢掉**：复制品是另一个终端，该有自己的对话。
-    // 照抄会让两条会话接进同一条对话，两边同时写同一个 .jsonl。
+    // conversationId **必须重新生成**（不是照抄、也不是留空）：复制品是
+    // 另一个终端，该有自己的对话。照抄会让两条会话接进同一条对话，两边
+    // 同时写同一个 .jsonl；留空则会被当成「老条目」而在下次恢复时弹选择框。
     const { order: _dropOrder, conversationId: _dropConv, ...rest } = entry;
-    await this.store.append({ ...rest, id: newId(), name });
+    await this.store.append({
+      ...rest, id: newId(), name, conversationId: newConversationId(),
+    });
   }
 
   async deleteEntry(entry: TerminalEntry): Promise<void> {

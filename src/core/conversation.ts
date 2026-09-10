@@ -143,3 +143,9 @@ function localStamp(ms: number): string {
 export function formatCandidate(c: ConversationCandidate): string {
   return `${localStamp(c.mtimeMs)} · ${c.summary.length > 0 ? c.summary : '（无摘要）'} · ${formatBytes(c.bytes)}`;
 }
+
+/**
+ * 选择框末尾那项。**开新对话只能由用户主动选它**，绝不由「取消」隐式产生 ——
+ * 取消是没有结论，不是「给我开一条新的」。
+ */
+export const NEW_CONVERSATION_LABEL = '＋ 新建一条对话（不复用任何历史）';

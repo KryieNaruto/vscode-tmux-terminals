@@ -25,14 +25,17 @@ export function commandFor(entry: TerminalEntry): string {
  * 会话死掉后重建时这么做，等于把原来的对话顶掉 —— 用户看到「会话全部
  * 清空」，只能手动 `/resume` 去翻列表，而多个条目共用同一个 cwd 时根本
  * 分不清哪个终端对应哪条对话（实测 4 条条目同 cwd、15 条候选）。
+ *
+ * **刻意没有 `continue` 分支。** `claude --continue` 接的是「该 cwd 下最近
+ * 的一条对话」—— 条目共用 cwd 时（实测 4 条同目录），若都走它就会一起接到
+ * 同一条对话上去，两个 claude 进程同时写同一个 `.jsonl`，是数据损坏级的
+ * 问题。所以「接哪条」要么由绑定决定，要么由用户当场指定，绝不含糊。
  */
 export type LaunchSpec =
-  /** 首次启动：开一条全新对话并把它**永久绑定**到条目 */
+  /** 开一条全新对话（首次启动，或用户在选择框里主动选了「新建一条对话」） */
   | { kind: 'new'; conversationId: string }
-  /** 接回该条目已绑定的那条对话 */
-  | { kind: 'resume'; conversationId: string }
-  /** 未绑定时的退路：接该 cwd 下最近的一条（用户明确放弃绑定时才用） */
-  | { kind: 'continue' };
+  /** 接回指定的一条对话（条目绑定的，或用户当场选中的） */
+  | { kind: 'resume'; conversationId: string };
 
 /**
  * 由 LaunchSpec 派生出完整的启动命令行。
@@ -51,7 +54,9 @@ export function conversationCommand(entry: TerminalEntry, spec: LaunchSpec): str
       return `${base} --session-id ${shellQuote(spec.conversationId)}`;
     case 'resume':
       return `${base} --resume ${shellQuote(spec.conversationId)}`;
-    case 'continue':
-      return `${base} --continue`;
+    default:
+      // 运行时兜底：LaunchSpec 来自手写分支，一旦有人把 `--continue`
+      // （或别的含糊退路）加回来，宁可炸也不要静默接错对话。
+      throw new Error(`未知的 LaunchSpec：${JSON.stringify(spec)}`);
   }
 }
