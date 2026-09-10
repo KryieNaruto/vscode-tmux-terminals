@@ -26,6 +26,7 @@
 
 **Files:**
 - Create: `package.json`
+- Create: `package-lock.json`（由 `npm install` 生成，**必须提交**以固定依赖版本）
 - Create: `tsconfig.json`
 - Create: `.vscodeignore`
 - Create: `src/core/tmux.ts`
@@ -280,7 +281,7 @@ Expected: 全部 PASS（约 20 个断言）。
 - [ ] **Step 9: 提交**
 
 ```bash
-git add package.json tsconfig.json .vscodeignore src/core/tmux.ts test/core/tmux.test.ts
+git add package.json package-lock.json tsconfig.json .vscodeignore src/core/tmux.ts test/core/tmux.test.ts
 git commit -m "feat: 项目脚手架 + tmux 纯函数（精确目标/解析/引用/就绪判断）"
 ```
 
