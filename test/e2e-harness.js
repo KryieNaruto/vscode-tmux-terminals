@@ -6,8 +6,8 @@
  * TerminalManager.openEntry 对着**真 tmux** 驱动起来，从而自动验证
  * 几条最核心的不变量：
  *
- *   1. 会话不存在 → 新建，并执行预设命令
- *   2. 会话已存在 → 接回，**绝不执行预设命令**（本项目最重要的一条）
+ *   1. 会话不存在 → 新建，并发送 profile 派生的启动命令
+ *   2. 会话已存在 → 接回，**绝不发送任何命令**（本项目最重要的一条）
  *   3. 重复点击 → 复用已有终端，不新开
  *   4. 前缀相近的会话互不干扰
  *
@@ -23,7 +23,7 @@ const { promisify } = require('util');
 const run = promisify(execFile);
 
 // ---- 1. 注入 vscode stub ----
-const calls = { terminals: [], messages: [], warns: [], errors: [] };
+const calls = { terminals: [], messages: [], warns: [], errors: [], literals: [], newSessions: [] };
 
 class TreeItem {
   constructor(label) { this.label = label; }
@@ -98,12 +98,9 @@ async function killAll(ids) {
     try { await run('tmux', ['kill-session', '-t', `=${S(id)}`]); } catch {}
   }
 }
-async function paneText(id) {
-  try {
-    const { stdout } = await run('tmux', ['capture-pane', '-p', '-t', `=${S(id)}:`]);
-    return stdout;
-  } catch { return ''; }
-}
+
+// ccr profile 派生的启动命令（见 src/core/command.ts 的 commandFor）
+const CCR_COMMAND = 'claude --dangerously-skip-permissions';
 
 (async () => {
   const ID_A = 'e2e0000a';
@@ -114,18 +111,34 @@ async function paneText(id) {
     async load() { return this.entries; },
     async save(e) { this.entries = e; },
     async add(e) { this.entries.push(e); },
-    async update() {}, async remove() {}, async findByName() {},
+    async append(e) { this.entries.push({ ...e, order: this.entries.length }); },
+    async update() {}, async remove() {}, async findByName() {}, async reorder() {},
   };
   const { TmuxClient } = require(path.join(ROOT, 'out/src/tmuxClient.js'));
   const tmux = new TmuxClient('tmux');
+
+  // 记录「真正把命令送进 pane」的调用：openEntry 走 tmux.sendLiteral，
+  // 不走 terminal.sendText（后者只发 `tmux attach`）。这里包一层以断言
+  // 命令有没有被发送、发到了哪个会话。
+  const origSendLiteral = tmux.sendLiteral.bind(tmux);
+  tmux.sendLiteral = async (name, text) => {
+    calls.literals.push({ name, text });
+    return origSendLiteral(name, text);
+  };
+  const origNewSession = tmux.newSession.bind(tmux);
+  tmux.newSession = async (name, cwd) => {
+    calls.newSessions.push({ name, cwd });
+    return origNewSession(name, cwd);
+  };
+
   const mgr = new TerminalManager(store, tmux);
 
   await killAll(ALL);
 
-  const entryA = { id: ID_A, name: 'A', cwd: '/tmp', commands: ['echo MARKER_A'], autoRestore: true };
-  const entryB = { id: ID_B, name: 'B', cwd: '/tmp', commands: ['echo MARKER_B'], autoRestore: true };
+  const entryA = { id: ID_A, name: 'A', cwd: '/tmp', profile: 'ccr', autoRestore: true, order: 0 };
+  const entryB = { id: ID_B, name: 'B', cwd: '/tmp', profile: 'ccr', autoRestore: true, order: 0 };
 
-  console.log('=== 1. 会话不存在 → 新建并执行预设命令 ===');
+  console.log('=== 1. 会话不存在 → 新建并发送 profile 派生的命令 ===');
   await mgr.openEntry(entryA);
   await sleep(2500);
   const t1 = calls.terminals[calls.terminals.length - 1];
@@ -136,21 +149,24 @@ async function paneText(id) {
     t1.sent.some((s) => s.text.includes('tmux attach') && s.text.includes(S(ID_A))),
     JSON.stringify(t1.sent.map((s) => s.text)));
   chk('会话已建立', await tmux.hasSession(S(ID_A)));
-  const pane1 = await paneText(ID_A);
-  chk('预设命令 MARKER_A 已执行', pane1.includes('MARKER_A'), pane1.split('\n').slice(-4).join('|'));
+  chk('create 发送了 profile 派生的命令到 A 会话',
+    calls.literals.some((l) => l.name === S(ID_A) && l.text === CCR_COMMAND),
+    JSON.stringify(calls.literals));
 
-  console.log('\n=== 2. 会话已存在 → 接回，绝不执行预设命令（核心不变量） ===');
+  console.log('\n=== 2. 会话已存在 → 接回，绝不发送任何命令（核心不变量） ===');
   // 换一个 manager 模拟「SSH 断线重连后」的新会话
   const mgr2 = new TerminalManager(store, tmux);
   calls.terminals.length = 0;
-  await mgr2.openEntry({ ...entryA, commands: ['echo SHOULD_NOT_RUN'] });
+  calls.literals.length = 0;
+  calls.newSessions.length = 0;
+  await mgr2.openEntry(entryA);
   await sleep(1200);
   const t2 = calls.terminals[0];
   chk('接回的是已有会话', t2.sent.some((s) => s.text.includes('tmux attach')));
-  const pane2 = await paneText(ID_A);
-  chk('★ 预设命令未被送入会话', !pane2.includes('SHOULD_NOT_RUN'),
-    '命令污染了用户正在运行的进程 stdin！');
-  chk('原会话内容仍在（接回非重建）', pane2.includes('MARKER_A'));
+  chk('★ 接回时未发送任何命令（安全闸门）', calls.literals.length === 0,
+    '命令污染了用户正在运行的进程 stdin！' + JSON.stringify(calls.literals));
+  chk('接回未重建会话', calls.newSessions.length === 0,
+    JSON.stringify(calls.newSessions));
 
   console.log('\n=== 3. 重复点击 → 复用终端，不新开 ===');
   calls.terminals.length = 0;
@@ -163,14 +179,17 @@ async function paneText(id) {
   chk('第二次点击执行了 show()', calls.terminals[0].shown >= 2);
 
   console.log('\n=== 4. 前缀相近的会话互不干扰 ===');
+  calls.literals.length = 0;
+  calls.newSessions.length = 0;
   const mgr4 = new TerminalManager(store, tmux);
   await mgr4.openEntry(entryB);
   await sleep(2500);
   chk('B 的会话已建立', await tmux.hasSession(S(ID_B)));
   chk('A 的会话仍在（未被 B 影响）', await tmux.hasSession(S(ID_A)));
-  const paneB = await paneText(ID_B);
-  chk('B 执行了自己的命令 MARKER_B', paneB.includes('MARKER_B'));
-  chk('B 的会话里没有 A 的命令', !paneB.includes('MARKER_A'));
+  chk('B 执行了自己的命令', calls.literals.some((l) => l.name === S(ID_B)),
+    JSON.stringify(calls.literals));
+  chk('B 的创建没有把命令送进 A 会话', !calls.literals.some((l) => l.name === S(ID_A)),
+    JSON.stringify(calls.literals));
 
   console.log('\n=== 5. 清理 ===');
   await killAll(ALL);

@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { isV1Shape, migrateEntry } from './migrate';
 import { TerminalEntry } from './types';
 
 /** 生成条目 id。用 crypto 而非 Math.random，避免同一毫秒内碰撞。 */
@@ -8,40 +9,75 @@ export function newId(): string {
   return crypto.randomBytes(6).toString('hex');
 }
 
-/**
- * 条目清单的持久化。
- *
- * 写入走「写临时文件 → rename」：rename 在同一文件系统内是原子的，
- * 避免进程在写一半时被杀导致清单变成半个 JSON。
- *
- * 读取对损坏内容一律宽容（返回空数组），因为清单损坏不该让扩展
- * 整个激活失败 —— 用户还能重新添加条目。
- */
 export class EntryStore {
   constructor(private readonly filePath: string) {}
 
-  async load(): Promise<TerminalEntry[]> {
+  /** 读原始 JSON，宽容失败。返回 undefined 表示文件不存在或不是数组。 */
+  private async readRaw(): Promise<unknown[] | undefined> {
     let raw: string;
     try {
       raw = await fs.readFile(this.filePath, 'utf8');
     } catch {
-      return [];
+      return undefined;
     }
     try {
       const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) return [];
-      return parsed.filter(isEntry);
+      return Array.isArray(parsed) ? parsed : undefined;
     } catch {
-      return [];
+      return undefined;
     }
+  }
+
+  /**
+   * 载入条目。
+   *
+   * **顺序至关重要：先迁移，再过滤。** v2 的 isEntry 不再接受 commands
+   * 字段，若先过滤，v1 的条目会被全部静默丢弃（远端实测 6 条）。
+   *
+   * 读取不改写文件 —— 迁移结果只存在于内存，等用户下次真实改动时才落盘。
+   * 「打开个扩展就改了用户文件」是不可接受的副作用。
+   */
+  async load(): Promise<TerminalEntry[]> {
+    const raw = await this.readRaw();
+    if (raw === undefined) return [];
+    const migrated: TerminalEntry[] = [];
+    raw.forEach((item, i) => {
+      const m = migrateEntry(item, i);
+      if (m !== undefined) migrated.push(m);
+    });
+    // 按 order 升序；order 相同时保持原下标顺序（稳定排序）
+    return migrated
+      .map((e, i) => ({ e, i }))
+      .sort((a, b) => (a.e.order - b.e.order) || (a.i - b.i))
+      .map((x) => x.e);
+  }
+
+  /**
+   * 若文件是 v1 形态，备份为 `<file>.bak` 并返回 true。
+   *
+   * 只在真的要迁移时备份，且**已存在的备份不覆盖** —— 第一次的备份才是
+   * 用户的原始数据，后续覆盖会让它失去意义。
+   */
+  async migrateAndBackup(): Promise<boolean> {
+    const raw = await this.readRaw();
+    if (raw === undefined) return false;
+    if (!raw.some(isV1Shape)) return false;
+    const bak = `${this.filePath}.bak`;
+    try {
+      await fs.access(bak);
+      return false; // 已有备份，不覆盖
+    } catch {
+      // 不存在 → 建它
+    }
+    const text = await fs.readFile(this.filePath, 'utf8');
+    await fs.writeFile(bak, text, 'utf8');
+    return true;
   }
 
   async save(entries: TerminalEntry[]): Promise<void> {
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
     // 临时名必须每次唯一。曾用固定的 `filePath + '.tmp'`，两次 save 交错时
     // 先完成者把 .tmp rename 走，后完成者 rename 时源已不存在 → ENOENT。
-    // 而 `add` 是 load→改→save，两次并发 add 会互相覆盖（丢更新）—— 见
-    // 下面的写锁，两者一起才能保证并发安全。
     const tmp = `${this.filePath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
     try {
       await fs.writeFile(tmp, JSON.stringify(entries, null, 2), 'utf8');
@@ -55,15 +91,14 @@ export class EntryStore {
   /**
    * 串行化「读-改-写」。
    *
-   * `add` / `update` / `remove` 都是 load→修改→save 的复合操作。并发调用
-   * 时两次 load 会读到同一份旧数据，后写的覆盖先写的，造成丢更新
-   * （实测两次并发 add 只留下 1 条）。所有写操作在此排队。
+   * `add` / `append` / `update` / `remove` / `reorder` 都是 load→修改→save
+   * 的复合操作。并发调用时两次 load 会读到同一份旧数据，后写的覆盖先写的，
+   * 造成丢更新（实测两次并发 add 只留下 1 条）。所有写操作在此排队。
    */
   private writeChain: Promise<unknown> = Promise.resolve();
 
   private enqueue<T>(op: () => Promise<T>): Promise<T> {
     const next = this.writeChain.then(op, op);
-    // 让链条不因单次失败而断掉
     this.writeChain = next.catch(() => {});
     return next;
   }
@@ -72,6 +107,22 @@ export class EntryStore {
     return this.enqueue(async () => {
       const all = await this.load();
       all.push(entry);
+      await this.save(all);
+    });
+  }
+
+  /**
+   * 追加一条新条目，**order 在锁内分配**。
+   *
+   * 不能在调用方算 order：`load` 与 `append` 之间没有锁，两次并发新增会
+   * 算出同一个 order，排序随即变得不确定。也不能让调用方传 0 —— 那样每条
+   * 新条目的 order 都相同。
+   */
+  async append(entry: Omit<TerminalEntry, 'order'>): Promise<void> {
+    return this.enqueue(async () => {
+      const all = await this.load();
+      const next = all.reduce((m, e) => Math.max(m, e.order), -1) + 1;
+      all.push({ ...entry, order: next });
       await this.save(all);
     });
   }
@@ -93,12 +144,36 @@ export class EntryStore {
     });
   }
 
+  /**
+   * 按给定 id 顺序重排，并把 order 重编号为 0..n-1。
+   *
+   * 重编号而非累加：连续拖拽会让 order 无限增长，且容易出现相等值。
+   * 未出现在 ids 里的条目追加在末尾（防御：调用方的列表可能已过期）。
+   */
+  async reorder(idsInNewOrder: string[]): Promise<void> {
+    return this.enqueue(async () => {
+      const all = await this.load();
+      const byId = new Map(all.map((e) => [e.id, e]));
+      const reordered: TerminalEntry[] = [];
+      for (const id of idsInNewOrder) {
+        const e = byId.get(id);
+        if (e !== undefined) {
+          reordered.push(e);
+          byId.delete(id);
+        }
+      }
+      reordered.push(...byId.values());
+      await this.save(reordered.map((e, i) => ({ ...e, order: i })));
+    });
+  }
+
   async findByName(name: string): Promise<TerminalEntry | undefined> {
     const all = await this.load();
     return all.find((e) => e.name === name);
   }
 }
 
+/** v2 形态校验。注意不再接受 commands 字段。 */
 function isEntry(v: unknown): v is TerminalEntry {
   if (typeof v !== 'object' || v === null) return false;
   const o = v as Record<string, unknown>;
@@ -106,8 +181,9 @@ function isEntry(v: unknown): v is TerminalEntry {
     typeof o.id === 'string' &&
     typeof o.name === 'string' &&
     typeof o.cwd === 'string' &&
-    Array.isArray(o.commands) &&
-    o.commands.every((c) => typeof c === 'string') &&
-    typeof o.autoRestore === 'boolean'
+    (o.profile === 'ccr' || o.profile === 'direct') &&
+    (o.model === undefined || typeof o.model === 'string') &&
+    typeof o.autoRestore === 'boolean' &&
+    typeof o.order === 'number'
   );
 }

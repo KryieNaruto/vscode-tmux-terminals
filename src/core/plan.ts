@@ -1,3 +1,4 @@
+import { commandFor } from './command';
 import { TerminalEntry } from './types';
 
 export type RestoreMode = 'attach' | 'create';
@@ -22,5 +23,5 @@ export function planRestore(entry: TerminalEntry, alive: boolean): RestorePlan {
   if (alive) {
     return { mode: 'attach', commands: [] };
   }
-  return { mode: 'create', commands: [...entry.commands] };
+  return { mode: 'create', commands: [commandFor(entry)] };
 }
