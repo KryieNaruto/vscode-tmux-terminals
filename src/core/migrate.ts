@@ -6,9 +6,10 @@ import { Profile, TerminalEntry } from './types';
  * v1 形态：{ id, name, cwd, commands: string[], autoRestore }
  * v2 形态：{ id, name, cwd, profile, model?, autoRestore, order }
  *
- * **为什么必须存在：** EntryStore.load() 会用 isEntry 过滤条目，而 v2 的
- * isEntry 不再接受 commands 字段。若不先迁移就过滤，用户已有的条目会被
- * **静默丢弃**（远端实测 6 条）。
+ * **为什么必须存在：** EntryStore.load() 把 migrateEntry 当作**唯一的守门
+ * 人** —— 载入时没有别的过滤阶段，只跑 migrateEntry；它返回 undefined 的
+ * 条目即被丢弃。因此迁移必须**保留所有必需字段**（而不是拒绝不熟悉的
+ * 字段）：否则用户已有的 v1 条目会被**静默丢弃**（远端实测 6 条）。
  *
  * 迁移是幂等的：已是 v2 形态的条目原样返回。
  */
