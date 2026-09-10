@@ -38,6 +38,23 @@ export function activate(context: vscode.ExtensionContext): void {
   });
   context.subscriptions.push(batchView);
 
+  // v1→v2 迁移前先备份一次用户数据。只在文件真的是 v1 形态时备份，且
+  // 已有 .bak 不覆盖 —— 第一次的备份才是原始数据。备份失败只静默：读文件
+  // 已成功，这里只兜 .bak 写不进去的情况，绝不让一次备份失败阻断扩展启动
+  // 或抛出未处理的 rejection。
+  void store
+    .migrateAndBackup()
+    .then((did) => {
+      if (did) {
+        void vscode.window.showInformationMessage(
+          '终端清单已升级到新格式，原文件已备份为 terminals.json.bak。',
+        );
+      }
+    })
+    .catch(() => {
+      // 忽略：备份只是防御手段，失败不影响正常使用。
+    });
+
   // ---- 存活状态轮询 ----
   let inFlight = false;
   const poll = async () => {

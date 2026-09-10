@@ -3,6 +3,7 @@ src/**
 test/**
 docs/**
 node_modules/**
+.superpowers/**
 out/test/**
 **/*.map
 tsconfig.json
