@@ -28,7 +28,8 @@ export class TerminalManager {
     });
   }
 
-  private home(): string {
+  /** 远端家目录。公开供扩展层复用，避免各处各算一份。 */
+  home(): string {
     // 扩展跑在远端，os.homedir() 即远端家目录
     return os.homedir();
   }
@@ -172,7 +173,9 @@ export class TerminalManager {
   }
 
   /**
-   * 退出当前 claude 并按 `launch` 的配置重新启动。
+   * 退出当前 claude 并按 `launch` 的配置重新启动，**始终 `--continue`**
+   * 接回原对话（两个 profile 共用 ~/.claude/projects/，实测）—— 这是唯一
+   * 调用方（applyProfile）的需要，故不再保留 resume 开关。
    *
    * `launch` 与 `entry` 分开传：调用方常需要「改某个字段后再启动」
    * （如清掉 model 以回落到 profile 默认），而提示语仍要用原条目的名字。
@@ -182,7 +185,6 @@ export class TerminalManager {
   private async restartClaude(
     entry: TerminalEntry,
     launch: TerminalEntry,
-    resume: boolean,
   ): Promise<boolean> {
     const session = sessionNameFor(entry.id);
     if (!(await this.canSendControl(session))) {
@@ -202,9 +204,8 @@ export class TerminalManager {
       return false;
     }
 
-    const base = commandFor(launch);
     // --continue 接回原对话：两个 profile 共用 ~/.claude/projects/（实测）
-    const cmd = resume ? `${base} --continue` : base;
+    const cmd = `${commandFor(launch)} --continue`;
     await this.tmux.sendLiteral(session, cmd);
     await this.tmux.sendEnter(session);
     return true;
@@ -225,9 +226,11 @@ export class TerminalManager {
    * 配置、提示下次启动生效。
    */
   /**
-   * 返回 false 表示被安全守卫拒绝（或目标模型无法确定），未改动配置；
-   * true 表示已成功应用（未运行 = 只落配置，也算成功）。与 restartClaude
-   * 一样用布尔回报结果，供批量套用据此统计「成功/失败」，而非把拒绝当成功。
+   * 返回 false 表示被安全守卫拒绝，未改动配置；true 表示已成功应用。
+   * 注意「目标模型无法确定」（清空且读不到 profile 默认）**不是**失败：
+   * 它照常落配置、返回 true，只是推迟到下次启动生效。
+   * 与 restartClaude 一样用布尔回报结果，供批量套用据此统计
+   * 「成功/失败」，而非把拒绝当成功。
    */
   async applyModel(entry: TerminalEntry, model: string | undefined): Promise<boolean> {
     const session = sessionNameFor(entry.id);
@@ -257,6 +260,15 @@ export class TerminalManager {
       this.refuse(entry, '切模型');
       return false;
     }
+    // 控制字符会把一行 `/model x` 拆成两条输入：`sendLiteral` 不解释 `\n`，
+    // 但终端把它当回车 —— 第二行会作为新的键盘输入打进活着的会话。模型名
+    // 来自 settings.json，手改就可能带上换行。宁可拒绝，绝不盲发。
+    if (/[\r\n]/.test(target)) {
+      void vscode.window.showErrorMessage(
+        `「${entry.name}」的目标模型名含换行符，已拒绝发送 /model（疑似 settings.json 被改坏）。`,
+      );
+      return false;
+    }
     await this.tmux.sendLiteral(session, `/model ${target}`);
     await this.tmux.sendEnter(session);
     await this.store.update(entry.id, { model: normalized });
@@ -281,14 +293,13 @@ export class TerminalManager {
     const session = sessionNameFor(entry.id);
 
     if (await this.tmux.hasSession(session)) {
-      const ok = await this.restartClaude(
-        entry,
-        { ...entry, profile, model: undefined },
-        true,
-      );
+      const ok = await this.restartClaude(entry, { ...entry, profile, model: undefined });
       if (!ok) return false; // 被拒绝时不动配置
     }
-    await this.store.update(entry.id, { profile });
+    // model 必须一并落盘：store.update **合并**补丁，只写 profile 会让旧的
+    // model（ccr 命名空间，如 deepseek-*）残留 —— 启动命令会带着无效的
+    // --model，冷启动随即失败。清空才与新 profile 的命名空间一致。
+    await this.store.update(entry.id, { profile, model: undefined });
     return true;
   }
 

@@ -18,14 +18,15 @@ export async function readProfileConfig(
   const file = profile === 'direct'
     ? '/etc/claude/direct.json'
     : path.join(home, '.claude', 'settings.json');
-  let raw: string;
   try {
-    raw = await fs.readFile(file, 'utf8');
+    const raw = await fs.readFile(file, 'utf8');
+    // parse* 目前不会抛，但「宽容」是本函数的契约：把它们放在 try 内，
+    // 让「读或解析失败都退化为空清单」这一点在本地一眼可见。
+    return {
+      models: parseAvailableModels(raw),
+      defaultModel: parseDefaultModel(raw),
+    };
   } catch {
     return { models: [] };
   }
-  return {
-    models: parseAvailableModels(raw),
-    defaultModel: parseDefaultModel(raw),
-  };
 }
