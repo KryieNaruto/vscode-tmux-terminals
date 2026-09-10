@@ -235,7 +235,7 @@ Map 未命中时，先按终端名在 `vscode.window.terminals` 里查找同名�
 
 ## 11. 不变量清单（实施与测试必须守住）
 
-1. 竞态兜底**只能把命令降级为空，永远不能凭空加出命令**（v1 原文，继续有效）
+1. 竞态兜底**只能把命令降级为不发，永远不能凭空加出命令**（v1 原文，措辞按 §15 订正）
 2. 控制序列只在「会话存活且前端确认是 claude」时发送，否则拒绝并说明
 3. 任何"会话可能属于别人"的迹象 → 一律不发送
 4. 拖拽重排只改本地顺序，绝不触发 tmux 操作
@@ -247,6 +247,15 @@ Map 未命中时，先按终端名在 `vscode.window.terminals` 里查找同名�
 8. **绝不往「状态不明」的面板里打字。** 复用面板前必须能证明它空闲停在
    shell 提示符上（shell integration 在场且无命令在跑）；判不出来一律新建
    面板 —— 宁可多一个面板，也不能打断用户正在跑的编译
+9. **往会话里发送启动命令的唯一闸门是「pane 前台确实是登录 shell」**
+   （`isShellReady`，绝不放宽到 `node`）。前台是 claude → 对话原样在跑，
+   只 attach、绝不打扰；前台是别的进程（编译、REPL）或读不出 → 一律不发送。
+   *（本条取代了 v2 首发时的「会话存活就一律不发送」—— 那条在 claude 已
+   退出时会把用户困在裸 shell 里，见 §15。）*
+10. **有 `conversationId` 就必须 `--resume` 那一条，绝不重开新对话顶替**
+    （§15）
+11. **没有绑定就不要猜。** 该 cwd 下有候选对话时问一次用户并永久记住；
+    用户取消 → 退回 `--continue` 且**不绑定**
 
 ## 12. 验证方式
 
@@ -287,8 +296,120 @@ Map 未命中时，先按终端名在 `vscode.window.terminals` 里查找同名�
 - **未改动的部分（有意保留）**：会话原本就存活时，**仍然**不发送
   `commandFor(entry)` 派生的启动命令。因此「存活会话的 pane 只是裸 shell」
   不会自动补发 claude —— 那是另一件事，需与用户确认后再做。
+  *（这一条已被下面的修订取代，见 §15。）*
 - **验证**：`npm test`（含新增 `test/core/restore.test.ts`、`parseAttachedCount`
   单测与 `attachedClients` 集成测试）、`node test/e2e-harness.js` 全绿；
   三处变异测试（退回「命中即 show」、空输出当成 0、去掉 idle 闸门）均被
   对应测试捕获。
 
+### 订正（2026-09-10，同上，用户补充需求）：条目 ↔ 对话绑定
+
+- **症状**：批量恢复后「会话全部清空」，claude 进去还要手动 `/resume` 翻列表，
+  且多个条目共用同一 cwd 时分不清哪个终端对应哪条对话。
+- **根因**：恢复已死会话时用的是**裸 `claude`**（`commandFor` 不带任何
+  resume 参数）→ 开了一条全新对话，把原来的顶掉。上一行的「存活会话的 pane
+  只是裸 shell 时也绝不补发命令」在 claude 已退出时会把用户困在裸 shell，
+  同样是「回不到原对话」。
+- **修法**：给条目永久绑定 `conversationId`（§15）；恢复时一律
+  `--resume <它>`；首次启动用 `--session-id` 开一条并绑定；老条目问一次。
+  发送闸门从「会话是否存活」改为 **`isShellReady(pane 前台进程)`** ——
+  claude 在跑就只 attach，claude 已退出才启动（§11 第 9 条）。
+  `restartClaude` 的 `--continue` 也一并改为「有绑定就 `--resume`」。
+- **删除**：`src/core/plan.ts`（及其测试）。它把已过时的
+  「存活 → 不发命令」+「裸 claude」写成了单一动作，语义已被取代。
+- **验证**：`npm test`（新增 `test/core/conversation.test.ts`、
+  `test/conversationFiles.test.ts`，扩展 command/migrate 测试）、
+  `node test/e2e-harness.js`（重写为 12 节，含「已死→--resume」「claude 在跑→
+  只 attach」「claude 已退出→--resume」「老条目询问/取消」「切 profile 用
+  --resume」）全绿；五处变异测试（resume 退化成 --continue、迁移吞掉
+  conversationId、cwd 归属退化成前缀匹配、从不询问、去掉 shell-ready 闸门）
+  均被对应测试捕获。
+
+
+## 15. 条目 ↔ 对话绑定（2026-09-10 追加）
+
+### 15.1 用户症状
+
+> 点击你的批量恢复，所有会话全部因为 tmux attach，导致变成 history restored，
+> 会话全部清空！claude 进去后，也要 resume 去找是哪个会话，和终端完全不能
+> 自动对上。**我希望的是批量恢复后，各个会话能回到 claude 各自当时所在的对话中去。**
+
+会话**活着**时不需要任何补救：它的 pane 里就是那条对话，attach 上去即可。
+问题全在**会话已死**的那条路径上：旧代码重开会话 + 裸起 `claude` ——
+不带任何参数的 `claude` 会开一条**全新对话**，等于把原来的顶掉。用户只能
+手动 `/resume` 翻列表，而 `/resume` 里根本分不清哪个终端对应哪条对话
+（实测 4 条条目共用 `/ssd/qiansenwei/workspace`、3 条共用同一 strip-qt-ui
+目录，各自的候选分别有 15 条和 12 条）。
+
+### 15.2 设计前已验证的前提（实测结论，勿重复实验）
+
+| # | 结论 |
+|---|---|
+| 1 | `claude --session-id <uuid>` 能指定会话 id，会话文件落在 `~/.claude/projects/<munged-cwd>/<uuid>.jsonl` ✅ |
+| 2 | `claude --resume <uuid>` **按 cwd 作用域**：从别的 cwd 运行会报 `No conversation found with session ID` ❌ |
+| 3 | 在会话自己的 cwd 里 `claude --resume <uuid>` **能精确接回那条对话** ✅ |
+| 4 | claude 进程**不长期持有** .jsonl 的 fd，无法从 `/proc/<pid>/fd` 反查运行中会话的 id ❌ |
+| 5 | 每个会话文件里记录了 `"cwd":"<绝对路径>"` —— **枚举候选一律按这个字段筛，不要猜目录名转义规则**（实测 `_` 和 `.` 也会被换成 `-`） ✅ |
+
+第 2 + 5 条决定了设计：**恢复必须在条目自己的 cwd 里 launch**（扩展本来就用
+`-c cwd` 建会话，天然满足），而**绑定关系只能由扩展自己记**（第 4 条排除了
+反查运行中 claude 的可能性）。
+
+### 15.3 数据模型
+
+`TerminalEntry` 增加 `conversationId?: string`（UUID）。
+
+- **未设** = 从未启动过 claude，或者从未绑定过的老条目（两者在数据上不可
+  区分，因此都走「问一次」的流程）。
+- 迁移（`core/migrate.ts`）**原样带过去，缺字段就保持 undefined，绝不编造**。
+  `migrateEntry` 是 `EntryStore.load()` 的唯一守门人，漏一行就会**静默吞掉**
+  用户已有的绑定，下一次恢复又变回「新开一条顶掉原来的」。
+- `duplicateEntry` **必须丢掉** `conversationId`：复制品是另一个终端，该有
+  自己的对话；照抄会让两条会话接进同一条对话，两边同时写同一个 `.jsonl`。
+
+### 15.4 决策：`resolveLaunchSpec`
+
+| 情况 | 动作 |
+|---|---|
+| 已绑定 `conversationId` | `--resume <它>` |
+| 未绑定 + 该 cwd 下有候选对话 | 弹一次 QuickPick，选中 → 存为该条目的 id 并 `--resume` |
+| 未绑定 + 无候选 | `--session-id <新 uuid>`，并把新 id **落到条目上** |
+| 用户取消选择 | `--continue`，**不绑定**（下次还会问） |
+
+候选 = `~/.claude/projects/*/*.jsonl` 中**文件内 `cwd` 字段精确等于**条目 cwd
+的那些，按 mtime 倒序；每项显示 `时间 · 首条用户消息摘要 · 体积`。
+已被其它条目绑走的对话在标签上标注「已绑给「X」」，避免选重。
+
+**何时才允许发送**（唯一的闸门，见 §11 第 9 条）：`isShellReady(pane 前台进程)`。
+会话刚建好、或 claude 已退出回到 shell → 发；claude 还在跑 → 只 attach。
+
+### 15.5 性能：候选枚举必须并发
+
+实测用户机器上 `~/.claude/projects` 有 31 个目录、292 个会话文件、合计 404 MB：
+
+- 串行逐个 `open` + 读 64 KB 头部：**8.7 s**
+- 并发（上限 32）：**43 ms**
+
+串行会让「全部恢复」在弹出选择框之前先卡十几秒 —— 那本身就是用户抱怨的
+那类体验。因此 `src/conversationFiles.ts` **只读文件头部**（首条用户消息实测
+落在 ~20 KB 处，上限取 64 KB）并限并发读取；读不到摘要不影响候选可用
+（时间 + 体积 + 目录足以辨认），但**读不出 cwd 的候选一律丢弃** —— 绝不猜归属。
+
+### 15.6 交互：选择必须串行
+
+「全部恢复」并行开 N 条条目。若各自弹一个 QuickPick，用户会同时看到一摞
+对话框、分不清哪个属于哪个终端（实测用户 8 条条目里 7 条未绑定，首次恢复
+会一次弹 7 个）。因此 `TerminalManager` 用一个 promise 链把选择交互串行化：
+一次只弹一个，其余排队，标题始终带条目名。
+
+### 15.7 改动清单
+
+- 新增 `src/core/conversation.ts`（纯函数：头部解析、归属判据、候选排序、显示格式化）
+- 新增 `src/conversationFiles.ts`（IO：限并发枚举会话文件）
+- 新增 `src/core/command.ts#conversationCommand` 与 `LaunchSpec`
+- 新增 `TerminalManager.resolveLaunchSpec` / `pickConversation` / `bindConversationInteractive`
+- 新增命令 `tmuxTerminals.bindConversation`（「选择要接回的对话…」，可随时重新绑定）
+- 条目 tooltip 显示绑定的对话（短 id）
+- **删除 `src/core/plan.ts`**：它把「会话存活 → 不发命令」+`commandFor(entry)`
+  （裸 claude，会开新对话顶掉原来的）写成了单一动作，语义已被这次订正取代；
+  现在的闸门是 `core/tmux.ts#isShellReady`

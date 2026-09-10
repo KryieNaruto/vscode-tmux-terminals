@@ -41,9 +41,14 @@ export function migrateEntry(raw: unknown, index: number): TerminalEntry | undef
   if (!isV1Shape(o)) {
     const profile: Profile = o.profile === 'direct' ? 'direct' : 'ccr';
     const model = str(o.model);
+    // 条目 ↔ 对话的绑定必须原样带过去。漏了这一行，迁移就会**静默吞掉**
+    // 用户的绑定 —— 下一次恢复又变成「新建一条对话顶掉原来的」。
+    // 缺字段/ 空串/ 非字符串一律视为**未绑定**：绝不编造一个 id。
+    const conversationId = str(o.conversationId);
     return {
       id, name, cwd, profile,
       ...(model !== undefined && model.length > 0 ? { model } : {}),
+      ...(conversationId !== undefined && conversationId.length > 0 ? { conversationId } : {}),
       autoRestore: o.autoRestore === true,
       order: typeof o.order === 'number' ? o.order : index,
     };

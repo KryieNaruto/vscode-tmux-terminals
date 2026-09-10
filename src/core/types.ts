@@ -13,6 +13,19 @@ export interface TerminalEntry {
   profile: Profile;
   /** 空/未设 = 用该 profile 的默认模型 */
   model?: string;
+  /**
+   * 该条目**永久绑定**的那条 claude 对话（UUID，= 会话文件名）。
+   *
+   * 未设 = 从未启动过 claude（首次启动会用 `--session-id` 开一条并绑定），
+   * 或者是从未绑定过的老条目（恢复时会弹一次选择）。
+   *
+   * **为什么必须由扩展自己记：** 实测 `claude --resume <uuid>` 是按 cwd
+   * 作用域的，且 claude 进程不长期持有 .jsonl 的 fd，无法从
+   * `/proc/<pid>/fd` 反查运行中会话的 id。用户又有多个条目共用同一个 cwd
+   * （实测 4 条在 /ssd/qiansenwei/workspace、3 条在同一 strip-qt-ui 目录），
+   * 靠 `/resume` 翻列表根本分不清哪个终端对应哪条对话。
+   */
+  conversationId?: string;
   /** 是否参与「全部恢复」 */
   autoRestore: boolean;
   /** 拖拽排序序号，从 0 递增，不保证连续 */

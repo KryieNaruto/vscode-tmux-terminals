@@ -12,6 +12,21 @@ function profileColor(entry: TerminalEntry): vscode.ThemeColor {
 }
 
 /**
+ * tooltip 里的「对话」一行。
+ *
+ * 显示短 id 而不是首条消息摘要：摘要要读一个可能几 MB 的会话文件，而
+ * tooltip 是同步渲染的 —— 为了一个提示去同步读盘不值得。想认内容就用
+ * 「选择要接回的对话…」命令，那里有摘要。
+ */
+function conversationLabel(entry: TerminalEntry): string {
+  const id = entry.conversationId;
+  if (id === undefined || id.length === 0) {
+    return '（未绑定 —— 下次启动 claude 时会让你选一条）';
+  }
+  return `\`${id.slice(0, 8)}…\`（启动时接回这条）`;
+}
+
+/**
  * 清单里的一行。
  *
  * `contextValue` 决定右键菜单显隐：`killSession` 只在存活时出现，
@@ -37,8 +52,9 @@ export class EntryTreeItem extends vscode.TreeItem {
         `- 目录：\`${entry.cwd}\``,
         `- profile：${entry.profile === 'direct' ? '🟠 direct（官方直连）' : '🔵 ccr（本地中转）'}`,
         `- 模型：${entry.model && entry.model.length > 0 ? `\`${entry.model}\`` : '（profile 默认）'}`,
-        `- 启动命令：\`${commandFor(entry)}\``,
-        `- 状态：${alive ? '🟢 会话存活，点击接回原进程' : '⚪ 无会话，点击新建并启动'}`,
+        `- 基础命令：\`${commandFor(entry)}\``,
+        `- 对话：${conversationLabel(entry)}`,
+        `- 状态：${alive ? '🟢 会话存活，点击接回原进程' : '⚪ 无会话，点击重建并接回该对话'}`,
         `- 参与全部恢复：${entry.autoRestore ? '是' : '否'}`,
       ].join('\n'),
     );

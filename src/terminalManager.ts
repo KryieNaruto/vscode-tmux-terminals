@@ -9,14 +9,15 @@ import {
   scanRoots,
   validateName,
 } from './core/paths';
-import { planRestore } from './core/plan';
 import { decideOpen } from './core/restore';
-import { sessionNameFor, shellQuote } from './core/tmux';
+import { isShellReady, sessionNameFor, shellQuote } from './core/tmux';
 import { Profile, TerminalEntry } from './core/types';
-import { commandFor } from './core/command';
+import { LaunchSpec, conversationCommand } from './core/command';
+import { ConversationCandidate, candidatesForCwd, formatCandidate } from './core/conversation';
 import { isClaudeCommand } from './core/claude';
 import { readProfileConfig } from './claudeConfig';
-import { EntryStore, newId } from './core/store';
+import { listConversations } from './conversationFiles';
+import { EntryStore, newConversationId, newId } from './core/store';
 import { TmuxClient } from './tmuxClient';
 
 const SHELL_READY_TIMEOUT_MS = 3000;
@@ -89,6 +90,118 @@ export class TerminalManager {
     return os.homedir();
   }
 
+  // ---- 条目 ↔ claude 对话的绑定 ----
+
+  /**
+   * 选择交互的串行队列。
+   *
+   * 「全部恢复」会并行开 N 条条目。若各自弹一个 QuickPick，用户会同时看到
+   * 一摞对话框、分不清哪个属于哪个终端（实测用户 8 条条目里有 7 条没绑定，
+   * 首次恢复会一次弹 7 个）。这里串行化：一次只弹一个，其余排队；每次的
+   * 标题都带条目名，用户始终知道在给哪个终端选对话。
+   */
+  private pickChain: Promise<unknown> = Promise.resolve();
+
+  private enqueuePick<T>(op: () => Promise<T>): Promise<T> {
+    const next = this.pickChain.then(op, op);
+    this.pickChain = next.catch(() => {});
+    return next;
+  }
+
+  /**
+   * 让用户为该条目挑一条对话。
+   *
+   * 候选 = `~/.claude/projects` 下**文件里记录的 cwd 精确等于该条目 cwd** 的
+   * 对话，按 mtime 倒序。绝不靠目录名反推归属（转义规则不可靠）。
+   *
+   * 返回 `total` 是为了让调用方区分「根本没有候选」与「用户取消」——
+   * 两者后续动作完全不同，不能都当成 undefined 一笔带过。
+   */
+  private async pickConversation(
+    entry: TerminalEntry,
+    title: string,
+  ): Promise<{ total: number; picked?: ConversationCandidate }> {
+    const cwd = this.cwdFor(entry);
+    return this.enqueuePick(async () => {
+      const candidates = candidatesForCwd(await listConversations(this.home()), cwd);
+      if (candidates.length === 0) return { total: 0 };
+
+      // 已被其它条目绑走的对话要标注出来：实测用户 4 条条目共用同一个 cwd，
+      // 选重了会让两条会话接进同一条对话，两边同时写同一个 .jsonl。
+      const owners = new Map<string, string>();
+      for (const e of await this.store.load()) {
+        if (e.id !== entry.id && e.conversationId !== undefined && e.conversationId.length > 0) {
+          owners.set(e.conversationId, e.name);
+        }
+      }
+
+      const items = candidates.map((c) => {
+        const owner = owners.get(c.id);
+        return {
+          label: owner === undefined ? formatCandidate(c) : `${formatCandidate(c)} · 已绑给「${owner}」`,
+          candidate: c,
+        };
+      });
+      const pick = await vscode.window.showQuickPick(items, {
+        title,
+        placeHolder: `${cwd} 下有 ${candidates.length} 条可接回的对话`,
+      });
+      return { total: candidates.length, ...(pick ? { picked: pick.candidate } : {}) };
+    });
+  }
+
+  /**
+   * 决定「该给这条条目发哪条启动命令」。顺序即优先级：
+   *
+   *  1. 已绑定对话 → **必须** `--resume` 接回那一条（绝不重开一条顶替它，
+   *     那正是用户抱怨的「会话全部清空」）；
+   *  2. 未绑定 + 该 cwd 下有可接回的对话 → 问用户挑一次，挑中即永久绑定
+   *     （老条目：**不要猜**）；
+   *  3. 未绑定 + 无候选 → 用 `--session-id` 开一条新的并立刻绑定，
+   *     从此该条目就有自己的对话，多个条目共用同一 cwd 也不会串；
+   *  4. 用户取消选择 → 退回 `--continue`，不绑定（下次还会问）。
+   */
+  private async resolveLaunchSpec(entry: TerminalEntry): Promise<LaunchSpec> {
+    if (entry.conversationId !== undefined && entry.conversationId.length > 0) {
+      return { kind: 'resume', conversationId: entry.conversationId };
+    }
+
+    const { total, picked } = await this.pickConversation(entry, `「${entry.name}」接回哪条对话？`);
+    if (total === 0) {
+      const conversationId = newConversationId();
+      await this.store.update(entry.id, { conversationId });
+      return { kind: 'new', conversationId };
+    }
+    if (picked === undefined) return { kind: 'continue' };
+
+    await this.store.update(entry.id, { conversationId: picked.id });
+    return { kind: 'resume', conversationId: picked.id };
+  }
+
+  /**
+   * 显式命令：为条目选择要接回的对话（随时可重新绑定）。
+   *
+   * 只影响**下一次在该条目里启动 claude**。会话还活着时那条对话本来就是
+   * 对的，不必也不该去打断正在跑的 claude。
+   */
+  async bindConversationInteractive(entry: TerminalEntry): Promise<void> {
+    const { total, picked } = await this.pickConversation(
+      entry, `为「${entry.name}」选择要接回的对话`,
+    );
+    if (picked === undefined) {
+      if (total === 0) {
+        void vscode.window.showInformationMessage(
+          `在 ${this.cwdFor(entry)} 下没有找到可接回的 claude 对话。`,
+        );
+      }
+      return;
+    }
+    await this.store.update(entry.id, { conversationId: picked.id });
+    void vscode.window.showInformationMessage(
+      `「${entry.name}」已绑定对话 ${picked.id.slice(0, 8)}…，下次启动 claude 时会接回它。`,
+    );
+  }
+
   private cwdFor(entry: TerminalEntry): string {
     return expandHome(entry.cwd, this.home());
   }
@@ -101,8 +214,12 @@ export class TerminalManager {
    * 面板，绝不用于断定「已经恢复好了」（那是 v2 首发的 bug：会话已死或
    * 0 附着时提前 return，用户只看到退回 cd 目录的裸 shell）。
    *
-   * 不变量：竞态兜底**只能把命令降级为空，永远不能凭空加出命令**。
-   * 任何「会话可能已属于别人」的迹象都必须导致 `runCommands = false`。
+   * 不变量一：竞态兜底**只能把命令降级为不发，永远不能凭空加出命令**。
+   * 任何「会话可能已属于别人」的迹象都必须导致 `allowLaunch = false`。
+   *
+   * 不变量二：**只有 pane 前台确实是登录 shell 时才允许往会话里发送启动
+   * 命令**（见 core/tmux.ts 的 isShellReady）。claude 还在跑 → attach 上去
+   * 就对了，绝不打扰；别的进程在跑（编译、REPL）→ 宁可不做，绝不盲发。
    */
   async openEntry(entry: TerminalEntry): Promise<void> {
     // tmux 会话名由条目 id 派生，与显示名解耦（显示名可随意改名）。
@@ -114,6 +231,10 @@ export class TerminalManager {
     // 会话不存在时不必（也无法）问附着数；已知 0 与「未知」都走同一条
     // 「必须 attach」的分支（decideOpen 里 null 也按保守处理）。
     const attached = sessionExists ? await this.tmux.attachedClients(session) : 0;
+    // pane 前台进程 —— 决定「允许不允许往这个会话里发送启动命令」。
+    // 空串（display-message 静默失败）必须判为「不是登录 shell」，
+    // isShellReady('') 恰好为 false，方向是对的。
+    const paneCommand = sessionExists ? await this.tmux.currentCommand(session) : '';
 
     const candidate = this.candidatePanel(session, entry.name);
     const action = decideOpen(
@@ -132,10 +253,14 @@ export class TerminalManager {
     }
 
     // 会话不存在时由扩展 detached 建出来，拿到确定的成功/失败信号。
-    let runCommands = false;
+    // allowLaunch：竞态闸门。只有「这个会话确实该由我们启动 claude」才为真。
+    let allowLaunch = false;
+    let shellReady = false;
     if (!sessionExists) {
       if (await this.tmux.newSession(session, cwd)) {
-        runCommands = true;
+        allowLaunch = true;
+        // 新建的会话 pane 必然是登录 shell，但是否已就绪要等（放在 attach
+        // 之后等，别让面板晚出现）
       } else if (await this.tmux.hasSession(session)) {
         // 竞态：等待期间被别的窗口建出来了 → 转为接回，绝不发命令
         vscode.window.showInformationMessage(
@@ -151,11 +276,13 @@ export class TerminalManager {
         );
         return;
       }
+    } else {
+      // 会话原本就存活。**claude 是否还在跑，决定我们能不能碰它**：
+      // 前台是登录 shell 说明 claude 已退出（这次要接回它的对话）；
+      // 前台是 claude 说明对话原样在跑 —— attach 上去就对了，绝不打扰。
+      allowLaunch = true;
+      shellReady = isShellReady(paneCommand);
     }
-
-    // planRestore 仍是命令清单的唯一来源；runCommands 只能把它清空
-    const plan = planRestore(entry, sessionExists);
-    const commands = runCommands ? plan.commands : [];
 
     // 复用只在 decideOpen 判定「已证明空闲」时才走到（action === 'reuse-attach'），
     // 因此这里往里打字不会打断面板里可能跑着的进程。
@@ -177,20 +304,26 @@ export class TerminalManager {
     // 命令行字符串要塞进 shell 执行，故此处需要 shell 引用。
     terminal.sendText(`tmux attach -t ${shellQuote('=' + session)}`, true);
 
-    if (commands.length === 0) return;
+    if (!allowLaunch) return;
 
-    const ready = await this.tmux.waitForShell(session, SHELL_READY_TIMEOUT_MS);
-    if (!ready) {
-      vscode.window.showWarningMessage(
-        `tmux 会话「${entry.name}」未在 ${SHELL_READY_TIMEOUT_MS / 1000}s 内就绪，已跳过 ${commands.length} 条预设命令。`,
-      );
-      return;
+    // 新建出来的会话要等 shell 就绪；存活会话已在开头看过前台进程。
+    if (!sessionExists) {
+      shellReady = await this.tmux.waitForShell(session, SHELL_READY_TIMEOUT_MS);
+      if (!shellReady) {
+        vscode.window.showWarningMessage(
+          `tmux 会话「${entry.name}」未在 ${SHELL_READY_TIMEOUT_MS / 1000}s 内就绪，已跳过启动 claude。`,
+        );
+        return;
+      }
     }
-    for (const c of commands) {
-      await this.tmux.sendLiteral(session, c);
-      await this.tmux.sendEnter(session);
-      await new Promise((r) => setTimeout(r, 150));
-    }
+    if (!shellReady) return;
+
+    // 在条目自己的 cwd 里启动 —— `--resume` 是按 cwd 作用域的，
+    // 而会话本就是 `-c cwd` 建的，pane 的 cwd 与之一致。
+    // resolveLaunchSpec 可能弹一次 QuickPick（老条目没有绑定时）。
+    const spec = await this.resolveLaunchSpec(entry);
+    await this.tmux.sendLiteral(session, conversationCommand(entry, spec));
+    await this.tmux.sendEnter(session);
   }
 
   /**
@@ -244,9 +377,13 @@ export class TerminalManager {
   }
 
   /**
-   * 退出当前 claude 并按 `launch` 的配置重新启动，**始终 `--continue`**
-   * 接回原对话（两个 profile 共用 ~/.claude/projects/，实测）—— 这是唯一
-   * 调用方（applyProfile）的需要，故不再保留 resume 开关。
+   * 退出当前 claude 并按 `launch` 的配置重新启动，**接回原来那条对话**
+   * （两个 profile 共用 ~/.claude/projects/，实测）。
+   *
+   * 接回方式：有 `conversationId` 就 `--resume <它>`，没有才退回 `--continue`。
+   * **不能一律 `--continue`** —— 实测用户 4 个条目共用同一个 cwd，全部
+   * `--continue` 会一起接到同一条最新的对话上去（两边的 claude 还会同时
+   * 写同一个 .jsonl）—— 这正是本次要修的「串台」。
    *
    * `launch` 与 `entry` 分开传：调用方常需要「改某个字段后再启动」
    * （如清掉 model 以回落到 profile 默认），而提示语仍要用原条目的名字。
@@ -275,8 +412,14 @@ export class TerminalManager {
       return false;
     }
 
-    // --continue 接回原对话：两个 profile 共用 ~/.claude/projects/（实测）
-    const cmd = `${commandFor(launch)} --continue`;
+    // 有绑定就必须 --resume 那条对话；没有绑定才退回 --continue。
+    const bound = launch.conversationId;
+    const cmd = conversationCommand(
+      launch,
+      bound !== undefined && bound.length > 0
+        ? { kind: 'resume', conversationId: bound }
+        : { kind: 'continue' },
+    );
     await this.tmux.sendLiteral(session, cmd);
     await this.tmux.sendEnter(session);
     return true;
@@ -491,7 +634,10 @@ export class TerminalManager {
     }
     // 用 append 而非 add：order 必须在 store 的锁内分配。
     // 直接复制 entry.order 会与源条目相同，排序随即不确定。
-    const { order: _drop, ...rest } = entry;
+    //
+    // conversationId **必须丢掉**：复制品是另一个终端，该有自己的对话。
+    // 照抄会让两条会话接进同一条对话，两边同时写同一个 .jsonl。
+    const { order: _dropOrder, conversationId: _dropConv, ...rest } = entry;
     await this.store.append({ ...rest, id: newId(), name });
   }
 

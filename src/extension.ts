@@ -154,6 +154,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // setModel 不 poll：改模型不改变会话存活状态，无需刷新存活标记
   //（setProfile 会重启会话，故需要 poll 刷新存活）。
+  // 只改绑定，不动正在跑的会话 —— 因此不 poll、只是刷新 tooltip
+  reg('tmuxTerminals.bindConversation', async (arg: unknown) => {
+    const it = item(arg);
+    if (it) await manager.bindConversationInteractive(it.entry);
+    provider.refresh();
+    batchProvider.refresh();
+  });
+
   reg('tmuxTerminals.setModel', async (arg: unknown) => {
     const it = item(arg);
     if (it) await manager.setModelInteractive(it.entry);
