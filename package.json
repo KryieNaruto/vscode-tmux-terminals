@@ -1,0 +1,29 @@
+{
+  "name": "vscode-tmux-terminals",
+  "displayName": "Tmux Terminals",
+  "description": "一键恢复 Remote-SSH 断开后的终端工作区",
+  "version": "0.1.0",
+  "publisher": "KryieNaruto",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/KryieNaruto/vscode-tmux-terminals.git" },
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "extensionKind": ["workspace"],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {},
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && mocha out/test/**/*.test.js",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.22.0",
+    "mocha": "^10.3.0",
+    "typescript": "^5.3.3"
+  }
+}
