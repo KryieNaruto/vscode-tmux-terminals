@@ -54,12 +54,24 @@ export class TerminalManager {
    */
   private readonly busy = new Set<vscode.Terminal>();
 
+  /**
+   * **本宿主世代由我们亲手创建**的面板。
+   *
+   * 只有它们才谈得上「busy 状态一直被跟踪着」。上一个宿主世代留下的面板
+   * （扩展重载后仍在 `window.terminals` 里）我们从未见过它开始跑什么 ——
+   * 重载后 `busy` 是空集、而 `shellIntegration` 依然在场，一个**正在跑编译**
+   * 的面板会被误判成空闲，然后被塞进 `tmux attach`。
+   * **「未知」必须与「空闲」区分开，未知一律按危险处理。**
+   */
+  private readonly ownPanels = new Set<vscode.Terminal>();
+
   constructor(
     private readonly store: EntryStore,
     private readonly tmux: TmuxClient,
   ) {
     vscode.window.onDidCloseTerminal((t) => {
       this.busy.delete(t);
+      this.ownPanels.delete(t);
       for (const [session, term] of this.terminals) {
         if (term === t) this.terminals.delete(session);
       }
@@ -90,13 +102,28 @@ export class TerminalManager {
   /**
    * 能否证明该面板空闲停在 shell 提示符上（即往里打字不会打断任何东西）。
    *
-   * 两个条件缺一不可：shell integration 在场（否则无从得知面板里跑着什么），
-   * 且没记录到有命令在跑。判不出来一律 false —— 宁可多开一个面板，
-   * 也不能把 `tmux attach` 打进用户正在跑的进程。
+   * 三个条件缺一不可：**面板是本宿主世代我们亲手建的**（否则 busy 状态未知）、
+   * shell integration 在场（否则无从得知面板里跑着什么）、且没记录到有命令在跑。
+   * 判不出来一律 false —— 宁可多开一个面板，也不能把 `tmux attach` 打进用户
+   * 正在跑的进程。代价是扩展重载后可能需要多一个新面板，这个代价接受。
    */
   private isIdlePanel(t: vscode.Terminal): boolean {
+    // 不是本世代我们建的 → busy 状态未知（扩展重载前它可能就在跑 build 了）
+    if (!this.ownPanels.has(t)) return false;
     if (t.shellIntegration === undefined) return false;
     return !this.busy.has(t);
+  }
+
+  /**
+   * 建一个**由本宿主世代跟踪**的面板（见 isIdlePanel）。
+   * 所有创建面板的地方都必须走这里，否则它会被当成「状态未知」而永不复用。
+   */
+  private createOwnPanel(name: string, cwd?: string): vscode.Terminal {
+    const t = cwd === undefined
+      ? vscode.window.createTerminal({ name })
+      : vscode.window.createTerminal({ name, cwd });
+    this.ownPanels.add(t);
+    return t;
   }
 
   /** 远端家目录。公开供扩展层复用，避免各处各算一份。 */
@@ -131,45 +158,47 @@ export class TerminalManager {
    *
    * 列表**末尾固定跟一项「＋ 新建一条对话」**：新对话只能由用户主动选出来，
    * 绝不由「取消」隐式产生（见 resolveLaunchSpec）。
+   *
+   * **调用方必须已经处在 `pickChain` 的一个 op 内**（本方法自己不再入队）。
+   * 读 owners 必须与写绑定处在同一个 op 里，否则两个共用 cwd 的老条目会
+   * 各自读到「还没人绑」的快照，双双接到同一条对话上。
    */
   private async pickConversation(
     entry: TerminalEntry,
     title: string,
   ): Promise<{ total: number; picked?: ConversationCandidate; owner?: string; startNew: boolean }> {
     const cwd = this.cwdFor(entry);
-    return this.enqueuePick(async () => {
-      const candidates = candidatesForCwd(await listConversations(this.home()), cwd);
-      if (candidates.length === 0) {
-        // 没有任何可接回的 → 没有列表可弹，调用方直接开一条新的
-        return { total: 0, startNew: false, picked: undefined };
-      }
+    const candidates = candidatesForCwd(await listConversations(this.home()), cwd);
+    if (candidates.length === 0) {
+      // 没有任何可接回的 → 没有列表可弹，调用方直接开一条新的
+      return { total: 0, startNew: false, picked: undefined };
+    }
 
-      // 已被其它条目绑走的对话要标注出来：实测用户 4 条条目共用同一个 cwd，
-      // 选重了会让两条会话接进同一条对话，两边同时写同一个 .jsonl。
-      const owners = ownersOf(await this.store.load(), entry.id);
+    // 已被其它条目绑走的对话要标注出来：实测用户 4 条条目共用同一个 cwd，
+    // 选重了会让两条会话接进同一条对话，两边同时写同一个 .jsonl。
+    const owners = ownersOf(await this.store.load(), entry.id);
 
-      // 末尾固定跟一项「＋ 新建一条对话」：新对话只能由用户主动选出来
-      const newItem = { label: NEW_CONVERSATION_LABEL, candidate: undefined };
-      const convoItems = candidates.map((c) => {
-        const owner = owners.get(c.id);
-        return {
-          label: formatCandidateWithOwner(c, owner),
-          candidate: c,
-          ...(owner !== undefined ? { owner } : {}),
-        };
-      });
-      const pick = await vscode.window.showQuickPick([...convoItems, newItem], {
-        title,
-        placeHolder: `${cwd} 下有 ${candidates.length} 条可接回的对话`,
-      });
+    // 末尾固定跟一项「＋ 新建一条对话」：新对话只能由用户主动选出来
+    const newItem = { label: NEW_CONVERSATION_LABEL, candidate: undefined };
+    const convoItems = candidates.map((c) => {
+      const owner = owners.get(c.id);
       return {
-        total: candidates.length,
-        startNew: pick === newItem,
-        ...(pick && pick.candidate
-          ? { picked: pick.candidate, ...(pick.owner !== undefined ? { owner: pick.owner } : {}) }
-          : {}),
+        label: formatCandidateWithOwner(c, owner),
+        candidate: c,
+        ...(owner !== undefined ? { owner } : {}),
       };
     });
+    const pick = await vscode.window.showQuickPick([...convoItems, newItem], {
+      title,
+      placeHolder: `${cwd} 下有 ${candidates.length} 条可接回的对话`,
+    });
+    return {
+      total: candidates.length,
+      startNew: pick === newItem,
+      ...(pick && pick.candidate
+        ? { picked: pick.candidate, ...(pick.owner !== undefined ? { owner: pick.owner } : {}) }
+        : {}),
+    };
   }
 
   /**
@@ -243,39 +272,46 @@ export class TerminalManager {
       return undefined;
     }
 
-    const { total, picked, owner, startNew } = await this.pickConversation(
-      entry, `「${entry.name}」接回哪条对话？`,
-    );
-    if (total === 0) {
-      const conversationId = newConversationId();
-      await this.store.update(entry.id, { conversationId });
-      return { kind: 'new', conversationId };
-    }
-    if (startNew) {
-      const conversationId = newConversationId();
-      await this.store.update(entry.id, { conversationId });
-      return { kind: 'new', conversationId };
-    }
-    if (picked === undefined) {
-      // 用户按 Esc：什么都不启动。绝不退回 `--continue` —— 条目共用 cwd 时
-      // 那会让几个终端一起接到同一条最新对话上去，两边同时写同一个 .jsonl。
-      void vscode.window.showInformationMessage(
-        `「${entry.name}」未接回对话。右键该条目选「选择要接回的对话…」可随时接回。`,
+    // **整段**放进 pickChain 的同一个 op：读 owners → 弹选择框 → 弹确认模态
+    // → 写绑定，中间不能插进别的条目的选择流程。
+    // 否则「读 owners」与「写绑定」之间有一个窗口，两个共用 cwd 的老条目会
+    // 各自看到「还没人绑」，双双接到同一条对话上 —— 两个 claude 进程同时写
+    // 同一个 .jsonl。顺带也避免了确认模态与下一个条目的选择框并存。
+    return this.enqueuePick(async (): Promise<LaunchSpec | undefined> => {
+      const { total, picked, owner, startNew } = await this.pickConversation(
+        entry, `「${entry.name}」接回哪条对话？`,
       );
-      return undefined;
-    }
-    // 选中的是**别人已经绑着**的对话 → 必须显式确认，否则两个 claude 会
-    // 同时写同一条 .jsonl。取消与 Esc 同侧：什么都不启动。
-    if (!(await this.confirmSharedConversation(entry, owner))) {
-      void vscode.window.showInformationMessage(
-        `「${entry.name}」未接回对话（该对话已绑给「${owner}」）。` +
-        `右键该条目选「选择要接回的对话…」可另选一条。`,
-      );
-      return undefined;
-    }
+      if (total === 0) {
+        const conversationId = newConversationId();
+        await this.store.update(entry.id, { conversationId });
+        return { kind: 'new', conversationId };
+      }
+      if (startNew) {
+        const conversationId = newConversationId();
+        await this.store.update(entry.id, { conversationId });
+        return { kind: 'new', conversationId };
+      }
+      if (picked === undefined) {
+        // 用户按 Esc：什么都不启动。绝不退回 `--continue` —— 条目共用 cwd 时
+        // 那会让几个终端一起接到同一条最新对话上去，两边同时写同一个 .jsonl。
+        void vscode.window.showInformationMessage(
+          `「${entry.name}」未接回对话。右键该条目选「选择要接回的对话…」可随时接回。`,
+        );
+        return undefined;
+      }
+      // 选中的是**别人已经绑着**的对话 → 必须显式确认，否则两个 claude 会
+      // 同时写同一条 .jsonl。取消与 Esc 同侧：什么都不启动。
+      if (!(await this.confirmSharedConversation(entry, owner))) {
+        void vscode.window.showInformationMessage(
+          `「${entry.name}」未接回对话（该对话已绑给「${owner}」）。` +
+          `右键该条目选「选择要接回的对话…」可另选一条。`,
+        );
+        return undefined;
+      }
 
-    await this.store.update(entry.id, { conversationId: picked.id });
-    return { kind: 'resume', conversationId: picked.id };
+      await this.store.update(entry.id, { conversationId: picked.id });
+      return { kind: 'resume', conversationId: picked.id };
+    });
   }
 
   /**
@@ -285,41 +321,45 @@ export class TerminalManager {
    * 对的，不必也不该去打断正在跑的 claude。
    */
   async bindConversationInteractive(entry: TerminalEntry): Promise<void> {
-    const { total, picked, owner, startNew } = await this.pickConversation(
-      entry, `为「${entry.name}」选择要接回的对话`,
-    );
+    // 与 resolveLaunchSpec 同侧：读 owners → 选择框 → 确认 → 写绑定 全在一个
+    // op 内，避免与并发的恢复流程互相看不到对方的绑定。
+    await this.enqueuePick(async (): Promise<void> => {
+      const { total, picked, owner, startNew } = await this.pickConversation(
+        entry, `为「${entry.name}」选择要接回的对话`,
+      );
 
-    if (picked !== undefined) {
-      // 绑到别人的对话上同样会造成两个 claude 写同一条记录 —— 显式命令也
-      // 不能例外，一样要确认。
-      if (!(await this.confirmSharedConversation(entry, owner))) {
+      if (picked !== undefined) {
+        // 绑到别人的对话上同样会造成两个 claude 写同一条记录 —— 显式命令也
+        // 不能例外，一样要确认。
+        if (!(await this.confirmSharedConversation(entry, owner))) {
+          void vscode.window.showInformationMessage(
+            `「${entry.name}」未改绑定（该对话已绑给「${owner}」）。`,
+          );
+          return;
+        }
+        await this.store.update(entry.id, { conversationId: picked.id });
         void vscode.window.showInformationMessage(
-          `「${entry.name}」未改绑定（该对话已绑给「${owner}」）。`,
+          `「${entry.name}」已绑定对话 ${picked.id.slice(0, 8)}…，下次启动 claude 时会接回它。`,
         );
         return;
       }
-      await this.store.update(entry.id, { conversationId: picked.id });
-      void vscode.window.showInformationMessage(
-        `「${entry.name}」已绑定对话 ${picked.id.slice(0, 8)}…，下次启动 claude 时会接回它。`,
-      );
-      return;
-    }
-    if (startNew) {
-      const conversationId = newConversationId();
-      await this.store.update(entry.id, { conversationId });
-      void vscode.window.showInformationMessage(
-        `「${entry.name}」将开一条新对话 ${conversationId.slice(0, 8)}…，下次启动 claude 时使用。`,
-      );
-      return;
-    }
-    if (total === 0) {
-      // 这个目录下压根没有可接回的。**不替用户生成一条新对话** ——
-      // 这条命令的语义是「挑一条历史接回」，没有历史就说没有。
-      void vscode.window.showInformationMessage(
-        `在 ${this.cwdFor(entry)} 下没有找到可接回的 claude 对话。`,
-      );
-    }
-    // 其余情况 = 用户按 Esc 取消，什么都不改
+      if (startNew) {
+        const conversationId = newConversationId();
+        await this.store.update(entry.id, { conversationId });
+        void vscode.window.showInformationMessage(
+          `「${entry.name}」将开一条新对话 ${conversationId.slice(0, 8)}…，下次启动 claude 时使用。`,
+        );
+        return;
+      }
+      if (total === 0) {
+        // 这个目录下压根没有可接回的。**不替用户生成一条新对话** ——
+        // 这条命令的语义是「挑一条历史接回」，没有历史就说没有。
+        void vscode.window.showInformationMessage(
+          `在 ${this.cwdFor(entry)} 下没有找到可接回的 claude 对话。`,
+        );
+      }
+      // 其余情况 = 用户按 Esc 取消，什么都不改
+    });
   }
 
   private cwdFor(entry: TerminalEntry): string {
@@ -388,7 +428,7 @@ export class TerminalManager {
         );
       } else {
         // 真的建不出来（tmux 不可用、cwd 不存在等）
-        const t = vscode.window.createTerminal({ name: entry.name });
+        const t = this.createOwnPanel(entry.name);
         this.terminals.set(session, t);
         t.show();
         vscode.window.showErrorMessage(
@@ -411,10 +451,10 @@ export class TerminalManager {
       terminal = candidate;
     } else {
       try {
-        terminal = vscode.window.createTerminal({ name: entry.name, cwd });
+        terminal = this.createOwnPanel(entry.name, cwd);
       } catch {
         vscode.window.showWarningMessage(`目录不存在，已在主目录打开：${cwd}`);
-        terminal = vscode.window.createTerminal({ name: entry.name });
+        terminal = this.createOwnPanel(entry.name);
       }
     }
     this.terminals.set(session, terminal);
@@ -444,6 +484,18 @@ export class TerminalManager {
     // 返回 undefined 表示「这次什么都不启动」（用户取消 / 绑定与本目录冲突）。
     const spec = await this.resolveLaunchSpec(entry);
     if (spec === undefined) return;
+
+    // 判据必须在**发送前**重算。resolveLaunchSpec 中间可能弹一次 QuickPick
+    // 并等用户思考很久（老条目首次恢复必弹），这期间用户完全可能在同一个
+    // pane 里起了 build —— 一开始算出来的 shellReady 那时早已不作数。
+    // 窗口从「用户思考时长」压到一次 display-message（毫秒级）。
+    if (!isShellReady(await this.tmux.currentCommand(session))) {
+      void vscode.window.showWarningMessage(
+        `「${entry.name}」的终端里已经有别的程序在跑，已跳过启动 claude（绝不打断它）。` +
+        `等它结束后再点一次该条目即可。`,
+      );
+      return;
+    }
 
     await this.tmux.sendLiteral(session, conversationCommand(entry, spec));
     await this.tmux.sendEnter(session);

@@ -425,6 +425,8 @@ git commit -m "feat: 路径展开与条目名校验"
 
 ### Task 3: 恢复决策 planRestore
 
+> **以下是 v1 的历史执行记录。** `src/core/plan.ts` 与 `test/core/plan.test.ts` 已在 v2 删除（见 `specs/2026-09-10-tmux-terminals-v2-design.md` §14/§15）：闸门现为`core/tmux.ts#isShellReady` + `core/restore.ts#decideOpen` + `core/command.ts#conversationCommand`。
+
 **Files:**
 - Create: `src/core/types.ts`
 - Create: `src/core/plan.ts`
