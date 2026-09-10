@@ -66,7 +66,9 @@ export class EmptyTreeItem extends vscode.TreeItem {
 
 export type TreeNode = EntryTreeItem | EmptyTreeItem;
 
-export class EntryTreeProvider implements vscode.TreeDataProvider<TreeNode> {
+export class EntryTreeProvider
+  implements vscode.TreeDataProvider<TreeNode>, vscode.TreeDragAndDropController<TreeNode>
+{
   private readonly emitter = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this.emitter.event;
 
@@ -74,7 +76,10 @@ export class EntryTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   private alive = new Set<string>();
 
   constructor(
-    private readonly store: { load(): Promise<TerminalEntry[]> },
+    private readonly store: {
+      load(): Promise<TerminalEntry[]>;
+      reorder(ids: string[]): Promise<void>;
+    },
   ) {}
 
   refresh(): void {
@@ -108,5 +113,53 @@ export class EntryTreeProvider implements vscode.TreeDataProvider<TreeNode> {
 
   getTreeItem(element: TreeNode): vscode.TreeItem {
     return element;
+  }
+
+  // ---- 拖拽排序 ----
+  // 拖拽是独立 API，不是 TreeItem 自带的能力。
+  readonly dragMimeTypes = ['application/vnd.code.tree.tmuxterminals.list'];
+  readonly dropMimeTypes = ['application/vnd.code.tree.tmuxterminals.list'];
+
+  async handleDrag(
+    source: readonly TreeNode[],
+    data: vscode.DataTransfer,
+    _token: vscode.CancellationToken,
+  ): Promise<void> {
+    const ids = source
+      .filter((n): n is EntryTreeItem => n instanceof EntryTreeItem)
+      .map((n) => n.entry.id);
+    data.set(this.dragMimeTypes[0], new vscode.DataTransferItem(ids));
+  }
+
+  /**
+   * 落点语义：拖到目标行 = **插到该行之前**。
+   *
+   * 不用「上/下半区分别表示前/后」：那需要落点位置信息，而 handleDrop 在
+   * 部分场景并不提供，语义会随 VS Code 版本漂移。统一为「之前」后，拖到
+   * 列表末尾即可实现「放到最后」。
+   *
+   * 只改本地顺序，**绝不触发任何 tmux 操作**。
+   */
+  async handleDrop(
+    target: TreeNode | undefined,
+    sources: vscode.DataTransfer,
+    _token: vscode.CancellationToken,
+  ): Promise<void> {
+    const item = sources.get(this.dragMimeTypes[0]);
+    if (!item) return;
+    const draggedIds = item.value as string[];
+    if (!Array.isArray(draggedIds) || draggedIds.length === 0) return;
+
+    const all = await this.store.load();
+    const ids = all.map((e) => e.id).filter((id) => !draggedIds.includes(id));
+
+    // 目标未定义 = 拖到空白处 → 追加到末尾
+    const targetId = target instanceof EntryTreeItem ? target.entry.id : undefined;
+    const at = targetId === undefined ? ids.length : ids.indexOf(targetId);
+    const insertAt = at === -1 ? ids.length : at;
+
+    ids.splice(insertAt, 0, ...draggedIds);
+    await this.store.reorder(ids); // 内部经 enqueue 串行化，防并发丢更新
+    this.emitter.fire();
   }
 }
