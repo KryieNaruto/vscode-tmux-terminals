@@ -111,11 +111,49 @@ describe('package.json 清单一致性', () => {
     assert.deepStrictEqual(bad, [], `activationEvents 引用了不存在的视图: ${bad}`);
   });
 
-  it('视图容器的图标文件真实存在', () => {
+  it('视图容器的图标文件真实存在（codicon 形式的图标跳过此项）', () => {
     const containers = contributes.viewsContainers?.activitybar ?? [];
     for (const c of containers) {
+      // "$(terminal)" 这类是 codicon，由 VS Code 内置字体提供，不是文件
+      if ((c.icon ?? '').startsWith('$(')) continue;
       const abs = path.join(repoRoot, c.icon);
       assert.ok(fs.existsSync(abs), `视图容器 ${c.id} 的图标不存在: ${c.icon}`);
+    }
+  });
+
+  /**
+   * 活动栏图标必须能被渲染出来。
+   *
+   * 回归 bug：图标文件确实存在、command palette 里命令也能搜到（说明贡献
+   * 注册成功），但活动栏里**什么都没有**。原因是 SVG 用了
+   * fill="currentColor"：VS Code 活动栏把图标当作 CSS mask 处理，此时
+   * currentColor 解析不到颜色 → 整个图标透明 → 图标位置一片空白。
+   *
+   * 实测对比（本机可正常显示图标的扩展）：
+   *   claude-code  fill="#D97757"（显式色）
+   *   codebuddy    viewBox="0 0 500 500"，不写 fill，用默认黑（显式色）
+   * 两者都没有依赖 currentColor。尺寸无关（500×500 也正常）。
+   *
+   * 修法：改用 VS Code 内置 codicon（"$(terminal)"）。VS Code 自己的
+   * references-view / copilot 就是这么写的，由编辑器保证渲染，最可靠。
+   */
+  it('活动栏图标必须是可渲染的形式（codicon 或显式颜色，不得用 currentColor）', () => {
+    const containers = contributes.viewsContainers?.activitybar ?? [];
+    for (const c of containers) {
+      const icon: string = c.icon ?? '';
+      if (icon.startsWith('$(')) {
+        assert.ok(icon.endsWith(')'), `codicon 语法错误: ${icon}`);
+        continue;
+      }
+      const abs = path.join(repoRoot, icon);
+      const svg = fs.readFileSync(abs, 'utf8');
+      assert.ok(
+        !/fill\s*=\s*["']currentColor["']/i.test(svg),
+        `图标 ${icon} 使用了 fill="currentColor"。VS Code 活动栏以 CSS mask ` +
+          `渲染图标，currentColor 会解析失败导致图标整体透明 —— 表现为` +
+          `「扩展已装、命令能搜到，但活动栏没有图标」。请改用 codicon ` +
+          `（如 "$(terminal)"）或显式颜色。`,
+      );
     }
   });
 

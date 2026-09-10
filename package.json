@@ -17,7 +17,7 @@
         {
           "id": "tmuxTerminals",
           "title": "我的终端",
-          "icon": "resources/terminal.svg"
+          "icon": "$(terminal)"
         }
       ]
     },
