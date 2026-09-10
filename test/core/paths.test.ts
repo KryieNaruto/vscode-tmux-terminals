@@ -1,5 +1,5 @@
 import * as assert from 'assert';
-import { expandHome, validateName } from '../../src/core/paths';
+import { expandHome, rankCandidates, validateName } from '../../src/core/paths';
 
 describe('expandHome', () => {
   const home = '/home/qiansenwei';
@@ -66,5 +66,22 @@ describe('validateName', () => {
   });
   it('含回车报错', () => {
     assert.notStrictEqual(validateName('a\rb', existing), null);
+  });
+});
+
+describe('rankCandidates', () => {
+  it('已用过的排在最前，且去重', () => {
+    const r = rankCandidates(['/used'], ['/new', '/used']);
+    assert.deepStrictEqual(r.items, ['/used', '/new']);
+  });
+
+  it('截断时报告数量（不能静默丢弃）', () => {
+    const r = rankCandidates([], ['/a', '/b', '/c'], 2);
+    assert.deepStrictEqual(r.items, ['/a', '/b']);
+    assert.strictEqual(r.truncated, 1);
+  });
+
+  it('空串与纯空白被剔除', () => {
+    assert.deepStrictEqual(rankCandidates(['', '  '], []).items, []);
   });
 });

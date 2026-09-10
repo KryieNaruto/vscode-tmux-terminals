@@ -1,6 +1,7 @@
+import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as vscode from 'vscode';
-import { expandHome, validateName } from './core/paths';
+import { expandHome, rankCandidates, validateName } from './core/paths';
 import { planRestore } from './core/plan';
 import { sessionNameFor, shellQuote } from './core/tmux';
 import { Profile, TerminalEntry } from './core/types';
@@ -415,13 +416,50 @@ export class TerminalManager {
     return value === undefined ? undefined : value.trim();
   }
 
+  /**
+   * 选目录。候选 = 已有条目用过的目录 + `~` 一层 + `~/workspace` 一层。
+   *
+   * 只扫一层：深扫会卡，而深层目录用户手输更快。
+   */
   private async askCwd(current?: string): Promise<string | undefined> {
-    return vscode.window.showInputBox({
-      title: '远程目录',
-      prompt: '支持 ~ 开头，例如 ~/mine/paint-pc',
-      value: current ?? '',
-      validateInput: (v) => (v.trim().length === 0 ? '目录不能为空' : null),
+    const MANUAL = '$(pencil) 手动输入…';
+    const all = await this.store.load();
+    const used = all.map((e) => e.cwd);
+
+    const home = this.home();
+    const discovered: string[] = [];
+    for (const base of ['~', '~/workspace']) {
+      try {
+        const dir = expandHome(base, home);
+        const entries = await fs.readdir(dir, { withFileTypes: true });
+        for (const d of entries) {
+          if (!d.isDirectory() || d.name.startsWith('.')) continue;
+          discovered.push(base === '~' ? `~/${d.name}` : `${base}/${d.name}`);
+        }
+      } catch {
+        // 目录不存在 —— 跳过，不打扰用户
+      }
+    }
+
+    const { items, truncated } = rankCandidates(used, discovered);
+    const title = truncated > 0
+      ? `远程目录（候选过多，仅显示前 ${items.length} 条，可手动输入其他）`
+      : '远程目录';
+
+    const pick = await vscode.window.showQuickPick([MANUAL, ...items], {
+      title,
+      placeHolder: current ?? '选择或手动输入',
     });
+    if (pick === undefined) return undefined;
+    if (pick === MANUAL) {
+      return vscode.window.showInputBox({
+        title: '远程目录',
+        prompt: '支持 ~ 开头，例如 ~/mine/paint-pc',
+        value: current ?? '',
+        validateInput: (v) => (v.trim().length === 0 ? '目录不能为空' : null),
+      });
+    }
+    return pick;
   }
 
   private async askAutoRestore(def: boolean): Promise<boolean | undefined> {
