@@ -7,6 +7,7 @@ import {
   isShellReady,
   sessionNameFor,
   escapeSessionName,
+  parseAttachedCount,
   SESSION_PREFIX,
 } from '../../src/core/tmux';
 
@@ -118,5 +119,31 @@ describe('isShellReady', () => {
     assert.strictEqual(isShellReady('sleep'), false);
     assert.strictEqual(isShellReady('claude'), false);
     assert.strictEqual(isShellReady('vim'), false);
+  });
+});
+
+describe('parseAttachedCount', () => {
+  it('解析出附着客户端数', () => {
+    assert.strictEqual(parseAttachedCount('0'), 0);
+    assert.strictEqual(parseAttachedCount('1'), 1);
+    assert.strictEqual(parseAttachedCount('12'), 12);
+  });
+  it('容忍尾部换行/空白（execFile 的 stdout 原样）', () => {
+    assert.strictEqual(parseAttachedCount('1\n'), 1);
+    assert.strictEqual(parseAttachedCount('  3  \n'), 3);
+  });
+  it('关键：空输出必须是 null（未知），不能当 0', () => {
+    // display-message 的 pane 目标漏冒号时 tmux 是 exit 0 + 空输出，
+    // 静默失败。当成 0 会让「已经附着」被误判为「没人附着」，
+    // 于是每次点击都重复 attach；反过来当成 1 更糟，会漏掉真正的恢复。
+    assert.strictEqual(parseAttachedCount(''), null);
+    assert.strictEqual(parseAttachedCount('\n'), null);
+    assert.strictEqual(parseAttachedCount('   '), null);
+  });
+  it('非数字输出一律 null（读取失败 / 格式被改）', () => {
+    assert.strictEqual(parseAttachedCount('abc'), null);
+    assert.strictEqual(parseAttachedCount('1.5'), null);
+    assert.strictEqual(parseAttachedCount('-1'), null);
+    assert.strictEqual(parseAttachedCount('1 2'), null);
   });
 });

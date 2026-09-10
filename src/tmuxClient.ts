@@ -1,6 +1,12 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { paneTarget, parseSessionList, sessionTarget, isShellReady } from './core/tmux';
+import {
+  isShellReady,
+  paneTarget,
+  parseAttachedCount,
+  parseSessionList,
+  sessionTarget,
+} from './core/tmux';
 
 const run = promisify(execFile);
 
@@ -32,6 +38,27 @@ export class TmuxClient {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * 取附着在该会话上的客户端数。
+   *
+   * 这是判断「用户此刻看得见这个会话吗」的**权威信号之一**（另一个是
+   * hasSession）。会话存活 ≠ 有人在看 —— 实测用户 7 个会话全部存活且
+   * pane 前台就是 claude，其中 6 个附着数为 0，用户因此「看不见 claude」。
+   *
+   * 目标必须走 `paneTarget`（`=名字:`）。漏冒号时 tmux 是 exit 0 + 空输出，
+   * 解析不出数字 → 返回 null（未知），调用方按「未知」保守处理。
+   */
+  async attachedClients(name: string): Promise<number | null> {
+    try {
+      const { stdout } = await run(this.tmuxPath, [
+        'display-message', '-p', '-t', paneTarget(name), '#{session_attached}',
+      ]);
+      return parseAttachedCount(stdout);
+    } catch {
+      return null;
     }
   }
 
