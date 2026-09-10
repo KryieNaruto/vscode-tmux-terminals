@@ -56,7 +56,7 @@
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],
   "extensionKind": ["workspace"],
-  "main": "./out/extension.js",
+  "main": "./out/src/extension.js",
   "activationEvents": [],
   "contributes": {},
   "scripts": {
@@ -1216,6 +1216,7 @@ git commit -m "feat: 侧边栏视图、命令、右键菜单与配置项"
 - Create: `src/tree.ts`
 - Create: `src/terminalManager.ts`
 - Create: `src/extension.ts`
+- Test: `test/manifest.test.ts`（清单交叉引用校验，见 Task 7 Step 7）
 
 **Interfaces:**
 - Consumes: `EntryStore`（Task 4）、`TmuxClient`（Task 5）、`TerminalEntry`（Task 3）、Task 6 的视图与命令 ID
@@ -1441,16 +1442,25 @@ export class TerminalManager {
     }
   }
 
-  async restoreAll(): Promise<void> {
-    const entries = (await this.store.load()).filter((e) => e.autoRestore);
-    if (entries.length === 0) {
-      vscode.window.showInformationMessage('没有标记为「参与全部恢复」的条目。');
-      return;
-    }
-    for (const e of entries) {
-      await this.openEntry(e);
-      await new Promise((r) => setTimeout(r, 300));
-    }
+  /**
+   * 恢复所有标记了 autoRestore 的条目。
+   *
+   * 终端并行打开，**不 await openEntry**：它会等 waitForShell（上限 3s）
+   * 并逐条派发预设命令。若串行 await，N 个条目最坏要等 N×3s 才全部开完，
+   * 而该功能的价值正是「一次点开整组工作区」。
+   */
+  restoreAll(): void {
+    void (async () => {
+      const entries = (await this.store.load()).filter((e) => e.autoRestore);
+      if (entries.length === 0) {
+        vscode.window.showInformationMessage('没有标记为「参与全部恢复」的条目。');
+        return;
+      }
+      for (const e of entries) {
+        void this.openEntry(e).catch(() => { /* 单个条目失败不中断整批 */ });
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    })();
   }
 
   // ---- 交互式增删改 ----
