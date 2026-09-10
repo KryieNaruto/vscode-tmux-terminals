@@ -38,15 +38,6 @@ describe('validateName', () => {
   it('全空白报错', () => {
     assert.notStrictEqual(validateName('   ', existing), null);
   });
-  it('含冒号报错（与 tmux 的 session:window.pane 目标语法冲突）', () => {
-    assert.notStrictEqual(validateName('a:b', existing), null);
-  });
-  it('含点号报错（同上）', () => {
-    assert.notStrictEqual(validateName('a.b', existing), null);
-  });
-  it('纯数字报错（与 tmux 会话索引冲突）', () => {
-    assert.notStrictEqual(validateName('123', existing), null);
-  });
   it('与已有条目重名报错', () => {
     assert.notStrictEqual(validateName('paint-pc', existing), null);
   });
@@ -55,5 +46,25 @@ describe('validateName', () => {
   });
   it('名字两侧空白被忽略后再判重', () => {
     assert.notStrictEqual(validateName('  paint-pc  ', existing), null);
+  });
+
+  // 以下三条是「会话名改由 id 派生」后的解禁项。
+  // 显示名不再进入 tmux 目标语法，故这些字符不再有技术风险。
+  it('含冒号放行（显示名不再用作 tmux 目标）', () => {
+    assert.strictEqual(validateName('a:b', existing), null);
+  });
+  it('含点号放行', () => {
+    assert.strictEqual(validateName('build.android', existing), null);
+  });
+  it('纯数字放行（不再与 tmux 会话索引冲突）', () => {
+    assert.strictEqual(validateName('123', existing), null);
+  });
+
+  // 换行仍须拒绝：会破坏 TreeView 的单行展示
+  it('含换行报错', () => {
+    assert.notStrictEqual(validateName('a\nb', existing), null);
+  });
+  it('含回车报错', () => {
+    assert.notStrictEqual(validateName('a\rb', existing), null);
   });
 });

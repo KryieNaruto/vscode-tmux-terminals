@@ -100,4 +100,43 @@ describe('EntryStore', () => {
     const ids = new Set(Array.from({ length: 500 }, () => newId()));
     assert.strictEqual(ids.size, 500);
   });
+
+  // 以下两条是并发写入的回归测试。
+  // 曾用固定的 `filePath + '.tmp'` 做临时名：两次 save 交错时先完成者把
+  // .tmp rename 走，后完成者 rename 时源已不存在 → ENOENT 抛出。
+  // 且 add 是 load→改→save，并发 add 会互相覆盖，丢更新。
+  it('并发 add 不抛错，且两条都保住（不丢更新）', async () => {
+    const store = new EntryStore(tmpFile());
+    await Promise.all([
+      store.add(entry({ name: 'a' })),
+      store.add(entry({ name: 'b' })),
+      store.add(entry({ name: 'c' })),
+      store.add(entry({ name: 'd' })),
+      store.add(entry({ name: 'e' })),
+    ]);
+    const names = (await store.load()).map((e) => e.name).sort();
+    assert.deepStrictEqual(names, ['a', 'b', 'c', 'd', 'e']);
+  });
+
+  it('并发混合增删改不抛错，最终状态一致', async () => {
+    const store = new EntryStore(tmpFile());
+    const keep = entry({ name: 'keep' });
+    await store.add(keep);
+    await Promise.all([
+      store.add(entry({ name: 'x' })),
+      store.update(keep.id, { cwd: '/changed' }),
+      store.add(entry({ name: 'y' })),
+    ]);
+    const all = await store.load();
+    assert.strictEqual(all.length, 3);
+    assert.strictEqual(all.find((e) => e.id === keep.id)?.cwd, '/changed');
+  });
+
+  it('并发写不留下 .tmp 残留', async () => {
+    const file = tmpFile();
+    const store = new EntryStore(file);
+    await Promise.all([store.add(entry({ name: 'a' })), store.add(entry({ name: 'b' }))]);
+    const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'));
+    assert.deepStrictEqual(leftovers, []);
+  });
 });

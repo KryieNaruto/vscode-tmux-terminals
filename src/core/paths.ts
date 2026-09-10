@@ -14,18 +14,20 @@ export function expandHome(p: string, home: string): string {
 }
 
 /**
- * 校验条目名。返回错误消息，或 null 表示通过。
+ * 校验条目显示名。返回错误消息，或 null 表示通过。
  *
- * 名字同时用作 tmux 会话名，所以限制来自 tmux：
- * - `:` 和 `.` 是 tmux 目标的层级分隔符（session:window.pane），会造成歧义
- * - 纯数字与 tmux 的会话索引（0、1、2…）冲突
+ * **只校验显示用途**：名字不再用作 tmux 会话名（会话名由条目 id 派生，
+ * 见 core/tmux.ts 的 sessionNameFor）。所以 `:`、`.`、纯数字都放行——
+ * 用户想叫 "build.android" 或 "2024" 都合理。
+ *
+ * 只拦两类：空白名（没有意义）和含换行/回车的名字（会破坏 TreeView
+ * 的单行展示）。重名也拦，因为会话名既然由 id 派生，重名就不再是
+ * 技术冲突而纯粹是用户困惑，仍应避免。
  */
 export function validateName(name: string, existingNames: string[]): string | null {
   const trimmed = name.trim();
   if (trimmed.length === 0) return '名称不能为空';
-  if (trimmed.includes(':')) return '名称不能包含冒号（与 tmux 目标语法冲突）';
-  if (trimmed.includes('.')) return '名称不能包含点号（与 tmux 目标语法冲突）';
-  if (/^\d+$/.test(trimmed)) return '名称不能是纯数字（与 tmux 会话索引冲突）';
+  if (/[\r\n]/.test(name)) return '名称不能包含换行';
   if (existingNames.includes(trimmed)) return `名称「${trimmed}」已存在`;
   return null;
 }
