@@ -224,14 +224,19 @@ export class TerminalManager {
    * 清空（model 未给）时回落到该 profile 的默认模型；读不到默认则只落
    * 配置、提示下次启动生效。
    */
-  async applyModel(entry: TerminalEntry, model: string | undefined): Promise<void> {
+  /**
+   * 返回 false 表示被安全守卫拒绝（或目标模型无法确定），未改动配置；
+   * true 表示已成功应用（未运行 = 只落配置，也算成功）。与 restartClaude
+   * 一样用布尔回报结果，供批量套用据此统计「成功/失败」，而非把拒绝当成功。
+   */
+  async applyModel(entry: TerminalEntry, model: string | undefined): Promise<boolean> {
     const session = sessionNameFor(entry.id);
     const normalized = model && model.length > 0 ? model : undefined;
     const alive = await this.tmux.hasSession(session);
 
     if (!alive) {
       await this.store.update(entry.id, { model: normalized });
-      return;
+      return true;
     }
 
     // 目标模型：显式给出就用它；清空则回落到该 profile 的默认模型。
@@ -245,16 +250,17 @@ export class TerminalManager {
       void vscode.window.showInformationMessage(
         `「${entry.name}」未读到 ${entry.profile} 的默认模型，已保存为「下次启动生效」。`,
       );
-      return;
+      return true;
     }
 
     if (!(await this.canSendControl(session))) {
       this.refuse(entry, '切模型');
-      return;
+      return false;
     }
     await this.tmux.sendLiteral(session, `/model ${target}`);
     await this.tmux.sendEnter(session);
     await this.store.update(entry.id, { model: normalized });
+    return true;
   }
 
   /**
@@ -266,8 +272,12 @@ export class TerminalManager {
    * model 一并清空：两个 profile 的模型命名空间不同（deepseek-* vs
    * claude-*），沿用旧值几乎必然无效，回落到新 profile 的默认才正确。
    */
-  async applyProfile(entry: TerminalEntry, profile: Profile): Promise<void> {
-    if (entry.profile === profile) return;
+  /**
+   * 返回 false 表示被安全守卫拒绝（或重启失败），未改动配置；true 表示
+   * 已切换成功。profile 未变时返回 true（无事可做，不算失败）。
+   */
+  async applyProfile(entry: TerminalEntry, profile: Profile): Promise<boolean> {
+    if (entry.profile === profile) return true;
     const session = sessionNameFor(entry.id);
 
     if (await this.tmux.hasSession(session)) {
@@ -276,9 +286,10 @@ export class TerminalManager {
         { ...entry, profile, model: undefined },
         true,
       );
-      if (!ok) return; // 被拒绝时不动配置
+      if (!ok) return false; // 被拒绝时不动配置
     }
     await this.store.update(entry.id, { profile });
+    return true;
   }
 
   /**
@@ -288,7 +299,7 @@ export class TerminalManager {
   private async applyToMany(
     entries: TerminalEntry[],
     label: string,
-    one: (e: TerminalEntry) => Promise<void>,
+    one: (e: TerminalEntry) => Promise<boolean>,
   ): Promise<void> {
     if (entries.length === 0) {
       void vscode.window.showInformationMessage('没有选中任何条目。');
@@ -298,9 +309,11 @@ export class TerminalManager {
     const failed: string[] = [];
     for (const e of entries) {
       try {
-        await one(e);
-        ok++;
+        // 成败由 one 的返回值裁决：守卫拒绝返回 false，不能算成功。
+        if (await one(e)) ok++;
+        else failed.push(e.name);
       } catch {
+        // 只兜意外异常；守卫拒绝不是异常，上面的 false 分支已经处理
         failed.push(e.name);
       }
       // 轻微错开，避免同时重启多个 claude 争抢资源

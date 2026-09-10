@@ -86,18 +86,21 @@ export function activate(context: vscode.ExtensionContext): void {
   reg('tmuxTerminals.add', async () => {
     await manager.addEntryInteractive();
     provider.refresh();
+    batchProvider.refresh();
   });
 
   reg('tmuxTerminals.edit', async (arg: unknown) => {
     const it = item(arg);
     if (it) await manager.editEntryInteractive(it.entry);
     provider.refresh();
+    batchProvider.refresh();
   });
 
   reg('tmuxTerminals.duplicate', async (arg: unknown) => {
     const it = item(arg);
     if (it) await manager.duplicateEntry(it.entry);
     provider.refresh();
+    batchProvider.refresh();
   });
 
   reg('tmuxTerminals.delete', async (arg: unknown) => {
@@ -146,8 +149,9 @@ export function activate(context: vscode.ExtensionContext): void {
     provider.refresh();
   });
 
-  // 内部命令：只由批量面板的 TreeItem.command 调用，故不在 package.json 里
-  // 声明 —— 声明了就会出现在命令面板，徒增噪音。
+  // 内部命令：只由批量面板的 TreeItem.command 调用。已在 package.json 声明
+  // （让「注册⇒声明」的清单校验覆盖它），但用 commandPalette 的 when:false
+  // 从命令面板隐藏 —— 避免徒增噪音。
   reg('tmuxTerminals.batchToggle', (id: unknown) => {
     if (typeof id === 'string') batchProvider.toggle(id);
   });
