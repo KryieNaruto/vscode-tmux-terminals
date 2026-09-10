@@ -31,3 +31,25 @@ export function validateName(name: string, existingNames: string[]): string | nu
   if (existingNames.includes(trimmed)) return `名称「${trimmed}」已存在`;
   return null;
 }
+
+/**
+ * 把候选项去重、排序、截断。
+ *
+ * 排序规则：条目里**已用过的目录最优先**（对高频目录最有用），其余按给定顺序。
+ * 截断数量必须回报 —— 静默丢弃会让用户以为没有那个目录。
+ */
+export function rankCandidates(
+  used: string[],
+  discovered: string[],
+  limit = 50,
+): { items: string[]; truncated: number } {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of [...used, ...discovered]) {
+    const t = p.trim();
+    if (t.length === 0 || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return { items: out.slice(0, limit), truncated: Math.max(0, out.length - limit) };
+}
