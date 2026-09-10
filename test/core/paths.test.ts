@@ -1,5 +1,13 @@
 import * as assert from 'assert';
-import { expandHome, rankCandidates, validateName } from '../../src/core/paths';
+import {
+  discoverCandidates,
+  displayPath,
+  expandHome,
+  parentOf,
+  rankCandidates,
+  scanRoots,
+  validateName,
+} from '../../src/core/paths';
 
 describe('expandHome', () => {
   const home = '/home/qiansenwei';
@@ -83,5 +91,111 @@ describe('rankCandidates', () => {
 
   it('空串与纯空白被剔除', () => {
     assert.deepStrictEqual(rankCandidates(['', '  '], []).items, []);
+  });
+});
+
+describe('displayPath', () => {
+  const home = '/home/u';
+  it('家目录本身显示为 ~', () => {
+    assert.strictEqual(displayPath('/home/u', home), '~');
+  });
+  it('家目录下的路径显示为 ~/…', () => {
+    assert.strictEqual(displayPath('/home/u/workspace/Mine', home), '~/workspace/Mine');
+  });
+  it('家目录之外的绝对路径原样', () => {
+    assert.strictEqual(displayPath('/ssd/u/workspace', home), '/ssd/u/workspace');
+  });
+  it('不误伤前缀相同的兄弟目录（/home/user vs /home/u）', () => {
+    assert.strictEqual(displayPath('/home/user/x', home), '/home/user/x');
+  });
+});
+
+describe('parentOf', () => {
+  it('取父目录', () => {
+    assert.strictEqual(parentOf('/ssd/u/workspace'), '/ssd/u');
+  });
+  it('根目录返回自身（不会无限上溯）', () => {
+    assert.strictEqual(parentOf('/'), '/');
+  });
+  it('单层目录返回根', () => {
+    assert.strictEqual(parentOf('/ssd'), '/');
+  });
+});
+
+describe('scanRoots', () => {
+  const home = '/home/u';
+
+  it('★ 已用目录被当作扫描根（否则它的子目录永远列不出来）', () => {
+    const r = scanRoots(['/ssd/u/workspace'], home);
+    assert.ok(r.includes('/ssd/u/workspace'), `实际：${r.join(', ')}`);
+  });
+
+  it('★ 已用目录的父目录也被扫描（这样能列出同级目录）', () => {
+    const r = scanRoots(['/ssd/u/workspace'], home);
+    assert.ok(r.includes('/ssd/u'), `实际：${r.join(', ')}`);
+  });
+
+  it('不含硬编码的 ~/workspace（工作树未必在家目录下）', () => {
+    const r = scanRoots(['/ssd/u/workspace'], home);
+    assert.ok(!r.includes('/home/u/workspace'), `实际：${r.join(', ')}`);
+  });
+
+  it('家目录仍被扫描（作为兜底）', () => {
+    assert.ok(scanRoots([], home).includes(home));
+  });
+
+  it('去重', () => {
+    const r = scanRoots(['/ssd/u/workspace', '/ssd/u/workspace'], home);
+    assert.strictEqual(r.filter((x) => x === '/ssd/u/workspace').length, 1);
+  });
+
+  it('条目里的 ~ 会先展开', () => {
+    const r = scanRoots(['~/mine/paint'], home);
+    assert.ok(r.includes('/home/u/mine/paint'), `实际：${r.join(', ')}`);
+  });
+});
+
+describe('discoverCandidates', () => {
+  const home = '/home/u';
+
+  // 真实复现：home 在 /home/u，而工作树在 /ssd/u/workspace，两者毫无关系。
+  const tree: Record<string, string[]> = {
+    '/home/u': ['Android', '.cache', 'workspace'],
+    '/ssd/u': ['workspace'],
+    '/ssd/u/workspace': ['mine', 'work', 'windows', 'test'],
+    '/ssd/u/workspace/mine': ['paint-pc'],
+  };
+  const readSubdirs = async (d: string) => tree[d] ?? [];
+
+  it('★ 回归：工作树不在 home 下时，其子目录仍须出现', async () => {
+    const roots = scanRoots(['/ssd/u/workspace'], home);
+    const out = await discoverCandidates(roots, home, readSubdirs);
+    assert.ok(
+      out.includes('/ssd/u/workspace/mine'),
+      `未列出 mine。实际：${out.join(', ')}`,
+    );
+  });
+
+  it('★ 回归：列出的是工作树下的目录，而不只是 home 那一堆', async () => {
+    const roots = scanRoots(['/ssd/u/workspace'], home);
+    const out = await discoverCandidates(roots, home, readSubdirs);
+    for (const want of ['mine', 'work', 'windows', 'test']) {
+      assert.ok(out.includes(`/ssd/u/workspace/${want}`), `缺 ${want}：${out.join(', ')}`);
+    }
+  });
+
+  it('家目录下的路径显示成 ~/…', async () => {
+    const out = await discoverCandidates([home], home, readSubdirs);
+    assert.deepStrictEqual(out.sort(), ['~/Android', '~/workspace']);
+  });
+
+  it('隐藏目录被跳过', async () => {
+    const out = await discoverCandidates([home], home, readSubdirs);
+    assert.ok(!out.some((p) => p.includes('.cache')), out.join(', '));
+  });
+
+  it('某个根不存在/不可读时静默跳过，不影响其他根', async () => {
+    const out = await discoverCandidates(['/nope', '/ssd/u/workspace'], home, readSubdirs);
+    assert.ok(out.includes('/ssd/u/workspace/mine'), out.join(', '));
   });
 });
