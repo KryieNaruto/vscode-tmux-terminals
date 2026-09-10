@@ -74,7 +74,7 @@ src/
 ├── core/                 纯逻辑，零 vscode 依赖 → 100% 单元测试
 │   ├── tmux.ts           parseSessionList / shellQuote / isShellCommand
 │   ├── paths.ts          expandHome / validateName
-│   └── plan.ts           planRestore
+│   └── plan.ts           planRestore ← **v2 已删除**，闸门现为 core/tmux.ts#isShellReady
 ├── tmuxClient.ts         execFile 包装：list / has / kill
 ├── store.ts              清单读写
 ├── tree.ts               TreeDataProvider + 存活状态
@@ -121,6 +121,9 @@ interface TerminalEntry {
 - 含 `:` 或 `.` → 报错（tmux 目标语法 `session:window.pane` 会产生歧义）
 - 纯数字 → 报错（与 tmux 的会话索引冲突）
 - 与已有条目重名 → 报错
+
+> **v2 已删除本节**（见 `2026-09-10-tmux-terminals-v2-design.md` §14/§15）。
+> 判据不再是「会话是否存活」，而是「pane 前台是不是登录 shell」（`core/tmux.ts#isShellReady`）+ 条目绑定的对话（`core/restore.ts#decideOpen`、`core/command.ts#conversationCommand`）。以下为 v1 原文，保留作历史记录。
 
 ### `planRestore(entry, alive: boolean): { mode: 'attach'|'create', commands: string[] }`
 - `alive === true` → `{ mode: 'attach', commands: [] }`

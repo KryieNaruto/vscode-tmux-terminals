@@ -260,7 +260,8 @@ Map 未命中时，先按终端名在 `vscode.window.terminals` 里查找同名�
 
 ## 12. 验证方式
 
-- **纯函数层**（`src/core/`）：`commandFor`、`migrate`、短路径消歧、`planRestore` 的现有测试 —— TDD，先写失败测试
+- **纯函数层**（`src/core/`）：`commandFor` / `conversationCommand`、`migrate`、短路径消歧、`restore`（decideOpen）、`conversation`、`claude`（isShellReady 在 `tmux.ts`）的测试 —— TDD，先写失败测试
+  （`planRestore` 与 `src/core/plan.ts` 已在 §14/§15 的订正里删除，它的位置由 `tmux.ts#isShellReady` 那道闸门取代）
 - **清单测试**（`test/manifest.test.ts`）：新增第二个 view 的 id/容器一致性；标题栏按钮的 `when` 条件与命令 id 一一对应
 - **e2e 脚本**（`test/e2e-harness.js`）：扩展为覆盖
   - 杀会话 → 面板确实被 dispose、Map 确实清空
@@ -360,6 +361,37 @@ Map 未命中时，先按终端名在 `vscode.window.terminals` 里查找同名�
 - **验证**：`npm test` 226 passing；e2e 全绿（新增 §2 出声断言、§6b 确认闸
   两条分支、§6c 显式命令入口）；三处变异测试（不出声、不确认、只在一个
   入口确认）均被对应断言捕获。
+
+### 订正（2026-09-10，第五次，独立复核后的四处残余）
+
+- **① busy 状态「未知」必须与「空闲」区分开。** 扩展宿主重载后 `busy` 是空集、
+  而 `shellIntegration` 仍在 —— 一个**正在跑编译**的面板会被误判空闲，然后被
+  塞进 `tmux attach`。改为只复用**本宿主世代由我们亲手创建**的面板
+  （`ownPanels`，所有 `createTerminal` 都经 `createOwnPanel`）；上一个世代的
+  面板：会话已附着 → 仍然只 `show()`；需要客户端 → 新建面板。代价是重载后
+  可能多一个新面板，接受。
+- **② `openEntry` 的 TOCTOU 窗口。** `shellReady` 算出来之后隔着一次可能很久
+  的 QuickPick，之后才发送。改为**发送前重算一次** `isShellReady`（一次
+  `display-message`），窗口从「用户思考时长」压到毫秒级。
+- **③ `pickChain` 只串行化了选择框。** `owners` 快照在 op 内读、`store.update`
+  却在 op 外写，两个共用 cwd 的老条目可能都看到「还没人绑」→ 双双接到同一条
+  对话上（正是本批提交要防的损坏）。改为**读 owners → 选择框 → 确认模态 →
+  写绑定整段在同一个 op 内**；`pickConversation` 自己不再入队，由调用方负责。
+  顺带解决确认模态与下一个条目的选择框并存的问题。
+- **④ 补两处零覆盖**：`duplicateEntry`（复制品的 `conversationId` 必须重新生成，
+  既不等于源、也不是 undefined）与 `openEntry` 的竞态分支（被别的窗口抢先
+  创建 → 转接回、绝不发命令）。
+- **⑤ 清理**：`rm -rf out` 重编，确认无指向已删 `core/plan` 的陈旧 `.js.map`；
+  v1 spec/plan 里把 `plan.ts` 标为 v2 已删除，v2 spec §12 的验证方式改指
+  现在的 `isShellReady` 闸门。
+- **⑥ e2e 的隔离断言升级为文件级**：原先只比 `~/.claude/projects` 的**目录集合**，
+  真 claude 若跑在**已存在**的 project 目录下（只加 `.jsonl`）就抓不到。现在逐
+  文件比路径集合，并额外断言「本轮没有任何测试会话的痕迹落进用户真实的库」
+  （用户自己的 claude 会话此刻仍在写盘，单独计数、不计入本测试）。
+
+- **验证**：`npm test` 226 passing；e2e 全绿（新增 §6d TOCTOU、§6e 并发串行化、
+  §11c/11c2/11e 面板三态、§16 复制、§17 竞态）；三处变异测试（去掉
+  `ownPanels` 判定、去掉发送前重算、把写绑定移出 op）均被对应断言捕获。
 
 
 ## 15. 条目 ↔ 对话绑定（2026-09-10 追加）

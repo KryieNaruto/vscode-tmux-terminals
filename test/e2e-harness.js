@@ -98,7 +98,11 @@ const vscodeStub = {
     onDidCloseTerminal() { return { dispose() {} }; },
     onDidStartTerminalShellExecution: (cb) => shellExecutionStart.event(cb),
     onDidEndTerminalShellExecution: (cb) => shellExecutionEnd.event(cb),
-    showWarningMessage(m) { calls.warns.push(m); return Promise.resolve(modalAnswer); },
+    showWarningMessage(m) {
+      calls.warns.push(m);
+      // 与 showQuickPick 同样支持「函数式应答」，好让用例模拟「用户在慢慢看」
+      return Promise.resolve(typeof modalAnswer === 'function' ? modalAnswer(m) : modalAnswer);
+    },
     showErrorMessage(m) { calls.errors.push(m); return Promise.resolve(undefined); },
     showInformationMessage(m) { calls.messages.push(m); return Promise.resolve(undefined); },
     showInputBox() { return Promise.resolve(undefined); },
@@ -160,6 +164,8 @@ const CONV_RESTART2 = 'aaaaaaaa-0008-0000-0000-000000000000';
 const CONV_FAIL = 'aaaaaaaa-0005-0000-0000-000000000000';
 const CONV_STALE = 'aaaaaaaa-0006-0000-0000-000000000000';
 const PICKED_CONV = '99999999-8888-7777-6666-555555555555';
+/** 并发用例专用：一开始没人绑，让第一个条目绑上、第二个必须看见它。 */
+const RACE_CONV = '77777777-6666-5555-4444-333333333333';
 const OTHER_CONV = '22222222-3333-4444-5555-666666666666';
 
 /**
@@ -243,12 +249,25 @@ async function writeConversation(uuid, cwd, summary, projectDir) {
   );
 }
 
-async function projectDirs() {
-  try {
-    return (await fs.promises.readdir(path.join(os.homedir(), '.claude', 'projects'))).sort();
-  } catch {
-    return [];
+/**
+ * 用户真实 ~/.claude/projects 的**文件级**快照（路径 → 体积/mtime）。
+ *
+ * 只比目录集合是不够的：真 claude 若跑在一个**已存在**的 project 目录下，
+ * 只会往里加 `.jsonl` / 改已有文件，目录集合一字不变 —— 那样根本抓不到。
+ */
+async function projectSnapshot() {
+  const root = path.join(os.homedir(), '.claude', 'projects');
+  const out = new Map();
+  for (const dir of await fs.promises.readdir(root).catch(() => [])) {
+    const abs = path.join(root, dir);
+    for (const f of await fs.promises.readdir(abs).catch(() => [])) {
+      try {
+        const st = await fs.promises.stat(path.join(abs, f));
+        out.set(`${dir}/${f}`, { size: st.size, mtimeMs: st.mtimeMs });
+      } catch { /* 读不到就不记 */ }
+    }
   }
+  return out;
 }
 
 (async () => {
@@ -262,6 +281,10 @@ async function projectDirs() {
   const ID_LEGACY_ESC = 'e2elegacye1'; // 老条目 + 有候选 → Esc → 什么都不启动
   const ID_SHARE = 'e2eshare0001';     // 老条目，选中「已绑给别人」的对话 → 二次确认
   const ID_SHARE2 = 'e2eshare0002';    // 同上，但走显式命令「选择要接回的对话…」
+  const ID_TOCTOU = 'e2etoctou001';    // 判据→弹选择框→发送 之间 pane 起了 build
+  const ID_RACE_A = 'e2eracea001';     // 并发恢复：两个共用 cwd 的老条目
+  const ID_RACE_B = 'e2eraceb001';
+  const ID_RACEBRANCH = 'e2eracebrnch'; // 竞态：会话被别的窗口抢先创建
   const ID_RESTART = 'e2erestart1';    // 切 profile：有绑定 → --resume
   const ID_NOBIND = 'e2enobind01';     // 切 profile：无绑定 → 拒绝
   const ID_RESUMEFAIL = 'e2eresfail1'; // --resume 报 No conversation found → 必须看得见
@@ -272,10 +295,11 @@ async function projectDirs() {
   const ID_PREFIX = 'e2e0000a';
   const STALE_IDS = ['e2estale01', 'e2estale02', 'e2estale03', 'e2estale04'];
   const ALL = [ID_NEW, ID_FRESH, ID_DEAD, ID_ALIVE, ID_SHELL, ID_LEGACY, ID_LEGACY_NEW,
-    ID_LEGACY_ESC, ID_SHARE, ID_SHARE2, ID_RESTART, ID_NOBIND, ID_RESUMEFAIL, ID_CONFLICT, ID_KILL,
-    ID_REFUSE, ID_B, ID_PREFIX, ...STALE_IDS];
+    ID_LEGACY_ESC, ID_SHARE, ID_SHARE2, ID_TOCTOU, ID_RACE_A, ID_RACE_B, ID_RACEBRANCH,
+    ID_RESTART, ID_NOBIND, ID_RESUMEFAIL, ID_CONFLICT, ID_KILL, ID_REFUSE, ID_B, ID_PREFIX,
+    ...STALE_IDS];
 
-  const projectsBefore = await projectDirs();
+  const projectsBefore = await projectSnapshot();
 
   // 清场：上一次跑残留的会话、假 HOME、假 claude、scratch 目录
   await killAll(ALL);
@@ -318,6 +342,7 @@ async function projectDirs() {
   // 老条目要挑的两条历史对话
   await writeConversation(PICKED_CONV, CONV_CWD, '把那个 bug 修了', '-tmp-tmuxterm-e2e-convcwd');
   await writeConversation(OTHER_CONV, CONV_CWD, '另一个终端的历史', '-tmp-tmuxterm-e2e-convcwd');
+  await writeConversation(RACE_CONV, CONV_CWD, '并发用例的对话', '-tmp-tmuxterm-e2e-convcwd');
 
   const store = {
     entries: [],
@@ -354,6 +379,10 @@ async function projectDirs() {
     mk(ID_LEGACY_ESC, 'LEGACYESC', CONV_CWD),
     mk(ID_SHARE, 'SHARE', CONV_CWD),
     mk(ID_SHARE2, 'SHARE2', CONV_CWD),
+    mk(ID_TOCTOU, 'TOCTOU', CONV_CWD),                 // 老条目：无 conversationId
+    mk(ID_RACE_A, 'RACEA', CONV_CWD),                  // 老条目：无 conversationId
+    mk(ID_RACE_B, 'RACEB', CONV_CWD),
+    mk(ID_RACEBRANCH, 'RACEBRANCH', SCRATCH),
     mk(ID_RESTART, 'RESTART', BOUND_CWD, { conversationId: CONV_RESTART }),
     mk(ID_NOBIND, 'NOBIND', BOUND_CWD, { conversationId: CONV_RESTART2 }),
     mk(ID_RESUMEFAIL, 'RESUMEFAIL', BOUND_CWD, { conversationId: CONV_FAIL }),
@@ -511,11 +540,15 @@ async function projectDirs() {
 
     chk('弹了选择框', calls.quickPicks.length === 1, `实际 ${calls.quickPicks.length} 次`);
     const items = (calls.quickPicks[0] || {}).items || [];
-    chk('候选 2 条 + 末尾「＋ 新建一条对话」', items.length === 3, `实际 ${items.length}`);
+    // 条数从假 HOME 实际算，避免以后加用例时写死
+    const expected = candidatesForCwd(await listConversations(HOME), CONV_CWD).length;
+    chk('候选若干条 + 末尾「＋ 新建一条对话」', items.length === expected + 1,
+      `实际 ${items.length}，期望 ${expected + 1}`);
     chk('★ 末尾那项明确写着「新建一条对话」',
-      /新建一条对话/.test((items[2] || {}).label || ''), JSON.stringify(items.map((i) => i.label)));
+      /新建一条对话/.test((items[items.length - 1] || {}).label || ''),
+      JSON.stringify(items.map((i) => i.label)));
     chk('对话候选显示 时间 · 摘要 · 体积',
-      items.slice(0, 2).every((i) => /·/.test(i.label) && /KB|MB|B/.test(i.label)),
+      items.slice(0, -1).every((i) => /·/.test(i.label) && /KB|MB|B/.test(i.label)),
       JSON.stringify(items.map((i) => i.label)));
     chk('★ 选中的对话被永久绑定到条目', bound(ID_LEGACY) === PICKED_CONV,
       `实际 ${JSON.stringify(bound(ID_LEGACY))}`);
@@ -594,6 +627,97 @@ async function projectDirs() {
     quickPickAnswer = undefined;
     chk('★ 确认后绑定生效', bound(ID_SHARE2) === PICKED_CONV,
       `实际 ${JSON.stringify(bound(ID_SHARE2))}`);
+  }
+
+  console.log('\n=== 6d. 判据 → 弹选择框 → 发送 之间用户起了 build → 绝不能发 ===');
+  {
+    resetCalls();
+    // PICKED_CONV 这时已被别的条目绑着，会先弹确认 —— 这里一路确认通过，
+    // 保证唯一能挡住发送的就是「发送前重算判据」那道闸。
+    modalAnswer = '仍然接这条';
+    // 用户在「思考该选哪条对话」的这段时间里，在同一个 pane 里起了 build
+    quickPickAnswer = async (items) => {
+      await run('tmux', ['send-keys', '-l', '-t', `=${S(ID_TOCTOU)}:`, 'sleep 300']);
+      await run('tmux', ['send-keys', '-t', `=${S(ID_TOCTOU)}:`, 'Enter']);
+      await sleep(600);
+      return items.find((i) => i.candidate && i.candidate.id === PICKED_CONV);
+    };
+    const mgr = newManager();
+    await mgr.openEntry(fresh(ID_TOCTOU));
+    await sleep(2000);
+    quickPickAnswer = undefined;
+    modalAnswer = undefined;
+
+    chk('前置：确实走完了选择流程（绑定已写入）', bound(ID_TOCTOU) === PICKED_CONV,
+      `实际 ${JSON.stringify(bound(ID_TOCTOU))}`);
+    chk('★ 发送前重算判据：pane 已不是登录 shell → 一条启动命令都没发',
+      calls.literals.length === 0,
+      'TOCTOU：命令发进了用户刚起的 build！' + JSON.stringify(calls.literals));
+    chk('★ 说清了原因', calls.warns.some((m) => String(m).includes('跳过')),
+      JSON.stringify(calls.warns));
+  }
+
+  console.log('\n=== 6e. 并发恢复两个共用 cwd 的老条目：第二个必须看见第一个的绑定 ===');
+  {
+    resetCalls();
+    // RACE_CONV 此时还没人绑：第一个条目会绑上它，第二个必须看见它已被绑
+    quickPickAnswer = (items) => items.find((i) => i.candidate && i.candidate.id === RACE_CONV);
+    modalAnswer = undefined;   // 第二个若被要求确认 → 取消
+    // 真实的 store.update 是一次**文件写入**，有真实耗时。把它放慢，
+    // 「读 owners 在 op 内、写绑定在 op 外」这个缺陷就一定会露马脚：
+    // 第二个条目会在第一个的写入落盘之前读到「还没人绑」。
+    const origUpdate = store.update.bind(store);
+    store.update = async (id, patch) => { await sleep(300); return origUpdate(id, patch); };
+
+    const mgr = newManager();
+    // 并发发起（restoreAll 内部就是这么并发 openEntry 的）
+    await Promise.all([mgr.openEntry(fresh(ID_RACE_A)), mgr.openEntry(fresh(ID_RACE_B))]);
+    await sleep(2500);
+    store.update = origUpdate;
+    quickPickAnswer = undefined;
+    modalAnswer = undefined;
+
+    const boundTo = [ID_RACE_A, ID_RACE_B]
+      .filter((id) => bound(id) === RACE_CONV);
+    const resumes = [...literalsTo(S(ID_RACE_A)), ...literalsTo(S(ID_RACE_B))]
+      .filter((t) => t.includes(`--resume '${RACE_CONV}'`));
+    chk('★ 同一条对话只有一个条目绑上（第二个看见了第一个的绑定并要确认）',
+      boundTo.length === 1, `实际绑上的：${JSON.stringify(boundTo.map((id) => [id, bound(id)]))}`);
+    chk('★ 因此只有一条 --resume 打向它（不会两个 claude 写同一个 .jsonl）',
+      resumes.length === 1, JSON.stringify(resumes));
+  }
+
+  console.log('\n=== 6f. 确认模态开着期间，不应有别的条目的选择框冒出来 ===');
+  {
+    resetCalls();
+    // 两个条目都恢复成「未绑定」，这样它们都会经过选择框
+    await store.update(ID_RACE_A, { conversationId: undefined });
+    await store.update(ID_RACE_B, { conversationId: undefined });
+    let modalCalls = 0;
+    let picksDuringModal = -1;
+    // 两个条目都选「已绑给 LEGACY」的 PICKED_CONV → 都会走确认模态
+    quickPickAnswer = (items) => items.find((i) => i.candidate && i.candidate.id === PICKED_CONV);
+    modalAnswer = async () => {
+      modalCalls++;
+      if (modalCalls === 1) {
+        await sleep(400);                       // 用户在看这个确认框
+        picksDuringModal = calls.quickPicks.length;
+        return '仍然接这条';
+      }
+      return undefined;                          // 第二个取消
+    };
+
+    const mgr = newManager();
+    await Promise.all([mgr.openEntry(fresh(ID_RACE_A)), mgr.openEntry(fresh(ID_RACE_B))]);
+    await sleep(2500);
+    quickPickAnswer = undefined;
+    modalAnswer = undefined;
+
+    chk('前置：两个条目各自弹过选择框，且确认模态出现过',
+      calls.quickPicks.length === 2 && modalCalls >= 1,
+      `pick=${calls.quickPicks.length} modal=${modalCalls}`);
+    chk('★ 确认模态开着期间没有下一个条目的选择框并存（不会一摞对话框）',
+      picksDuringModal === 1, `实际当时已有 ${picksDuringModal} 个选择框`);
   }
 
   console.log('\n=== 7. 老条目 + 用户主动选「＋ 新建一条对话」→ 开新对话并绑定 ===');
@@ -744,23 +868,66 @@ async function projectDirs() {
       vscodeStub.window.terminals.length = 0;
     }
 
-    // ---- 11c. 存活 + 0 附着 + 可证明空闲的同名面板 → 复用该面板 ----
+    // ---- 11c. 上一个宿主世代的面板：busy 状态未知 → **绝不**用来打字 ----
+    // 宿主重载后 busy 是空集、而 shellIntegration 仍在，一个正在跑编译的面板
+    // 会被误判空闲。未知必须与空闲区分开，一律按危险处理。
     {
       await tmux.newSession(S(STALE_IDS[2]), BOUND_CWD);
       resetCalls();
       const mgr = newManager();
-      const idleSurvivor = makeSurvivor(nm(2), { shellIntegration: {} });
-      vscodeStub.window.terminals.push(idleSurvivor);
+      const foreignIdle = makeSurvivor(nm(2), { shellIntegration: {} });
+      vscodeStub.window.terminals.push(foreignIdle);
 
       await mgr.openEntry(fresh(STALE_IDS[2]));
       await sleep(1500);
 
-      chk('11c ★ 证明空闲的面板被复用（不再多开一个）', calls.terminals.length === 0,
+      chk('11c ★ 上一个世代的面板（即使看着空闲）也不往里打字',
+        foreignIdle.sent.length === 0,
+        'busy 状态未知的面板被打进了 tmux attach！' + JSON.stringify(foreignIdle.sent));
+      chk('11c 改为新建面板并 attach',
+        calls.terminals.length === 1 && attachedTo(calls.terminals[0]),
+        `新终端 ${calls.terminals.length} 个`);
+      vscodeStub.window.terminals.length = 0;
+    }
+
+    // ---- 11c2. 本宿主世代由我们亲手建的面板：busy 一直跟踪着 → 可以复用 ----
+    {
+      resetCalls();
+      const mgr = newManager();
+      await mgr.openEntry(fresh(STALE_IDS[2]));   // 建会话 + 建**我们自己的**面板
+      await sleep(2000);
+      const ourPanel = calls.terminals[calls.terminals.length - 1];
+      chk('11c2 前置条件：建出了我们自己的面板', !!ourPanel && attachedTo(ourPanel));
+
+      await run('tmux', ['kill-session', '-t', `=${S(STALE_IDS[2])}`]);   // 会话死掉
+      resetCalls();
+      await mgr.openEntry(fresh(STALE_IDS[2]));   // 会话已死 → 需要客户端
+      await sleep(2000);
+
+      chk('11c2 ★ 复用了我们自己建的面板（不再多开一个）', calls.terminals.length === 0,
         `实际新终端数 ${calls.terminals.length}`);
-      chk('11c 向复用的面板发了 tmux attach', attachedTo(idleSurvivor),
-        JSON.stringify(idleSurvivor.sent));
-      chk('11c 对复用的面板执行了 show()', idleSurvivor.shown === 1,
-        `实际 show ${idleSurvivor.shown} 次`);
+      chk('11c2 向复用的面板发了 tmux attach', attachedTo(ourPanel),
+        JSON.stringify(ourPanel.sent));
+      chk('11c2 对复用的面板执行了 show()', ourPanel.shown >= 1, `实际 show ${ourPanel.shown} 次`);
+    }
+
+    // ---- 11e. 上一个世代的面板 + 会话已附着 → 只 show（不打字，安全又整洁） ----
+    {
+      await tmux.newSession(S(STALE_IDS[2]), BOUND_CWD);
+      await attachRealClient(S(STALE_IDS[2]));
+      resetCalls();
+      const mgr = newManager();
+      const foreign = makeSurvivor(nm(2), { shellIntegration: {} });
+      vscodeStub.window.terminals.push(foreign);
+
+      await mgr.openEntry(fresh(STALE_IDS[2]));
+      await sleep(1200);
+      await detachRealClient();
+
+      chk('11e ★ 会话已有人在看 → 只 show 那个面板，不新建也不打字',
+        calls.terminals.length === 0 && foreign.sent.length === 0,
+        `新终端 ${calls.terminals.length} 个，sent=${JSON.stringify(foreign.sent)}`);
+      chk('11e 对面板执行了 show()', foreign.shown === 1, `实际 show ${foreign.shown} 次`);
       vscodeStub.window.terminals.length = 0;
     }
 
@@ -868,18 +1035,73 @@ async function projectDirs() {
     await fs.promises.rm(refuseFile, { force: true }).catch(() => {});
   }
 
+  console.log('\n=== 16. duplicateEntry：复制品必须有自己的对话 id ===');
+  {
+    const src = fresh(ID_DEAD);
+    resetCalls();
+    const mgr = newManager();
+    await mgr.duplicateEntry(src);
+    const copy = store.entries[store.entries.length - 1];
+
+    chk('复制出了新条目（新 id、新名字）',
+      !!copy && copy.id !== src.id && copy.name !== src.name,
+      `src=${src.id}/${src.name} copy=${copy && copy.id}/${copy && copy.name}`);
+    chk('★ 复制品的 conversationId 已被重新生成（不是源条目那条）',
+      copy.conversationId !== src.conversationId,
+      `src=${src.conversationId} copy=${copy.conversationId}`);
+    chk('★ 也不是 undefined（否则会被当成「老条目」而在恢复时弹选择框）',
+      copy.conversationId !== undefined && UUID_RE.test(copy.conversationId),
+      String(copy.conversationId));
+  }
+
+  console.log('\n=== 17. 竞态：会话在等待期间被别的窗口抢先创建 → 只接回、绝不发命令 ===');
+  {
+    resetCalls();
+    const mgr = newManager();
+    // 让 newSession 报告「不是我建的」，但会话其实已经存在 —— 这正是
+    // 「等待期间被别的窗口建出来」的竞态
+    const origNew = tmux.newSession;
+    tmux.newSession = async (name, cwd) => {
+      calls.newSessions.push({ name, cwd });
+      await run('tmux', ['new-session', '-d', '-s', name, '-c', cwd]);
+      return false;
+    };
+    await mgr.openEntry(fresh(ID_RACEBRANCH));
+    await sleep(1500);
+    tmux.newSession = origNew;
+
+    chk('会话存在（别的窗口建的）', await tmux.hasSession(S(ID_RACEBRANCH)));
+    chk('接回了面板', calls.terminals.some(attachedTo));
+    chk('★ 一条启动命令都没发（§11 竞态铁律）', calls.literals.length === 0,
+      '把命令发进了别人的会话！' + JSON.stringify(calls.literals));
+    chk('提示了「刚被其他窗口创建」',
+      calls.messages.some((m) => String(m).includes('其他窗口')), JSON.stringify(calls.messages));
+  }
+
   console.log('\n=== 15. 清理 + 用户环境未被触碰 ===');
   await detachRealClient();
   await killAll(ALL);
   const left = (await tmux.listSessions()).filter((s) => s.startsWith('tmuxterm-e2e'));
   chk('无残留测试会话', left.length === 0, left.join(', '));
 
-  // ★ 最要紧的一条：整轮跑完，用户真实的 ~/.claude/projects 必须一字不差
-  const projectsAfter = await projectDirs();
-  chk('★ 用户真实的 ~/.claude/projects 目录集合未被改动',
-    JSON.stringify(projectsBefore) === JSON.stringify(projectsAfter),
-    `before=${projectsBefore.length} after=${projectsAfter.length} ` +
-    `新增=${projectsAfter.filter((d) => !projectsBefore.includes(d)).join(',')}`);
+  // ★ 最要紧的一条：整轮跑完，用户真实的 ~/.claude/projects 必须逐文件一致
+  const projectsAfter = await projectSnapshot();
+  const added = [...projectsAfter.keys()].filter((k) => !projectsBefore.has(k));
+  const removed = [...projectsBefore.keys()].filter((k) => !projectsAfter.has(k));
+  chk('★ 用户真实的 ~/.claude/projects 没有新增/删除任何文件',
+    added.length === 0 && removed.length === 0,
+    `新增=${added.join(',')} 删除=${removed.join(',')}`);
+
+  // 用户自己的 claude 会话此刻仍在写盘（它们不是本测试的痕迹）。
+  // 关键是：**本测试不能留下任何痕迹** —— 测试会话的 cwd 全部以
+  // tmuxterm-e2e 打头，真 claude 若被拉起来就会在对应 project 下留文件。
+  const liveChanged = [...projectsAfter]
+    .filter(([k, v]) => projectsBefore.has(k) && projectsBefore.get(k).mtimeMs !== v.mtimeMs)
+    .map(([k]) => k);
+  chk('★ 本轮没有任何测试会话的痕迹落进用户真实的库',
+    !liveChanged.some((k) => k.includes('tmuxterm-e2e')),
+    liveChanged.filter((k) => k.includes('tmuxterm-e2e')).join(','));
+  console.log(`    （本轮期间用户在活动的会话文件 ${liveChanged.length} 个 —— 那是他自己的进程，不计入）`);
 
   const fakeHomeBefore = fs.existsSync(HOME);
   await fs.promises.rm(HOME, { recursive: true, force: true });
