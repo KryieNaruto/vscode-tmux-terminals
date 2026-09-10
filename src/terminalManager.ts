@@ -1,7 +1,14 @@
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as vscode from 'vscode';
-import { expandHome, rankCandidates, validateName } from './core/paths';
+import {
+  discoverCandidates,
+  displayPath,
+  expandHome,
+  rankCandidates,
+  scanRoots,
+  validateName,
+} from './core/paths';
 import { planRestore } from './core/plan';
 import { sessionNameFor, shellQuote } from './core/tmux';
 import { Profile, TerminalEntry } from './core/types';
@@ -480,29 +487,25 @@ export class TerminalManager {
   }
 
   /**
-   * 选目录。候选 = 已有条目用过的目录 + `~` 一层 + `~/workspace` 一层。
+   * 选目录。候选 = 已用过的目录 + 它们自身与父目录各一层 + 家目录一层。
    *
    * 只扫一层：深扫会卡，而深层目录用户手输更快。
+   *
+   * 扫描根取自「已经用过的目录」，**不硬编码 `~/workspace`**：那个
+   * 猜测在本机就是错的（home 在 /home/…，工作树在 /ssd/…），会把
+   * 用户从不使用的目录塞满列表，而真正在用的树一条都不出现。
    */
   private async askCwd(current?: string): Promise<string | undefined> {
     const MANUAL = '$(pencil) 手动输入…';
     const all = await this.store.load();
-    const used = all.map((e) => e.cwd);
-
     const home = this.home();
-    const discovered: string[] = [];
-    for (const base of ['~', '~/workspace']) {
-      try {
-        const dir = expandHome(base, home);
-        const entries = await fs.readdir(dir, { withFileTypes: true });
-        for (const d of entries) {
-          if (!d.isDirectory() || d.name.startsWith('.')) continue;
-          discovered.push(base === '~' ? `~/${d.name}` : `${base}/${d.name}`);
-        }
-      } catch {
-        // 目录不存在 —— 跳过，不打扰用户
-      }
-    }
+
+    const used = all.map((e) => displayPath(e.cwd.trim(), home));
+    const roots = scanRoots(all.map((e) => e.cwd), home);
+    const discovered = await discoverCandidates(roots, home, async (dir) => {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      return entries.filter((d) => d.isDirectory()).map((d) => d.name);
+    });
 
     const { items, truncated } = rankCandidates(used, discovered);
     const title = truncated > 0

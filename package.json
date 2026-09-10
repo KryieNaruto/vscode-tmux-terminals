@@ -2,15 +2,26 @@
   "name": "vscode-tmux-terminals",
   "displayName": "Tmux Terminals",
   "description": "一键恢复 Remote-SSH 断开后的终端工作区",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "KryieNaruto",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/KryieNaruto/vscode-tmux-terminals.git" },
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Other"],
-  "extensionKind": ["workspace"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KryieNaruto/vscode-tmux-terminals.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
   "main": "./out/src/extension.js",
-  "activationEvents": ["onView:tmuxTerminals.list"],
+  "activationEvents": [
+    "onView:tmuxTerminals.list"
+  ],
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -27,49 +38,178 @@
           "id": "tmuxTerminals.list",
           "name": "终端清单"
         },
-        { "id": "tmuxTerminals.batch", "name": "批量操作" }
+        {
+          "id": "tmuxTerminals.batch",
+          "name": "批量操作"
+        }
       ]
     },
     "commands": [
-      { "command": "tmuxTerminals.open", "title": "打开终端", "icon": "$(terminal)" },
-      { "command": "tmuxTerminals.add", "title": "新建终端条目", "icon": "$(add)" },
-      { "command": "tmuxTerminals.edit", "title": "编辑", "icon": "$(edit)" },
-      { "command": "tmuxTerminals.duplicate", "title": "复制", "icon": "$(copy)" },
-      { "command": "tmuxTerminals.delete", "title": "删除条目", "icon": "$(trash)" },
-      { "command": "tmuxTerminals.killSession", "title": "杀掉远端 tmux 会话", "icon": "$(stop-circle)" },
-      { "command": "tmuxTerminals.toggleAutoRestore", "title": "切换「参与全部恢复」", "icon": "$(check)" },
-      { "command": "tmuxTerminals.restoreAll", "title": "全部恢复", "icon": "$(history)" },
-      { "command": "tmuxTerminals.refresh", "title": "刷新状态", "icon": "$(refresh)" },
-      { "command": "tmuxTerminals.setModel", "title": "设置模型…", "icon": "$(chip)" },
-      { "command": "tmuxTerminals.setProfile", "title": "切换直连/中转", "icon": "$(plug)" },
-      { "command": "tmuxTerminals.batchSetCcr", "title": "设为中转", "icon": "$(cloud)" },
-      { "command": "tmuxTerminals.batchSetDirect", "title": "设为直连", "icon": "$(plug)" },
-      { "command": "tmuxTerminals.batchSetModel", "title": "批量设置模型…", "icon": "$(chip)" },
-      { "command": "tmuxTerminals.batchClear", "title": "清空选择", "icon": "$(clear-all)" },
-      { "command": "tmuxTerminals.batchToggle", "title": "切换选中（内部）" }
+      {
+        "command": "tmuxTerminals.open",
+        "title": "打开终端",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "tmuxTerminals.add",
+        "title": "新建终端条目",
+        "icon": "$(add)"
+      },
+      {
+        "command": "tmuxTerminals.edit",
+        "title": "编辑",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "tmuxTerminals.duplicate",
+        "title": "复制",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "tmuxTerminals.delete",
+        "title": "删除条目",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "tmuxTerminals.killSession",
+        "title": "杀掉远端 tmux 会话",
+        "icon": "$(stop-circle)"
+      },
+      {
+        "command": "tmuxTerminals.toggleAutoRestore",
+        "title": "切换「参与全部恢复」",
+        "icon": "$(check)"
+      },
+      {
+        "command": "tmuxTerminals.restoreAll",
+        "title": "全部恢复",
+        "icon": "$(history)"
+      },
+      {
+        "command": "tmuxTerminals.refresh",
+        "title": "刷新状态",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "tmuxTerminals.setModel",
+        "title": "设置模型…",
+        "icon": "$(chip)"
+      },
+      {
+        "command": "tmuxTerminals.setProfile",
+        "title": "切换直连/中转",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "tmuxTerminals.batchSetCcr",
+        "title": "设为中转",
+        "icon": "$(cloud)"
+      },
+      {
+        "command": "tmuxTerminals.batchSetDirect",
+        "title": "设为直连",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "tmuxTerminals.batchSetModel",
+        "title": "批量设置模型…",
+        "icon": "$(chip)"
+      },
+      {
+        "command": "tmuxTerminals.batchClear",
+        "title": "清空选择",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "tmuxTerminals.batchToggle",
+        "title": "切换选中（内部）"
+      }
     ],
     "menus": {
       "view/title": [
-        { "command": "tmuxTerminals.restoreAll", "when": "view == tmuxTerminals.list", "group": "navigation@1" },
-        { "command": "tmuxTerminals.add", "when": "view == tmuxTerminals.list", "group": "navigation@2" },
-        { "command": "tmuxTerminals.refresh", "when": "view == tmuxTerminals.list", "group": "navigation@3" },
-        { "command": "tmuxTerminals.batchSetCcr", "when": "view == tmuxTerminals.batch", "group": "navigation@1" },
-        { "command": "tmuxTerminals.batchSetDirect", "when": "view == tmuxTerminals.batch", "group": "navigation@2" },
-        { "command": "tmuxTerminals.batchSetModel", "when": "view == tmuxTerminals.batch", "group": "navigation@3" },
-        { "command": "tmuxTerminals.batchClear", "when": "view == tmuxTerminals.batch", "group": "navigation@4" }
+        {
+          "command": "tmuxTerminals.restoreAll",
+          "when": "view == tmuxTerminals.list",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tmuxTerminals.add",
+          "when": "view == tmuxTerminals.list",
+          "group": "navigation@2"
+        },
+        {
+          "command": "tmuxTerminals.refresh",
+          "when": "view == tmuxTerminals.list",
+          "group": "navigation@3"
+        },
+        {
+          "command": "tmuxTerminals.batchSetCcr",
+          "when": "view == tmuxTerminals.batch",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tmuxTerminals.batchSetDirect",
+          "when": "view == tmuxTerminals.batch",
+          "group": "navigation@2"
+        },
+        {
+          "command": "tmuxTerminals.batchSetModel",
+          "when": "view == tmuxTerminals.batch",
+          "group": "navigation@3"
+        },
+        {
+          "command": "tmuxTerminals.batchClear",
+          "when": "view == tmuxTerminals.batch",
+          "group": "navigation@4"
+        }
       ],
       "view/item/context": [
-        { "command": "tmuxTerminals.open", "when": "view == tmuxTerminals.list", "group": "inline@1" },
-        { "command": "tmuxTerminals.killSession", "when": "view == tmuxTerminals.list && viewItem == aliveSession", "group": "1_kill@1" },
-        { "command": "tmuxTerminals.setModel", "when": "view == tmuxTerminals.list", "group": "2_edit@0" },
-        { "command": "tmuxTerminals.setProfile", "when": "view == tmuxTerminals.list", "group": "2_edit@1" },
-        { "command": "tmuxTerminals.edit", "when": "view == tmuxTerminals.list", "group": "2_edit@1" },
-        { "command": "tmuxTerminals.duplicate", "when": "view == tmuxTerminals.list", "group": "2_edit@2" },
-        { "command": "tmuxTerminals.toggleAutoRestore", "when": "view == tmuxTerminals.list", "group": "2_edit@3" },
-        { "command": "tmuxTerminals.delete", "when": "view == tmuxTerminals.list", "group": "3_danger@1" }
+        {
+          "command": "tmuxTerminals.open",
+          "when": "view == tmuxTerminals.list",
+          "group": "inline@1"
+        },
+        {
+          "command": "tmuxTerminals.killSession",
+          "when": "view == tmuxTerminals.list && viewItem == aliveSession",
+          "group": "1_kill@1"
+        },
+        {
+          "command": "tmuxTerminals.setModel",
+          "when": "view == tmuxTerminals.list",
+          "group": "2_edit@0"
+        },
+        {
+          "command": "tmuxTerminals.setProfile",
+          "when": "view == tmuxTerminals.list",
+          "group": "2_edit@1"
+        },
+        {
+          "command": "tmuxTerminals.edit",
+          "when": "view == tmuxTerminals.list",
+          "group": "2_edit@1"
+        },
+        {
+          "command": "tmuxTerminals.duplicate",
+          "when": "view == tmuxTerminals.list",
+          "group": "2_edit@2"
+        },
+        {
+          "command": "tmuxTerminals.toggleAutoRestore",
+          "when": "view == tmuxTerminals.list",
+          "group": "2_edit@3"
+        },
+        {
+          "command": "tmuxTerminals.delete",
+          "when": "view == tmuxTerminals.list",
+          "group": "3_danger@1"
+        }
       ],
       "commandPalette": [
-        { "command": "tmuxTerminals.batchToggle", "when": "false" }
+        {
+          "command": "tmuxTerminals.batchToggle",
+          "when": "false"
+        }
       ]
     },
     "configuration": {
