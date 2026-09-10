@@ -116,7 +116,8 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
   const ID_B = 'e2e0000ab';      // 与 A 互为前缀，验证互不干扰
   const ID_KILL = 'e2ekill0001';
   const ID_REUSE = 'e2ereuse01';
-  const ALL = [ID_A, ID_B, ID_KILL, ID_REUSE];
+  const ID_REFUSE = 'e2erefus01';
+  const ALL = [ID_A, ID_B, ID_KILL, ID_REUSE, ID_REFUSE];
   const store = {
     entries: [],
     async load() { return this.entries; },
@@ -258,7 +259,41 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
     vscodeStub.window.terminals.length = 0;   // 清掉，避免污染清理节
   }
 
-  console.log('\n=== 7. 清理 ===');
+  console.log('\n=== 7. applyModel 拒绝路径：前台不是 claude → 不发序列、不改配置 ===');
+  {
+    const s = S(ID_REFUSE);
+    const { EntryStore } = require(path.join(ROOT, 'out/src/core/store.js'));
+    const refuseFile = `/tmp/vscode-tmux-terminals-e2e-refuse-${process.pid}.json`;
+    await fs.promises.rm(refuseFile, { force: true }).catch(() => {});
+    const refuseStore = new EntryStore(refuseFile);
+    await refuseStore.append({ id: ID_REFUSE, name: 'REFUSE', cwd: '/tmp', profile: 'ccr', autoRestore: true });
+    const entryRefuse = (await refuseStore.load()).find((e) => e.id === ID_REFUSE);
+
+    // 前台进程是 sleep（非 claude），模拟用户正在跑的非 claude 程序。
+    // 此时发 /model 会把字符打进 sleep 的 stdin —— 必须被守卫拦下。
+    await run('tmux', ['new-session', '-d', '-s', s, 'sleep 600']);
+
+    calls.literals.length = 0;
+    calls.errors.length = 0;
+
+    const mgrRefuse = new TerminalManager(refuseStore, tmux);
+    await mgrRefuse.applyModel(entryRefuse, 'some-model');
+
+    const after = (await refuseStore.load()).find((e) => e.id === ID_REFUSE);
+    chk('★ 拒绝时未发送任何控制序列（/model 未打进 sleep 进程）',
+      calls.literals.length === 0,
+      JSON.stringify(calls.literals));
+    chk('★ 拒绝时未写配置（model 保持未设）',
+      after.model === undefined,
+      `实际 model=${JSON.stringify(after.model)}`);
+    chk('拒绝已向用户呈现（error message 记录）',
+      calls.errors.some((m) => String(m).includes('不是 claude')),
+      JSON.stringify(calls.errors));
+
+    await fs.promises.rm(refuseFile, { force: true }).catch(() => {});
+  }
+
+  console.log('\n=== 8. 清理 ===');
   await killAll(ALL);
   const left = (await tmux.listSessions()).filter((s) => s.startsWith('tmuxterm-e2e'));
   chk('无残留测试会话', left.length === 0, left.join(', '));
