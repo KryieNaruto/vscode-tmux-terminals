@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { commandFor } from './core/command';
 import { sessionNameFor } from './core/tmux';
 import { TerminalEntry } from './core/types';
 
@@ -23,8 +24,7 @@ export class EntryTreeItem extends vscode.TreeItem {
         '',
         `- 目录：\`${entry.cwd}\``,
         `- 状态：${alive ? '🟢 会话存活，点击接回原进程' : '⚪ 无会话，点击新建并执行预设命令'}`,
-        `- 预设命令：${entry.commands.length === 0 ? '（无）' : ''}`,
-        ...entry.commands.map((c) => `  - \`${c}\``),
+        `- 预设命令：\`${commandFor(entry)}\``,
         `- 参与全部恢复：${entry.autoRestore ? '是' : '否'}`,
       ].join('\n'),
     );

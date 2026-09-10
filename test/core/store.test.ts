@@ -6,15 +6,17 @@ import { EntryStore, newId } from '../../src/core/store';
 import { TerminalEntry } from '../../src/core/types';
 
 function tmpFile(): string {
-  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tmuxterm-')), 'terminals.json');
+  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tmuxstore-')), 'terminals.json');
 }
 
+/** 原有用例的 v2 条目构造器（id 用 newId 保证唯一，供 add/remove/update 用）。 */
 const entry = (over: Partial<TerminalEntry> = {}): TerminalEntry => ({
   id: newId(),
   name: 'paint-pc',
   cwd: '~/mine/paint-pc',
-  commands: ['source env.sh'],
+  profile: 'ccr',
   autoRestore: true,
+  order: 0,
   ...over,
 });
 
@@ -53,7 +55,7 @@ describe('EntryStore', () => {
   });
 
   it('自动创建父目录', async () => {
-    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tmuxterm-')), 'a', 'b', 'terminals.json');
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tmuxstore-')), 'a', 'b', 'terminals.json');
     const store = new EntryStore(file);
     await store.save([entry()]);
     assert.strictEqual(fs.existsSync(file), true);
@@ -138,5 +140,85 @@ describe('EntryStore', () => {
     await Promise.all([store.add(entry({ name: 'a' })), store.add(entry({ name: 'b' }))]);
     const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'));
     assert.deepStrictEqual(leftovers, []);
+  });
+});
+
+describe('EntryStore v1 迁移', () => {
+  it('v1 文件能读出 v2 条目且一条不丢（回归：曾会被 isEntry 静默过滤）', async () => {
+    const f = tmpFile();
+    fs.writeFileSync(f, JSON.stringify([
+      { id: '9b96d6ac7a3f', name: '统筹者', cwd: '/w', commands: ['claude --dangerously-skip-permissions'], autoRestore: true },
+      { id: 'dab74caad49b', name: '咨询', cwd: '/w', commands: ['claude --dangerously-skip-permissions'], autoRestore: true },
+      { id: '1942d99d7238', name: 'UI', cwd: '/w/t', commands: ['claude-direct --dangerously-skip-permissions'], autoRestore: true },
+    ], null, 2));
+    const all = await new EntryStore(f).load();
+    assert.strictEqual(all.length, 3, '三条都必须保留');
+    assert.deepStrictEqual(all.map((e) => e.profile), ['ccr', 'ccr', 'direct']);
+    assert.deepStrictEqual(all.map((e) => e.order), [0, 1, 2]);
+  });
+
+  it('load() 不改写用户文件（不能只是打开扩展就动用户数据）', async () => {
+    const f = tmpFile();
+    const original = JSON.stringify([{ id: 'a', name: 'n', cwd: '/w', commands: [], autoRestore: true }]);
+    fs.writeFileSync(f, original);
+    await new EntryStore(f).load();
+    assert.strictEqual(fs.readFileSync(f, 'utf8'), original, '文件必须原样');
+  });
+
+  it('migrateAndBackup 备份一次，且重复调用不覆盖已有备份', async () => {
+    const f = tmpFile();
+    fs.writeFileSync(f, JSON.stringify([{ id: 'a', name: 'n', cwd: '/w', commands: [], autoRestore: true }]));
+    const s = new EntryStore(f);
+    assert.strictEqual(await s.migrateAndBackup(), true);
+    const bak1 = fs.readFileSync(f + '.bak', 'utf8');
+    assert.ok(bak1.includes('"commands"'), '备份必须是 v1 原文');
+    assert.strictEqual(await s.migrateAndBackup(), false);
+    assert.strictEqual(fs.readFileSync(f + '.bak', 'utf8'), bak1, '备份不能被覆盖');
+  });
+});
+
+describe('EntryStore.append', () => {
+  it('order 依次递增，不重复', async () => {
+    const f = tmpFile();
+    const s = new EntryStore(f);
+    // append 收 Omit<TerminalEntry,'order'> —— order 由 store 在锁内分配
+    await s.append({ id: 'a', name: 'a', cwd: '/w', profile: 'ccr', autoRestore: true });
+    await s.append({ id: 'b', name: 'b', cwd: '/w', profile: 'ccr', autoRestore: true });
+    const all = await s.load();
+    assert.deepStrictEqual(all.map((e) => e.order), [0, 1]);
+  });
+
+  it('并发 append 不产生相同 order（回归：order 必须在锁内分配）', async () => {
+    const f = tmpFile();
+    const s = new EntryStore(f);
+    await Promise.all([
+      s.append({ id: 'a', name: 'a', cwd: '/w', profile: 'ccr', autoRestore: true }),
+      s.append({ id: 'b', name: 'b', cwd: '/w', profile: 'ccr', autoRestore: true }),
+    ]);
+    const all = await s.load();
+    assert.strictEqual(all.length, 2);
+    assert.deepStrictEqual(all.map((e) => e.order).sort(), [0, 1], 'order 不能相同');
+  });
+});
+
+describe('EntryStore.reorder', () => {
+  it('按给定顺序重编号 order', async () => {
+    const f = tmpFile();
+    const s = new EntryStore(f);
+    for (const id of ['a', 'b', 'c']) await s.append({ id, name: id, cwd: '/w', profile: 'ccr', autoRestore: true });
+    await s.reorder(['c', 'a', 'b']);
+    const all = await s.load();
+    assert.deepStrictEqual(all.map((e) => e.id), ['c', 'a', 'b']);
+    assert.deepStrictEqual(all.map((e) => e.order), [0, 1, 2]);
+  });
+
+  it('并发 reorder 不丢更新（回归：v1 曾因并发 load→save 丢数据）', async () => {
+    const f = tmpFile();
+    const s = new EntryStore(f);
+    for (const id of ['a', 'b', 'c']) await s.append({ id, name: id, cwd: '/w', profile: 'ccr', autoRestore: true });
+    await Promise.all([s.reorder(['b', 'c', 'a']), s.reorder(['c', 'b', 'a'])]);
+    const all = await s.load();
+    assert.strictEqual(all.length, 3, '不能丢条目');
+    assert.deepStrictEqual(all.map((e) => e.order).sort(), [0, 1, 2], 'order 必须连续不重复');
   });
 });

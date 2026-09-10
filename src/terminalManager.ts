@@ -149,12 +149,10 @@ export class TerminalManager {
     if (name === undefined) return;
     const cwd = await this.askCwd();
     if (cwd === undefined) return;
-    const commands = await this.askCommands([]);
-    if (commands === undefined) return;
     const autoRestore = await this.askAutoRestore(true);
     if (autoRestore === undefined) return;
 
-    await this.store.add({ id: newId(), name, cwd, commands, autoRestore });
+    await this.store.append({ id: newId(), name, cwd, profile: 'ccr', autoRestore });
   }
 
   async editEntryInteractive(entry: TerminalEntry): Promise<void> {
@@ -165,10 +163,8 @@ export class TerminalManager {
     if (name === undefined) return;
     const cwd = await this.askCwd(entry.cwd);
     if (cwd === undefined) return;
-    const commands = await this.askCommands(entry.commands);
-    if (commands === undefined) return;
 
-    await this.store.update(entry.id, { name, cwd, commands });
+    await this.store.update(entry.id, { name, cwd });
   }
 
   async duplicateEntry(entry: TerminalEntry): Promise<void> {
@@ -179,7 +175,10 @@ export class TerminalManager {
     while (all.some((e) => e.name === name)) {
       name = `${base}${n++}`;
     }
-    await this.store.add({ ...entry, id: newId(), name });
+    // 用 append 而非 add：order 必须在 store 的锁内分配。
+    // 直接复制 entry.order 会与源条目相同，排序随即不确定。
+    const { order: _drop, ...rest } = entry;
+    await this.store.append({ ...rest, id: newId(), name });
   }
 
   async deleteEntry(entry: TerminalEntry): Promise<void> {
@@ -229,26 +228,6 @@ export class TerminalManager {
       value: current ?? '',
       validateInput: (v) => (v.trim().length === 0 ? '目录不能为空' : null),
     });
-  }
-
-  /** 循环输入命令，留空结束。返回 undefined 表示用户中途取消。 */
-  private async askCommands(current: string[]): Promise<string[] | undefined> {
-    const result = [...current];
-    const first = current.length === 0;
-    let editing = first;
-    while (editing) {
-      const v = await vscode.window.showInputBox({
-        title: first ? '命令 1（可留空跳过）' : `命令 ${result.length + 1}（留空结束）`,
-        prompt: '仅在新建 tmux 会话时执行；会话存活接回时不执行',
-        value: '',
-        ignoreFocusOut: true,
-      });
-      if (v === undefined) return undefined; // 用户按 Esc 取消整个流程
-      if (v.trim().length === 0) break;
-      result.push(v);
-      editing = true;
-    }
-    return result;
   }
 
   private async askAutoRestore(def: boolean): Promise<boolean | undefined> {
