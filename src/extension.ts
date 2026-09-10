@@ -1,8 +1,11 @@
 import * as vscode from 'vscode';
+import * as os from 'os';
 import * as path from 'path';
 import { EntryStore } from './core/store';
 import { TmuxClient } from './tmuxClient';
 import { EntryTreeItem, EntryTreeProvider } from './tree';
+import { BatchTreeProvider } from './batchTree';
+import { readProfileConfig } from './claudeConfig';
 import { TerminalManager } from './terminalManager';
 
 let pollTimer: NodeJS.Timeout | undefined;
@@ -27,6 +30,13 @@ export function activate(context: vscode.ExtensionContext): void {
     dragAndDropController: provider,
   });
   context.subscriptions.push(view);
+
+  const batchProvider = new BatchTreeProvider(store);
+  const batchView = vscode.window.createTreeView('tmuxTerminals.batch', {
+    treeDataProvider: batchProvider,
+    showCollapseAll: false,
+  });
+  context.subscriptions.push(batchView);
 
   // ---- 存活状态轮询 ----
   let inFlight = false;
@@ -94,6 +104,9 @@ export function activate(context: vscode.ExtensionContext): void {
     const it = item(arg);
     if (it) await manager.deleteEntry(it.entry);
     provider.refresh();
+    // 批量面板的 prune 只在 getChildren 里跑，这里主动触发一次刷新，
+    // 让被删条目的 id 从选中集合里立即剔除，避免对已删条目执行批量操作。
+    batchProvider.refresh();
   });
 
   reg('tmuxTerminals.killSession', async (arg: unknown) => {
@@ -129,6 +142,51 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   reg('tmuxTerminals.refresh', async () => {
+    await poll();
+    provider.refresh();
+  });
+
+  // 内部命令：只由批量面板的 TreeItem.command 调用，故不在 package.json 里
+  // 声明 —— 声明了就会出现在命令面板，徒增噪音。
+  reg('tmuxTerminals.batchToggle', (id: unknown) => {
+    if (typeof id === 'string') batchProvider.toggle(id);
+  });
+
+  reg('tmuxTerminals.batchClear', () => batchProvider.clear());
+
+  reg('tmuxTerminals.batchSetDirect', async () => {
+    await manager.applyProfileToMany(
+      batchProvider.entriesFor(batchProvider.selectedIds()), 'direct',
+    );
+    batchProvider.clear();
+    await poll();
+    provider.refresh();
+  });
+
+  reg('tmuxTerminals.batchSetCcr', async () => {
+    await manager.applyProfileToMany(
+      batchProvider.entriesFor(batchProvider.selectedIds()), 'ccr',
+    );
+    batchProvider.clear();
+    await poll();
+    provider.refresh();
+  });
+
+  reg('tmuxTerminals.batchSetModel', async () => {
+    const targets = batchProvider.entriesFor(batchProvider.selectedIds());
+    if (targets.length === 0) {
+      void vscode.window.showInformationMessage('请先在「批量操作」里选中条目。');
+      return;
+    }
+    // 候选取第一条的 profile：批量场景下用户的心智是「这批统一成某个模型」
+    const { models } = await readProfileConfig(targets[0].profile, os.homedir());
+    const CLEAR = '（清空，用 profile 默认）';
+    const pick = await vscode.window.showQuickPick([...models, CLEAR], {
+      title: `批量设置模型（${targets.length} 条）`,
+    });
+    if (pick === undefined) return;
+    await manager.applyModelToMany(targets, pick === CLEAR ? undefined : pick);
+    batchProvider.clear();
     await poll();
     provider.refresh();
   });

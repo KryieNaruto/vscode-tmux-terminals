@@ -281,6 +281,45 @@ export class TerminalManager {
     await this.store.update(entry.id, { profile });
   }
 
+  /**
+   * 批量套用。逐条独立捕获异常，沿用 restoreAll 的写法：一条失败不影响
+   * 其余，结束后汇报「成功 N / 失败 M」。
+   */
+  private async applyToMany(
+    entries: TerminalEntry[],
+    label: string,
+    one: (e: TerminalEntry) => Promise<void>,
+  ): Promise<void> {
+    if (entries.length === 0) {
+      void vscode.window.showInformationMessage('没有选中任何条目。');
+      return;
+    }
+    let ok = 0;
+    const failed: string[] = [];
+    for (const e of entries) {
+      try {
+        await one(e);
+        ok++;
+      } catch {
+        failed.push(e.name);
+      }
+      // 轻微错开，避免同时重启多个 claude 争抢资源
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const msg = failed.length === 0
+      ? `${label}：成功 ${ok} 条。`
+      : `${label}：成功 ${ok} 条，失败 ${failed.length} 条（${failed.join('、')}）。`;
+    void vscode.window.showInformationMessage(msg);
+  }
+
+  async applyModelToMany(entries: TerminalEntry[], model: string | undefined): Promise<void> {
+    await this.applyToMany(entries, '批量设置模型', (e) => this.applyModel(e, model));
+  }
+
+  async applyProfileToMany(entries: TerminalEntry[], profile: Profile): Promise<void> {
+    await this.applyToMany(entries, '批量切换直连/中转', (e) => this.applyProfile(e, profile));
+  }
+
   /** 单条：选一个模型。清单来自 profile 的 settings；读不到则允许手输。 */
   async setModelInteractive(entry: TerminalEntry): Promise<void> {
     const { models } = await readProfileConfig(entry.profile, this.home());

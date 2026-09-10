@@ -68,7 +68,10 @@ describe('package.json 清单一致性', () => {
   it('注册的命令都在 package.json 里声明了', () => {
     const declared = new Set((contributes.commands ?? []).map((c: { command: string }) => c.command));
     const registered = [...EXTENSION_SRC.matchAll(/reg\('([^']+)'/g)].map((m) => m[1]);
-    const extra = registered.filter((c) => !declared.has(c));
+    // batchToggle 是内部命令：只由批量面板的 TreeItem.command 调用。
+    // 注册是为了有 handler；故意不声明，以免它出现在命令面板徒增噪音。
+    const internalOnly = new Set(['tmuxTerminals.batchToggle']);
+    const extra = registered.filter((c) => !declared.has(c) && !internalOnly.has(c));
     assert.deepStrictEqual(extra, [], `注册了但未声明的命令（命令面板里看不到）: ${extra}`);
   });
 
@@ -169,5 +172,14 @@ describe('package.json 清单一致性', () => {
     // 每个被菜单引用的 viewItem 值都必须由代码设置，否则菜单项永不出现
     const neverSet = usedInMenus.filter((v) => !setValues.includes(v));
     assert.deepStrictEqual(neverSet, [], `菜单引用了代码从不设置的 contextValue（该项永不出现）: ${neverSet}`);
+  });
+
+  it('两个 view 同属 tmuxTerminals 容器', () => {
+    const containerIds = (contributes.viewsContainers?.activitybar ?? []).map((c: any) => c.id);
+    assert.ok(containerIds.includes('tmuxTerminals'));
+    const views = contributes.views?.tmuxTerminals ?? [];
+    for (const viewId of ['tmuxTerminals.list', 'tmuxTerminals.batch']) {
+      assert.ok(views.some((v: any) => v.id === viewId), `缺少 view ${viewId}`);
+    }
   });
 });
