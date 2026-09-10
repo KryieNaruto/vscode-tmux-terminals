@@ -44,6 +44,21 @@ export class TmuxClient {
   }
 
   /**
+   * 摘掉附着在该会话上的所有客户端。
+   *
+   * 杀会话前先 detach：否则「终端里的 attach 客户端」与「kill」之间存在
+   * 时序窗口，用户会看到面板停在 tmux 界面 / 状态与 UI 不符（实测问题）。
+   * 会话本就不存在时 tmux 报错，视为已达成目标。
+   */
+  async detachClients(name: string): Promise<void> {
+    try {
+      await run(this.tmuxPath, ['detach-client', '-s', sessionTarget(name)]);
+    } catch {
+      // 没有客户端附着 —— 目标状态已达成
+    }
+  }
+
+  /**
    * 以 detached 方式建会话，返回是否真的由本次调用创建。
    *
    * **为什么不直接在终端里 `tmux new -s name`：** 那样无法区分
