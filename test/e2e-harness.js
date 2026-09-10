@@ -10,6 +10,10 @@
  *   2. 会话已存在 → 接回，**绝不发送任何命令**（本项目最重要的一条）
  *   3. 重复点击 → 复用已有终端，不新开
  *   4. 前缀相近的会话互不干扰
+ *   5. 陈旧面板（宿主重启前留下的）不得被当成「已恢复」：会话已死要重建、
+ *      0 附着要 attach；面板状态不明或有命令在跑时绝不往里打字
+ *
+ * 只使用 `tmuxterm-e2e*` 前缀的会话，跑完必清，绝不碰用户已有会话。
  *
  * 用法：node test/e2e-harness.js
  */
@@ -32,10 +36,19 @@ class TreeItem {
   constructor(label) { this.label = label; }
 }
 class EventEmitter {
-  constructor() { this.event = () => ({ dispose() {} }); }
-  fire() {}
-  dispose() {}
+  constructor() {
+    this.listeners = [];
+    this.event = (cb) => { this.listeners.push(cb); return { dispose() {} }; };
+  }
+  fire(e) { for (const cb of [...this.listeners]) cb(e); }
+  dispose() { this.listeners.length = 0; }
 }
+
+// shell integration 的「有命令开始/结束」事件。真实 VS Code（1.93+，本机
+// 已开启 shell integration）靠它回答「某个面板里在跑什么」——这是
+// TerminalManager 判断「能否安全复用这个面板」的唯一依据，必须能驱动。
+const shellExecutionStart = new EventEmitter();
+const shellExecutionEnd = new EventEmitter();
 class ThemeIcon { constructor(id, color) { this.id = id; this.color = color; } }
 class ThemeColor { constructor(id) { this.id = id; } }
 class MarkdownString { constructor(v) { this.value = v; } }
@@ -60,6 +73,9 @@ const vscodeStub = {
         sent: [],
         shown: 0,
         disposed: 0,
+        // 真实 VS Code 面板（shell integration 开启）在 shell 就绪后
+        // 即有此对象；它是「可证明面板空闲」的前提。
+        shellIntegration: {},
         show() { this.shown++; },
         sendText(text, addNewline) { this.sent.push({ text, addNewline }); },
         dispose() { this.disposed++; },
@@ -68,6 +84,8 @@ const vscodeStub = {
       return t;
     },
     onDidCloseTerminal() { return { dispose() {} }; },
+    onDidStartTerminalShellExecution: (cb) => shellExecutionStart.event(cb),
+    onDidEndTerminalShellExecution: (cb) => shellExecutionEnd.event(cb),
     showWarningMessage(m) { calls.warns.push(m); return Promise.resolve(modalAnswer); },
     showErrorMessage(m) { calls.errors.push(m); return Promise.resolve(undefined); },
     showInformationMessage(m) { calls.messages.push(m); return Promise.resolve(undefined); },
@@ -108,6 +126,45 @@ async function killAll(ids) {
   }
 }
 
+// ---- 造「真的附着在会话上的客户端」 ----
+// `tmux attach` 需要 pty；借另一个 tmux 会话的 pane 提供 pty（`unset TMUX`
+// 才允许嵌套）。杀那个 helper 会话即可精确摘掉客户端，不留游离进程。
+const ATTACH_HELPER = 'tmuxterm-e2e-attach';
+
+async function attachRealClient(session) {
+  try { await run('tmux', ['kill-session', '-t', `=${ATTACH_HELPER}`]); } catch {}
+  await run('tmux', ['new-session', '-d', '-s', ATTACH_HELPER,
+    `unset TMUX; exec tmux attach -t =${session}`]);
+  await sleep(900);
+}
+
+async function detachRealClient() {
+  try { await run('tmux', ['kill-session', '-t', `=${ATTACH_HELPER}`]); } catch {}
+  await sleep(300);
+}
+
+/**
+ * 「陈旧面板」替身：扩展宿主重启前留下、名字与条目相同的终端。
+ * `shellIntegration` 只有在真实 VS Code 里 shell 就绪后才会挂上 —— 不传
+ * 就等价于「无法判定它是否空闲」，TerminalManager 必须因此新建面板。
+ */
+function makeSurvivor(name, opts) {
+  const t = {
+    name,
+    sent: [],
+    shown: 0,
+    disposed: 0,
+    show() { this.shown++; },
+    sendText(text, addNewline) { this.sent.push({ text, addNewline }); },
+    dispose() { this.disposed++; },
+  };
+  if (opts && opts.shellIntegration) t.shellIntegration = opts.shellIntegration;
+  return t;
+}
+
+const attachedTo = (term) =>
+  !!term && term.sent.some((s) => String(s.text).includes('tmux attach'));
+
 // ccr profile 派生的启动命令（见 src/core/command.ts 的 commandFor）
 const CCR_COMMAND = 'claude --dangerously-skip-permissions';
 
@@ -115,9 +172,8 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
   const ID_A = 'e2e0000a';
   const ID_B = 'e2e0000ab';      // 与 A 互为前缀，验证互不干扰
   const ID_KILL = 'e2ekill0001';
-  const ID_REUSE = 'e2ereuse01';
   const ID_REFUSE = 'e2erefus01';
-  const ALL = [ID_A, ID_B, ID_KILL, ID_REUSE, ID_REFUSE];
+  const ALL = [ID_A, ID_B, ID_KILL, ID_REFUSE];
   const store = {
     entries: [],
     async load() { return this.entries; },
@@ -180,15 +236,31 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
   chk('接回未重建会话', calls.newSessions.length === 0,
     JSON.stringify(calls.newSessions));
 
-  console.log('\n=== 3. 重复点击 → 复用终端，不新开 ===');
+  console.log('\n=== 3. 已恢复的会话：重复点击只 show，不新建也不重复 attach ===');
   calls.terminals.length = 0;
   const mgr3 = new TerminalManager(store, tmux);
   await mgr3.openEntry(entryA);
   const countAfterFirst = calls.terminals.length;
+  const firstTerm = calls.terminals[0];
+
+  // 第一次点击后，面板里的 `tmux attach` 在真实机器上确实会附着上去。
+  // 用真客户端把这一步补上 —— 「已经有人在看这个会话」才是重复点击
+  // 该走 show-only 的前提（判据是 #{session_attached}，不是内存 Map）。
+  await attachRealClient(S(ID_A));
+  const attachedNow = await tmux.attachedClients(S(ID_A));
+  chk('会话已有客户端附着（判据就绪）', attachedNow !== null && attachedNow >= 1,
+    `实际 attached=${attachedNow}`);
+  const sentBefore = firstTerm.sent.length;
+
   await mgr3.openEntry(entryA);
   chk('第二次点击未新建终端', calls.terminals.length === countAfterFirst,
     `第一次 ${countAfterFirst} 个，第二次后 ${calls.terminals.length} 个`);
-  chk('第二次点击执行了 show()', calls.terminals[0].shown >= 2);
+  chk('第二次点击执行了 show()', firstTerm.shown >= 2, `实际 show ${firstTerm.shown} 次`);
+  chk('已恢复的会话不再重复 attach（不往面板重复打字）',
+    firstTerm.sent.length === sentBefore,
+    JSON.stringify(firstTerm.sent.slice(sentBefore)));
+
+  await detachRealClient();
 
   console.log('\n=== 4. 前缀相近的会话互不干扰 ===');
   calls.literals.length = 0;
@@ -239,24 +311,117 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
       `实际新终端数 ${calls.terminals.length}`);
   }
 
-  console.log('\n=== 6. openEntry 复用守卫：Map 空但面板存活 ===');
+  console.log('\n=== 6. 陈旧面板不得被当成「已恢复」（2026-09-10 订正） ===');
   {
-    const entryReuse = { id: ID_REUSE, name: 'REUSE', cwd: '/tmp', profile: 'ccr', autoRestore: true, order: 0 };
+    // 旧实现：Map 空、但 window.terminals 里有同名面板 → 直接 show() 并
+    // return。它既不验证会话是否还在，也不验证有没有客户端附着。真实后果
+    // 就是用户描述的「批量恢复没用，只能恢复到 cd 那一层，不会调用 claude」：
+    // 面板当初是以 {cwd} 建的，tmux 客户端一退出就退回该目录下的裸 shell。
+    // 下面四种组合逐一钉死新行为。
+    const staleIds = ['e2estale01', 'e2estale02', 'e2estale03', 'e2estale04'];
+    await killAll(staleIds);   // 上一次跑残留的，先清
 
-    // 全新 manager（内部 Map 空），模拟扩展宿主重启；面板却仍存活在 window.terminals
-    const mgrReuse = new TerminalManager(store, tmux);
-    calls.terminals.length = 0;
+    const mkEntry = (id, name) => ({ id, name, cwd: '/tmp', profile: 'ccr', autoRestore: true, order: 0 });
 
-    const survivor = { name: 'REUSE', shown: 0, show() { this.shown++; }, dispose() {} };
-    vscodeStub.window.terminals.push(survivor);
+    // ---- 6a. 会话已死 + 同名陈旧面板（旧实现：完全 no-op）----
+    {
+      const entry = mkEntry(staleIds[0], 'STALEDEAD');
+      const mgrStale = new TerminalManager(store, tmux);
+      calls.terminals.length = 0;
+      calls.literals.length = 0;
+      calls.newSessions.length = 0;
 
-    await mgrReuse.openEntry(entryReuse);
+      const stale = makeSurvivor('STALEDEAD');   // 无 shellIntegration → 判不出空闲
+      vscodeStub.window.terminals.push(stale);
 
-    chk('未新建终端（复用了存活面板）', calls.terminals.length === 0,
-      `实际新终端数 ${calls.terminals.length}`);
-    chk('对存活面板执行了 show()', survivor.shown === 1, `实际 show ${survivor.shown} 次`);
+      await mgrStale.openEntry(entry);
+      await sleep(1200);
 
-    vscodeStub.window.terminals.length = 0;   // 清掉，避免污染清理节
+      chk('6a 会话已死 + 陈旧面板：会话被重新建出来',
+        await tmux.hasSession(S(staleIds[0])), '旧实现完全 no-op，什么都不做');
+      const fresh = calls.terminals[calls.terminals.length - 1];
+      chk('6a ★ 确实发了 tmux attach（不再停在 cd 那一层的裸 shell）', attachedTo(fresh),
+        JSON.stringify(calls.terminals.map((t) => t.sent)));
+      chk('6a 未把 attach 打进状态不明的陈旧面板（安全闸门）', stale.sent.length === 0,
+        JSON.stringify(stale.sent));
+
+      vscodeStub.window.terminals.length = 0;
+    }
+
+    // ---- 6b. 会话存活但 0 附着 + 同名陈旧面板（旧实现：只 show）----
+    {
+      const entry = mkEntry(staleIds[1], 'STALEALIVE');
+      await tmux.newSession(S(staleIds[1]), '/tmp');   // 存活，但没有任何客户端附着
+      const mgrStale = new TerminalManager(store, tmux);
+      calls.terminals.length = 0;
+      calls.literals.length = 0;
+      calls.newSessions.length = 0;
+
+      const stale = makeSurvivor('STALEALIVE');
+      vscodeStub.window.terminals.push(stale);
+
+      await mgrStale.openEntry(entry);
+      await sleep(1200);
+
+      chk('6b 会话仍存在（未误重建）', await tmux.hasSession(S(staleIds[1])));
+      chk('6b 未新建 tmux 会话', calls.newSessions.length === 0, JSON.stringify(calls.newSessions));
+      chk('6b ★ 0 附着 → 必须 attach（旧实现只 show()，claude 在后台跑着却看不见）',
+        calls.terminals.some(attachedTo), JSON.stringify(calls.terminals.map((t) => t.sent)));
+      chk('6b 未把 attach 打进状态不明的陈旧面板', stale.sent.length === 0, JSON.stringify(stale.sent));
+
+      vscodeStub.window.terminals.length = 0;
+    }
+
+    // ---- 6c. 会话存活 + 0 附着 + 可证明空闲的同名面板 → 复用该面板 ----
+    {
+      const entry = mkEntry(staleIds[2], 'STALEIDLE');
+      await tmux.newSession(S(staleIds[2]), '/tmp');
+      const mgrStale = new TerminalManager(store, tmux);
+      calls.terminals.length = 0;
+
+      // shellIntegration 在场 + 没有命令在跑 = 已证明空闲停在提示符上
+      const idleSurvivor = makeSurvivor('STALEIDLE', { shellIntegration: {} });
+      vscodeStub.window.terminals.push(idleSurvivor);
+
+      await mgrStale.openEntry(entry);
+      await sleep(1200);
+
+      chk('6c ★ 证明空闲的面板被复用（不再多开一个）', calls.terminals.length === 0,
+        `实际新终端数 ${calls.terminals.length}`);
+      chk('6c 向复用的面板发了 tmux attach', attachedTo(idleSurvivor),
+        JSON.stringify(idleSurvivor.sent));
+      chk('6c 对复用的面板执行了 show()', idleSurvivor.shown === 1,
+        `实际 show ${idleSurvivor.shown} 次`);
+
+      vscodeStub.window.terminals.length = 0;
+    }
+
+    // ---- 6d. 面板里正在跑命令（shell integration 报忙）→ 绝不往里打字 ----
+    {
+      const entry = mkEntry(staleIds[3], 'BUSYPANEL');
+      await tmux.newSession(S(staleIds[3]), '/tmp');
+      const mgrStale = new TerminalManager(store, tmux);
+      calls.terminals.length = 0;
+
+      const busySurvivor = makeSurvivor('BUSYPANEL', { shellIntegration: {} });
+      vscodeStub.window.terminals.push(busySurvivor);
+      // 模拟用户在面板里跑着编译：shell integration 报「命令开始」
+      shellExecutionStart.fire({ terminal: busySurvivor });
+
+      await mgrStale.openEntry(entry);
+      await sleep(1200);
+
+      chk('6d ★ 面板里有命令在跑 → 不往里打字（宁可多开一个面板）',
+        busySurvivor.sent.length === 0,
+        '把 tmux attach 塞进了用户正在跑的进程 stdin！' + JSON.stringify(busySurvivor.sent));
+      chk('6d 改为新建面板并 attach', calls.terminals.length === 1 && attachedTo(calls.terminals[0]),
+        `新终端 ${calls.terminals.length} 个，sent=${JSON.stringify(calls.terminals.map((t) => t.sent))}`);
+
+      shellExecutionEnd.fire({ terminal: busySurvivor });   // 收尾，别把忙态留给后面
+      vscodeStub.window.terminals.length = 0;
+    }
+
+    await killAll(staleIds);
   }
 
   console.log('\n=== 7. applyModel 拒绝路径：前台不是 claude → 不发序列、不改配置 ===');
@@ -294,6 +459,7 @@ const CCR_COMMAND = 'claude --dangerously-skip-permissions';
   }
 
   console.log('\n=== 8. 清理 ===');
+  await detachRealClient();          // 摘掉 3 节借来造附着客户端的 helper 会话
   await killAll(ALL);
   const left = (await tmux.listSessions()).filter((s) => s.startsWith('tmuxterm-e2e'));
   chk('无残留测试会话', left.length === 0, left.join(', '));

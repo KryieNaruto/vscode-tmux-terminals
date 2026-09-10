@@ -10,6 +10,7 @@ import {
   validateName,
 } from './core/paths';
 import { planRestore } from './core/plan';
+import { decideOpen } from './core/restore';
 import { sessionNameFor, shellQuote } from './core/tmux';
 import { Profile, TerminalEntry } from './core/types';
 import { commandFor } from './core/command';
@@ -21,18 +22,65 @@ import { TmuxClient } from './tmuxClient';
 const SHELL_READY_TIMEOUT_MS = 3000;
 
 export class TerminalManager {
-  /** tmux 会话名 → 终端，用于去重：重复点击复用已有终端而不是新开。 */
+  /**
+   * tmux 会话名 → 终端。**只用来挑「用哪个面板」**，绝不用来断定会话已
+   * 恢复（v2 首发的 bug 就出在这里，见 core/restore.ts）。同理，
+   * 凭 `window.terminals` 的同名面板也不足以断定恢复。
+   */
   private readonly terminals = new Map<string, vscode.Terminal>();
+
+  /**
+   * 已知「有命令正在跑」的面板，由 shell integration 事件维护。
+   *
+   * 面板里可能正跑着用户的编译／REPL，往它 stdin 里塞 `tmux attach` 能
+   * 毁掉一次构建。只有 shell integration 能回答「面板里在跑什么」，
+   * 因此这是「能否安全复用面板」的唯一依据。
+   */
+  private readonly busy = new Set<vscode.Terminal>();
 
   constructor(
     private readonly store: EntryStore,
     private readonly tmux: TmuxClient,
   ) {
     vscode.window.onDidCloseTerminal((t) => {
+      this.busy.delete(t);
       for (const [session, term] of this.terminals) {
         if (term === t) this.terminals.delete(session);
       }
     });
+
+    // 版本 <1.93 没有这两个 API；缺失时整条「可否安全复用面板」的判据
+    // 降级为「一律判不出来」→ 总是新建面板（安全侧）。attach 照常发生，
+    // 用户仍能看见 claude，只是可能多一个面板。
+    vscode.window.onDidStartTerminalShellExecution?.((e) => {
+      this.busy.add(e.terminal);
+    });
+    vscode.window.onDidEndTerminalShellExecution?.((e) => {
+      this.busy.delete(e.terminal);
+    });
+  }
+
+  /**
+   * 挑一个代表该会话的面板：先查内存 Map（同宿主内更精确），再按显示名
+   * 在 `window.terminals` 里找（扩展宿主重启后 Map 会清空，面板仍在）。
+   *
+   * **只用于挑面板。** 命中不等于会话已恢复 —— 会话可能已死、也可能没有
+   * 任何客户端附着。判据在 core/restore.ts。
+   */
+  private candidatePanel(session: string, name: string): vscode.Terminal | undefined {
+    return this.terminals.get(session) ?? vscode.window.terminals.find((t) => t.name === name);
+  }
+
+  /**
+   * 能否证明该面板空闲停在 shell 提示符上（即往里打字不会打断任何东西）。
+   *
+   * 两个条件缺一不可：shell integration 在场（否则无从得知面板里跑着什么），
+   * 且没记录到有命令在跑。判不出来一律 false —— 宁可多开一个面板，
+   * 也不能把 `tmux attach` 打进用户正在跑的进程。
+   */
+  private isIdlePanel(t: vscode.Terminal): boolean {
+    if (t.shellIntegration === undefined) return false;
+    return !this.busy.has(t);
   }
 
   /** 远端家目录。公开供扩展层复用，避免各处各算一份。 */
@@ -48,34 +96,44 @@ export class TerminalManager {
   /**
    * 打开（接回或重建）一个条目。
    *
+   * 对每条条目必须保证：**会话存在 + 至少一个客户端附着 + 有一个面板在
+   * 显示它**。判据见 core/restore.ts —— 内存 Map 与「终端同名」只用来挑
+   * 面板，绝不用于断定「已经恢复好了」（那是 v2 首发的 bug：会话已死或
+   * 0 附着时提前 return，用户只看到退回 cd 目录的裸 shell）。
+   *
    * 不变量：竞态兜底**只能把命令降级为空，永远不能凭空加出命令**。
    * 任何「会话可能已属于别人」的迹象都必须导致 `runCommands = false`。
    */
   async openEntry(entry: TerminalEntry): Promise<void> {
     // tmux 会话名由条目 id 派生，与显示名解耦（显示名可随意改名）。
     const session = sessionNameFor(entry.id);
-
-    const existing = this.terminals.get(session);
-    if (existing) {
-      existing.show();
-      return;
-    }
-
-    // Map 是内存态，扩展宿主重启后会清空，而终端面板仍在。没有这道守卫
-    // 就会出现「两个面板连着同一个会话」，并再次制造 UI 与实际不符。
-    const reused = vscode.window.terminals.find((t) => t.name === entry.name);
-    if (reused) {
-      this.terminals.set(session, reused);
-      reused.show();
-      return;
-    }
-
     const cwd = this.cwdFor(entry);
-    const wasAlive = await this.tmux.hasSession(session);
+
+    // ---- 权威事实：会话是否存在、有几个客户端附着 ----
+    const sessionExists = await this.tmux.hasSession(session);
+    // 会话不存在时不必（也无法）问附着数；已知 0 与「未知」都走同一条
+    // 「必须 attach」的分支（decideOpen 里 null 也按保守处理）。
+    const attached = sessionExists ? await this.tmux.attachedClients(session) : 0;
+
+    const candidate = this.candidatePanel(session, entry.name);
+    const action = decideOpen(
+      { exists: sessionExists, attached },
+      {
+        present: candidate !== undefined,
+        idle: candidate !== undefined && this.isIdlePanel(candidate),
+      },
+    );
+
+    // 已恢复：会话在、有人在看、面板也在手。show 一下就行，不重复 attach。
+    if (action === 'show' && candidate !== undefined) {
+      this.terminals.set(session, candidate);
+      candidate.show();
+      return;
+    }
 
     // 会话不存在时由扩展 detached 建出来，拿到确定的成功/失败信号。
     let runCommands = false;
-    if (!wasAlive) {
+    if (!sessionExists) {
       if (await this.tmux.newSession(session, cwd)) {
         runCommands = true;
       } else if (await this.tmux.hasSession(session)) {
@@ -96,15 +154,21 @@ export class TerminalManager {
     }
 
     // planRestore 仍是命令清单的唯一来源；runCommands 只能把它清空
-    const plan = planRestore(entry, wasAlive);
+    const plan = planRestore(entry, sessionExists);
     const commands = runCommands ? plan.commands : [];
 
+    // 复用只在 decideOpen 判定「已证明空闲」时才走到（action === 'reuse-attach'），
+    // 因此这里往里打字不会打断面板里可能跑着的进程。
     let terminal: vscode.Terminal;
-    try {
-      terminal = vscode.window.createTerminal({ name: entry.name, cwd });
-    } catch {
-      vscode.window.showWarningMessage(`目录不存在，已在主目录打开：${cwd}`);
-      terminal = vscode.window.createTerminal({ name: entry.name });
+    if (action === 'reuse-attach' && candidate !== undefined) {
+      terminal = candidate;
+    } else {
+      try {
+        terminal = vscode.window.createTerminal({ name: entry.name, cwd });
+      } catch {
+        vscode.window.showWarningMessage(`目录不存在，已在主目录打开：${cwd}`);
+        terminal = vscode.window.createTerminal({ name: entry.name });
+      }
     }
     this.terminals.set(session, terminal);
     terminal.show();

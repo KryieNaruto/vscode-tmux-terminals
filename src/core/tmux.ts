@@ -69,6 +69,21 @@ export function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * 解析 `#{session_attached}` 的输出。
+ *
+ * **空输出/非数字必须返回 null（未知），不能当成 0。** 与 isShellReady
+ * 同一个坑：`display-message` 的 pane 目标漏了冒号时 tmux 是
+ * **exit 0 + 空输出**，静默失败。把未知当成 0 会让「会话已附着」被误判为
+ * 「没人附着」；反过来当成 1 会让「其实没人附着」被漏判 —— 后者正是本次
+ * 要修的 bug（用户看到 claude 在后台跑着却看不见）。故未知单独成一个值，
+ * 由调用方按保守方向处理。
+ */
+export function parseAttachedCount(stdout: string): number | null {
+  const s = stdout.trim();
+  return /^\d+$/.test(s) ? Number(s) : null;
+}
+
 const LOGIN_SHELLS = new Set(['bash', 'zsh', 'sh', 'dash', 'fish', 'ksh', 'tcsh', 'csh']);
 
 /**

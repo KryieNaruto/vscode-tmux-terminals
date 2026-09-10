@@ -7,9 +7,10 @@ const run = promisify(execFile);
 const client = new TmuxClient('tmux');
 const A = 'tmuxterm-aaaa1111';
 const B = 'tmuxterm-aaaa1111bbbb'; // 用来验证 A 不会前缀匹配到 B
+const HELPER = 'tmuxterm-aaaahelp1'; // 借它的 pane 提供 pty，好让 tmux attach 跑起来
 
 async function cleanup() {
-  for (const n of [A, B]) {
+  for (const n of [A, B, HELPER]) {
     try { await run('tmux', ['kill-session', '-t', `=${n}`]); } catch { /* 不存在就算了 */ }
   }
 }
@@ -116,8 +117,36 @@ describe('TmuxClient（集成，需要本机有 tmux）', function () {
     assert.strictEqual(await client.hasSession(A), false);
     assert.strictEqual(await client.hasSession(B), true, '前缀相同的会话被误杀了');
   });
-
   it('killSession 对不存在的会话不抛错', async () => {
     await client.killSession('tmuxterm-cafebabe');
+  });
+
+  describe('attachedClients —— 「用户此刻看得见这个会话吗」的权威信号', () => {
+    it('detached 建出的会话附着数为 0', async () => {
+      await client.newSession(A, '/tmp');
+      assert.strictEqual(await client.attachedClients(A), 0);
+    });
+
+    it('有客户端附着时返回 >= 1', async () => {
+      await client.newSession(A, '/tmp');
+      assert.strictEqual(await client.attachedClients(A), 0);
+      // `tmux attach` 需要 pty；借另一个 tmux 会话的 pane 提供一个
+      // （`unset TMUX` 才允许嵌套）。杀 helper 即摘掉这个客户端。
+      await run('tmux', ['new-session', '-d', '-s', HELPER,
+        `unset TMUX; exec tmux attach -t =${A}`]);
+      await new Promise((r) => setTimeout(r, 900));
+      const n = await client.attachedClients(A);
+      assert.ok(n !== null && n >= 1, `附着数应 >= 1，实际 ${n}`);
+      await run('tmux', ['kill-session', '-t', `=${HELPER}`]);
+      await new Promise((r) => setTimeout(r, 300));
+      assert.strictEqual(await client.attachedClients(A), 0, '摘掉客户端后应回到 0');
+    });
+
+    it('关键：会话不存在时返回 null（未知），不能是 0', async () => {
+      // display-message 的 pane 目标漏冒号时 tmux 是 exit 0 + 空输出，
+      // 静默失败。把「读不到」与「没人附着」混为一谈会让调用方在两种
+      // 完全不同的处境下做同一个决定。
+      assert.strictEqual(await client.attachedClients('tmuxterm-cafebabe'), null);
+    });
   });
 });
