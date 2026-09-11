@@ -6,8 +6,16 @@ import { EntryTreeItem, EntryTreeProvider } from './tree';
 import { BatchTreeProvider } from './batchTree';
 import { readProfileConfig } from './claudeConfig';
 import { TerminalManager } from './terminalManager';
+import { ActivityTracker } from './activityTracker';
+import { sessionNameFor } from './core/tmux';
 
 let pollTimer: NodeJS.Timeout | undefined;
+let activityTimer: NodeJS.Timeout | undefined;
+
+/** 活动轮询节奏——比会话存活轮询（默认 10s，见 pollInterval 配置）快得多，
+ * 因为它驱动的是"运行中徽章闪烁"这种需要看起来鲜活的 UI 效果，不是配置项，
+ * 用户不需要也不应该去调它。 */
+const ACTIVITY_POLL_INTERVAL_MS = 900;
 
 export function activate(context: vscode.ExtensionContext): void {
   const cfg = () => vscode.workspace.getConfiguration('tmuxTerminals');
@@ -29,7 +37,10 @@ export function activate(context: vscode.ExtensionContext): void {
       `清单已按空列表继续，可从中手动恢复条目。`,
     );
   });
-  const provider = new EntryTreeProvider(store);
+  // TmuxClient 已经有 paneTitle(name) 方法，结构上满足 ActivityTracker
+  // 需要的最小接口，不需要额外适配。
+  const tracker = new ActivityTracker(tmux);
+  const provider = new EntryTreeProvider(store, tracker);
   const manager = new TerminalManager(store, tmux);
 
   const view = vscode.window.createTreeView('tmuxTerminals.list', {
@@ -84,16 +95,49 @@ export function activate(context: vscode.ExtensionContext): void {
     void poll();
   };
 
+  // ---- 活动状态轮询（运行中/刚完成的徽章与图标，见 activityTracker.ts）----
+  // 独立于上面的存活轮询：节奏快得多（900ms vs 默认 10s），且只在面板
+  // 可见时跑——这是纯视觉效果，不可见时没有意义轮询，白白多发 tmux 命令。
+  let activityInFlight = false;
+  const pollActivity = async () => {
+    if (activityInFlight) return;
+    activityInFlight = true;
+    try {
+      const entries = await store.load();
+      const aliveIds = entries
+        .filter((e) => provider.isAlive(sessionNameFor(e.id)))
+        .map((e) => e.id);
+      await tracker.poll(aliveIds);
+    } finally {
+      activityInFlight = false;
+    }
+  };
+
+  const restartActivityPolling = () => {
+    if (activityTimer) clearInterval(activityTimer);
+    activityTimer = undefined;
+    if (view.visible) {
+      activityTimer = setInterval(() => void pollActivity(), ACTIVITY_POLL_INTERVAL_MS);
+    }
+    void pollActivity();
+  };
+
   context.subscriptions.push(
-    view.onDidChangeVisibility(() => restartPolling()),
+    view.onDidChangeVisibility(() => {
+      restartPolling();
+      restartActivityPolling();
+    }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('tmuxTerminals')) restartPolling();
     }),
+    tracker.onDidChange(() => provider.refresh()),
     new vscode.Disposable(() => {
       if (pollTimer) clearInterval(pollTimer);
+      if (activityTimer) clearInterval(activityTimer);
     }),
   );
   restartPolling();
+  restartActivityPolling();
 
   // ---- 命令注册 ----
   const item = (arg: unknown): EntryTreeItem | undefined =>
@@ -104,7 +148,12 @@ export function activate(context: vscode.ExtensionContext): void {
 
   reg('tmuxTerminals.open', async (arg: unknown) => {
     const it = item(arg);
-    if (it) await manager.openEntry(it.entry);
+    if (it) {
+      // 先清"刚完成待查看"标记再真正打开：用户点开就是"看到了"，
+      // 图标应该立刻恢复，不用等下一轮 tmux 轮询。
+      tracker.markSeen(it.entry.id);
+      await manager.openEntry(it.entry);
+    }
   });
 
   reg('tmuxTerminals.add', async () => {
@@ -236,4 +285,5 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   if (pollTimer) clearInterval(pollTimer);
+  if (activityTimer) clearInterval(activityTimer);
 }

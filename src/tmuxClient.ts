@@ -126,6 +126,24 @@ export class TmuxClient {
   }
 
   /**
+   * 取 pane title —— claude 会把当前状态（运行中/空闲）和任务名编码进
+   * 这里（见 core/tmux.ts 的 isRunningTitle / taskNameFromTitle）。
+   *
+   * 目标同样必须走 paneTarget（带冒号），漏写时 tmux 静默返回空串，
+   * 解析函数对空串的处理已经是「判为空闲、无任务名」，方向安全。
+   */
+  async paneTitle(name: string): Promise<string> {
+    try {
+      const { stdout } = await run(this.tmuxPath, [
+        'display-message', '-p', '-t', paneTarget(name), '#{pane_title}',
+      ]);
+      return stdout.trim();
+    } catch {
+      return '';
+    }
+  }
+
+  /**
    * 抓取 pane **可视区域**的文本（不含 scrollback），只读。
    *
    * 刻意不带 `-S`：带了就会把历史滚屏也抓进来，而这些历史里可能正好有

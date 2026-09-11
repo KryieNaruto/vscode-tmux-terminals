@@ -9,6 +9,9 @@ import {
   escapeSessionName,
   parseAttachedCount,
   SESSION_PREFIX,
+  isRunningTitle,
+  taskNameFromTitle,
+  DEFAULT_TASK_TITLE,
 } from '../../src/core/tmux';
 
 describe('sessionNameFor / escapeSessionName', () => {
@@ -145,5 +148,46 @@ describe('parseAttachedCount', () => {
     assert.strictEqual(parseAttachedCount('1.5'), null);
     assert.strictEqual(parseAttachedCount('-1'), null);
     assert.strictEqual(parseAttachedCount('1 2'), null);
+  });
+});
+
+describe('isRunningTitle', () => {
+  it('Braille 指示符判为运行中', () => {
+    assert.strictEqual(isRunningTitle('⠐ VSCode 终端会话管理插件'), true);
+    assert.strictEqual(isRunningTitle('⠂ Claude Code'), true);
+  });
+  it('普通符号判为空闲', () => {
+    assert.strictEqual(isRunningTitle('✳ Claude Code'), false);
+    assert.strictEqual(isRunningTitle('✳ 继续 Krita MSVC 编译工程'), false);
+  });
+  it('容忍前导空白', () => {
+    assert.strictEqual(isRunningTitle('  ⠐ 任务'), true);
+  });
+  it('空串/纯空白判为空闲（关键：display-message 目标写错会静默返回空）', () => {
+    assert.strictEqual(isRunningTitle(''), false);
+    assert.strictEqual(isRunningTitle('   '), false);
+  });
+  it('只看首字符，字符串其余部分出现 Braille 字符不算', () => {
+    assert.strictEqual(isRunningTitle('✳ 含有 ⠐ 字符的任务名'), false);
+  });
+});
+
+describe('taskNameFromTitle', () => {
+  it('占位符「Claude Code」返回空串（无论运行中还是空闲）', () => {
+    assert.strictEqual(taskNameFromTitle('✳ Claude Code'), '');
+    assert.strictEqual(taskNameFromTitle('⠂ Claude Code'), '');
+    assert.strictEqual(taskNameFromTitle(`✳ ${DEFAULT_TASK_TITLE}`), '');
+  });
+  it('取出具体任务名', () => {
+    assert.strictEqual(taskNameFromTitle('✳ 继续 Krita MSVC 编译工程'), '继续 Krita MSVC 编译工程');
+    assert.strictEqual(taskNameFromTitle('⠐ VSCode 终端会话管理插件'), 'VSCode 终端会话管理插件');
+  });
+  it('空串返回空串', () => {
+    assert.strictEqual(taskNameFromTitle(''), '');
+    assert.strictEqual(taskNameFromTitle('   '), '');
+  });
+  it('只有指示符没有文字时返回空串', () => {
+    assert.strictEqual(taskNameFromTitle('✳'), '');
+    assert.strictEqual(taskNameFromTitle('✳ '), '');
   });
 });
