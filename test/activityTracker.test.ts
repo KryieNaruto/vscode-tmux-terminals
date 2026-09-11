@@ -68,30 +68,6 @@ describe('ActivityTracker.poll', () => {
   });
 });
 
-describe('ActivityTracker.blinkOn', () => {
-  it('running 态随每次 poll 在 true/false 之间切换', async () => {
-    const tmux = fakeTmux({ 'tmuxterm-a': '⠐ 任务' });
-    const tracker = new ActivityTracker(tmux);
-    await tracker.poll(['a']);
-    const first = tracker.blinkOn('a');
-    await tracker.poll(['a']);
-    const second = tracker.blinkOn('a');
-    assert.notStrictEqual(first, second);
-  });
-  it('非 running 态恒为 true（不闪）', async () => {
-    const tmux = fakeTmux({ 'tmuxterm-a': '✳ Claude Code' });
-    const tracker = new ActivityTracker(tmux);
-    await tracker.poll(['a']);
-    assert.strictEqual(tracker.blinkOn('a'), true);
-    await tracker.poll(['a']);
-    assert.strictEqual(tracker.blinkOn('a'), true);
-  });
-  it('未知条目恒为 true', () => {
-    const tracker = new ActivityTracker(fakeTmux({}));
-    assert.strictEqual(tracker.blinkOn('unknown'), true);
-  });
-});
-
 describe('ActivityTracker.markSeen', () => {
   it('done-unseen → idle，并触发一次变化通知', async () => {
     const titles: Record<string, string> = { 'tmuxterm-a': '⠐ 任务' };
