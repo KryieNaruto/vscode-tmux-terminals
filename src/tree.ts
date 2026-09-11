@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import { commandFor } from './core/command';
 import { EntryActivity } from './core/activity';
-import { shortLabels } from './core/labels';
+import { groupByCwd } from './core/grouping';
+import { reorderWithinGroup } from './core/reorder';
 import { sessionNameFor } from './core/tmux';
 import { TerminalEntry } from './core/types';
 
@@ -36,48 +37,48 @@ function activityLabel(activity: EntryActivity | undefined): string {
 }
 
 /**
- * 清单里的一行。
+ * 一级节点：按 cwd 精确分组的「文件夹」。
  *
- * `contextValue` 决定右键菜单显隐：`killSession` 只在存活时出现，
- * 见 package.json 里 `viewItem == aliveSession` 的 when 条件。
+ * `id` 用 cwd 派生（而不是数组下标），保证增删其他文件夹的条目时，
+ * VS Code 记住的展开/折叠状态不会因为下标漂移而错位。
+ */
+export class FolderTreeItem extends vscode.TreeItem {
+  constructor(
+    public readonly cwd: string,
+    public readonly entries: TerminalEntry[],
+  ) {
+    super(cwd, vscode.TreeItemCollapsibleState.Expanded);
+    this.id = `folder:${cwd}`;
+    this.contextValue = 'folder';
+    this.iconPath = new vscode.ThemeIcon('folder');
+  }
+}
+
+/**
+ * 二级节点：一个终端条目。
  *
- * 存活与否用**图标形状**表示，profile 用**颜色**表示 —— 两个维度互不覆盖。
- * 运行状态（activity）在此基础上**临时覆盖**图标：运行中换成原生转圈动画
- * （`loading~spin`，颜色仍用 profile 色，不丢失 profile 信息）；刚运行完
- * 且未查看时图标变实心绿点，直到用户点开该条目（ActivityTracker.markSeen）
- * 才恢复成 profile 色。
- *
- * 任务名徽章：activity.taskName 非空时拼在名称后面，用
- * `TreeItemLabel.highlights` 渲染成一个带背景色的小块（VS Code 没有开放
- * 任意自定义背景色的徽章控件，高亮色由主题决定，这是能拿到的最接近效果）。
- * blinkOn 为 false 时不给 highlights 区间，靠外部轮询在 true/false 间来回
- * 切换制造闪烁——只有 running 态才会被这样驱动，其余状态 blinkOn 恒为
- * true（徽章常驻显示，不闪）。
+ * 图标只体现「存活/死亡 + profile 颜色」，不再体现运行状态——运行状态的
+ * 转圈/绿点图标现在挂在三级的 `TaskTreeItem` 上。有任务名时
+ * `collapsibleState = Expanded`，可以展开看到那一级；没有任务名时
+ * `None`，不产生一个空的可展开箭头。
  */
 export class EntryTreeItem extends vscode.TreeItem {
   constructor(
     public readonly entry: TerminalEntry,
     public readonly alive: boolean,
-    /** 由 shortLabels() 算好的短路径，冲突时带父目录 */
-    public readonly shortPath: string,
     /** 由 ActivityTracker 轮询得来的当前活动状态；未轮询到时为 undefined */
     public readonly activity: EntryActivity | undefined,
-    /** 徽章此刻该不该显示为「亮」的一相；只有 running 态下才会真的来回切换 */
-    blinkOn: boolean,
   ) {
     const taskName = activity?.taskName ?? '';
-    const label: string | vscode.TreeItemLabel = taskName.length > 0
-      ? {
-          label: `${entry.name}  ${taskName}`,
-          highlights: blinkOn
-            ? [[entry.name.length + 2, entry.name.length + 2 + taskName.length]]
-            : [],
-        }
-      : entry.name;
-    super(label, vscode.TreeItemCollapsibleState.None);
+    super(
+      entry.name,
+      taskName.length > 0
+        ? vscode.TreeItemCollapsibleState.Expanded
+        : vscode.TreeItemCollapsibleState.None,
+    );
     this.id = entry.id;
     this.contextValue = alive ? 'aliveSession' : 'deadSession';
-    this.description = alive ? shortPath : `${shortPath}（无会话）`;
+    this.description = alive ? undefined : '（无会话）';
     this.tooltip = new vscode.MarkdownString(
       [
         `**${entry.name}**`,
@@ -92,11 +93,38 @@ export class EntryTreeItem extends vscode.TreeItem {
         `- 参与全部恢复：${entry.autoRestore ? '是' : '否'}`,
       ].join('\n'),
     );
-    this.iconPath = !alive
-      ? new vscode.ThemeIcon('circle-outline', profileColor(entry))
-      : activity?.state === 'running'
+    this.iconPath = alive
+      ? new vscode.ThemeIcon('circle-filled', profileColor(entry))
+      : new vscode.ThemeIcon('circle-outline', profileColor(entry));
+    this.command = {
+      command: 'tmuxTerminals.open',
+      title: '打开终端',
+      arguments: [this],
+    };
+  }
+}
+
+/**
+ * 三级节点：任务名。只在 `activity.taskName` 非空时才会被创建
+ * （由 `EntryTreeProvider.getChildren` 保证，见下）。
+ *
+ * 图标按活动状态三态：running → 原生转圈动画；done-unseen → 实心绿点
+ * （直到用户点开该节点，见 ActivityTracker.markSeen）；idle → 实心
+ * profile 色点（有任务名但当前空闲是正常状态，见 core/activity.ts 的
+ * 说明——taskName 不随 state 变化而清空）。
+ */
+export class TaskTreeItem extends vscode.TreeItem {
+  constructor(
+    public readonly entry: TerminalEntry,
+    public readonly activity: EntryActivity,
+  ) {
+    super(activity.taskName, vscode.TreeItemCollapsibleState.None);
+    this.id = `task:${entry.id}`;
+    this.contextValue = 'task';
+    this.iconPath =
+      activity.state === 'running'
         ? new vscode.ThemeIcon('loading~spin', profileColor(entry))
-        : activity?.state === 'done-unseen'
+        : activity.state === 'done-unseen'
           ? new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.green'))
           : new vscode.ThemeIcon('circle-filled', profileColor(entry));
     this.command = {
@@ -117,7 +145,7 @@ export class EmptyTreeItem extends vscode.TreeItem {
   }
 }
 
-export type TreeNode = EntryTreeItem | EmptyTreeItem;
+export type TreeNode = FolderTreeItem | EntryTreeItem | TaskTreeItem | EmptyTreeItem;
 
 export class EntryTreeProvider
   implements vscode.TreeDataProvider<TreeNode>, vscode.TreeDragAndDropController<TreeNode>
@@ -137,12 +165,11 @@ export class EntryTreeProvider
      * 活动状态的只读查询接口，由 extension.ts 传入真正的 ActivityTracker。
      * 用最小接口而不是具体类型，让 tree.ts 不必知道 ActivityTracker 的
      * 轮询细节（与上面 store 参数同样的处理方式）。省略时所有条目的
-     * activity 都是 undefined（不挂徽章，图标退回默认逻辑），不影响
-     * 既有调用方（比如批量面板用的是另一个 Provider，不受影响）。
+     * activity 都是 undefined（不生成三级节点，二级图标退回默认逻辑），
+     * 不影响既有调用方（比如批量面板用的是另一个 Provider，不受影响）。
      */
     private readonly activity?: {
       activityFor(entryId: string): EntryActivity | undefined;
-      blinkOn(entryId: string): boolean;
     },
   ) {}
 
@@ -166,19 +193,29 @@ export class EntryTreeProvider
   }
 
   async getChildren(element?: TreeNode): Promise<TreeNode[]> {
-    if (element) return [];
-    this.entries = await this.store.load();
-    if (this.entries.length === 0) return [new EmptyTreeItem()];
-    const labels = shortLabels(this.entries.map((e) => e.cwd));
-    return this.entries.map(
-      (e, i) => new EntryTreeItem(
-        e,
-        this.alive.has(sessionNameFor(e.id)),
-        labels[i],
-        this.activity?.activityFor(e.id),
-        this.activity?.blinkOn(e.id) ?? true,
-      ),
-    );
+    if (element === undefined) {
+      this.entries = await this.store.load();
+      if (this.entries.length === 0) return [new EmptyTreeItem()];
+      return groupByCwd(this.entries).map(
+        ([cwd, group]) => new FolderTreeItem(cwd, group),
+      );
+    }
+    if (element instanceof FolderTreeItem) {
+      return element.entries.map(
+        (e) => new EntryTreeItem(
+          e,
+          this.alive.has(sessionNameFor(e.id)),
+          this.activity?.activityFor(e.id),
+        ),
+      );
+    }
+    if (element instanceof EntryTreeItem) {
+      const activity = this.activity?.activityFor(element.entry.id);
+      return activity !== undefined && activity.taskName.length > 0
+        ? [new TaskTreeItem(element.entry, activity)]
+        : [];
+    }
+    return [];
   }
 
   getTreeItem(element: TreeNode): vscode.TreeItem {
@@ -186,7 +223,9 @@ export class EntryTreeProvider
   }
 
   // ---- 拖拽排序 ----
-  // 拖拽是独立 API，不是 TreeItem 自带的能力。
+  // 拖拽是独立 API，不是 TreeItem 自带的能力。三级树引入后，拖拽范围收窄到
+  // 「同一文件夹（同 cwd）内」——跨文件夹拖拽整体是 no-op，不产生任何
+  // 中间态；见 docs/superpowers/specs/2026-09-10-tree-hierarchy-design.md §5。
   readonly dragMimeTypes = ['application/vnd.code.tree.tmuxterminals.list'];
   readonly dropMimeTypes = ['application/vnd.code.tree.tmuxterminals.list'];
 
@@ -195,18 +234,21 @@ export class EntryTreeProvider
     data: vscode.DataTransfer,
     _token: vscode.CancellationToken,
   ): Promise<void> {
-    const ids = source
-      .filter((n): n is EntryTreeItem => n instanceof EntryTreeItem)
-      .map((n) => n.entry.id);
-    data.set(this.dragMimeTypes[0], new vscode.DataTransferItem(ids));
+    const items = source.filter((n): n is EntryTreeItem => n instanceof EntryTreeItem);
+    if (items.length === 0) return;
+    const cwd = items[0].entry.cwd;
+    // 多选跨文件夹：整体不产生 drag data，而不是只取同 cwd 的子集——
+    // 后者会让用户以为「拖了 3 个，其实只挪了 1 个」，比完全不动更容易踩坑。
+    if (!items.every((n) => n.entry.cwd === cwd)) return;
+    data.set(this.dragMimeTypes[0], new vscode.DataTransferItem(items.map((n) => n.entry.id)));
   }
 
   /**
-   * 落点语义：拖到目标行 = **插到该行之前**。
+   * 落点语义：拖到目标行 = **插到该行之前**（沿用重构前的约定）。
    *
-   * 不用「上/下半区分别表示前/后」：那需要落点位置信息，而 handleDrop 在
-   * 部分场景并不提供，语义会随 VS Code 版本漂移。统一为「之前」后，拖到
-   * 列表末尾即可实现「放到最后」。
+   * 落点必须与拖拽源同属一个 cwd，否则整体 no-op：落在别的文件夹的条目
+   * 或文件夹节点本身上 → 不动；落在空白处（`target === undefined`）→
+   * 按「落到自己文件夹末尾」处理。
    *
    * 只改本地顺序，**绝不触发任何 tmux 操作**。
    */
@@ -220,21 +262,27 @@ export class EntryTreeProvider
     const draggedIds = item.value as string[];
     if (!Array.isArray(draggedIds) || draggedIds.length === 0) return;
 
-    // 拖到自身（或所选集合内任一条）上是 no-op。被拖的 id 会先从 ids 里
-    // 滤掉，于是 indexOf 目标返回 -1，若不拦就会落到「追加到末尾」——
-    // 把条目无端挪到队尾（模拟：[a,b,c,d] 把 a 拖到 a 会变成 [b,c,d,a]）。
+    const all = await this.store.load();
+    const draggedCwd = all.find((e) => e.id === draggedIds[0])?.cwd;
+    if (draggedCwd === undefined) return;
+
+    const targetCwd =
+      target instanceof EntryTreeItem
+        ? target.entry.cwd
+        : target instanceof FolderTreeItem
+          ? target.cwd
+          : undefined;
+    if (targetCwd !== undefined && targetCwd !== draggedCwd) return;
+
+    // 拖到自身（或所选集合内任一条）上是 no-op，逻辑与重构前一致。
     const targetId = target instanceof EntryTreeItem ? target.entry.id : undefined;
     if (targetId !== undefined && draggedIds.includes(targetId)) return;
 
-    const all = await this.store.load();
-    const ids = all.map((e) => e.id).filter((id) => !draggedIds.includes(id));
+    const allIds = all.map((e) => e.id);
+    const groupIds = all.filter((e) => e.cwd === draggedCwd).map((e) => e.id);
+    const newIds = reorderWithinGroup(allIds, groupIds, draggedIds, targetId);
 
-    // 目标未定义 = 拖到空白处 → 追加到末尾
-    const at = targetId === undefined ? ids.length : ids.indexOf(targetId);
-    const insertAt = at === -1 ? ids.length : at;
-
-    ids.splice(insertAt, 0, ...draggedIds);
-    await this.store.reorder(ids); // 内部经 enqueue 串行化，防并发丢更新
+    await this.store.reorder(newIds); // 内部经 enqueue 串行化，防并发丢更新
     this.emitter.fire();
   }
 }
