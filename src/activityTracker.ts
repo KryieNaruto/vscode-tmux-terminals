@@ -8,8 +8,7 @@ export interface PaneTitleReader {
 
 /**
  * 轮询一批「存活条目」的 tmux pane title，推进每个条目的活动状态机
- * （见 core/activity.ts），并维护一个全局「闪烁相位」用于驱动运行中
- * 条目的徽章闪烁。
+ * （见 core/activity.ts）。
  *
  * 刻意不依赖 vscode：只依赖一个「读 pane title」的最小接口（结构类型，
  * TmuxClient 天然满足），方便直接用 mocha 单测。
@@ -17,7 +16,6 @@ export interface PaneTitleReader {
 export class ActivityTracker {
   private listeners: Array<() => void> = [];
   private state = new Map<string, EntryActivity>();
-  private phaseOn = true;
 
   constructor(private readonly tmux: PaneTitleReader) {}
 
@@ -39,14 +37,6 @@ export class ActivityTracker {
     return this.state.get(entryId);
   }
 
-  /**
-   * 徽章此刻该不该显示为「亮」的那一相。只有 running 态才会真的闪烁；
-   * 其余状态（含未知条目）恒为 true——常驻显示，不闪。
-   */
-  blinkOn(entryId: string): boolean {
-    return this.state.get(entryId)?.state === 'running' ? this.phaseOn : true;
-  }
-
   /** 用户点开条目查看：done-unseen → idle。状态确实变了才触发一次通知。 */
   markSeen(entryId: string): void {
     const cur = this.state.get(entryId);
@@ -66,12 +56,10 @@ export class ActivityTracker {
    * 再出现按「首次观测」处理，不会凭空冒出一次「刚运行完」
    * （见 core/activity.ts 顶部注释里的不变量）。
    *
-   * 无论有没有存活条目，每次调用结束都触发一次变化通知——闪烁相位
-   * 已经翻转，即便状态本身没变，也需要让订阅方（UI 刷新）知道。
+   * 无论有没有存活条目，每次调用结束都触发一次变化通知，让订阅方
+   * （UI 刷新）能看到状态表里的最新结果。
    */
   async poll(aliveEntryIds: readonly string[]): Promise<void> {
-    this.phaseOn = !this.phaseOn;
-
     const aliveSet = new Set(aliveEntryIds);
     for (const id of [...this.state.keys()]) {
       if (!aliveSet.has(id)) this.state.delete(id);

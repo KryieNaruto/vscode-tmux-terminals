@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { EntryStore } from './core/store';
 import { TmuxClient } from './tmuxClient';
-import { EntryTreeItem, EntryTreeProvider } from './tree';
+import { EntryTreeItem, EntryTreeProvider, TaskTreeItem } from './tree';
 import { BatchTreeProvider } from './batchTree';
 import { readProfileConfig } from './claudeConfig';
 import { TerminalManager } from './terminalManager';
@@ -140,8 +140,8 @@ export function activate(context: vscode.ExtensionContext): void {
   restartActivityPolling();
 
   // ---- 命令注册 ----
-  const item = (arg: unknown): EntryTreeItem | undefined =>
-    arg instanceof EntryTreeItem ? arg : undefined;
+  const item = (arg: unknown): EntryTreeItem | TaskTreeItem | undefined =>
+    arg instanceof EntryTreeItem || arg instanceof TaskTreeItem ? arg : undefined;
 
   const reg = (id: string, fn: (...a: any[]) => any) =>
     context.subscriptions.push(vscode.commands.registerCommand(id, fn));
