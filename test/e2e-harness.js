@@ -47,7 +47,10 @@ let modalAnswer;
 let quickPickAnswer;
 
 class TreeItem {
-  constructor(label) { this.label = label; }
+  constructor(label, collapsibleState) {
+    this.label = label;
+    this.collapsibleState = collapsibleState;
+  }
 }
 class EventEmitter {
   constructor() {
@@ -60,6 +63,14 @@ class EventEmitter {
 class ThemeIcon { constructor(id, color) { this.id = id; this.color = color; } }
 class ThemeColor { constructor(id) { this.id = id; } }
 class MarkdownString { constructor(v) { this.value = v; } }
+class DataTransferItem {
+  constructor(value) { this.value = value; }
+}
+class DataTransfer {
+  constructor() { this.map = new Map(); }
+  set(mime, item) { this.map.set(mime, item); }
+  get(mime) { return this.map.get(mime); }
+}
 
 // shell integration 的「有命令开始/结束」事件。真实 VS Code（1.93+，本机
 // 已开启 shell integration）靠它回答「某个面板里在跑什么」——这是
@@ -74,6 +85,8 @@ const vscodeStub = {
   ThemeIcon,
   ThemeColor,
   MarkdownString,
+  DataTransfer,
+  DataTransferItem,
   window: {
     // openEntry 的候选面板守卫会读 window.terminals。它是可变数组：
     // 某一节可往里塞「陈旧面板」再清空（见第 11 节）。默认空。
@@ -1076,6 +1089,90 @@ async function projectSnapshot() {
       '把命令发进了别人的会话！' + JSON.stringify(calls.literals));
     chk('提示了「刚被其他窗口创建」',
       calls.messages.some((m) => String(m).includes('其他窗口')), JSON.stringify(calls.messages));
+  }
+
+  console.log('\n=== 18. 三级树：getChildren 分层与拖拽范围收窄到同文件夹 ===');
+  {
+    const { EntryTreeProvider, FolderTreeItem, EntryTreeItem, TaskTreeItem } =
+      require(path.join(ROOT, 'out/src/tree.js'));
+
+    // 独立的一套假 store/activity，不复用外层那个巨大的 TerminalManager
+    // 用例夹具——那份数据是为别的场景准备的，cwd 分布对本节没有意义。
+    const treeStore = {
+      entries: [
+        mk('t-a1', 'A1', '/proj/a'),
+        mk('t-a2', 'A2', '/proj/a'),
+        mk('t-b1', 'B1', '/proj/b'),
+      ],
+      async load() { return this.entries.map((e) => ({ ...e })); },
+      reorderCalls: [],
+      async reorder(ids) { this.reorderCalls.push(ids); },
+    };
+    const activityByEntry = {
+      't-a1': { state: 'running', taskName: '编译' },
+      // t-a2、t-b1 没有 activity（undefined）——不应该生出三级节点
+    };
+    const treeActivity = {
+      activityFor(id) { return activityByEntry[id]; },
+    };
+    const provider = new EntryTreeProvider(treeStore, treeActivity);
+
+    // ---- 一级：按 cwd 分两个文件夹 ----
+    const folders = await provider.getChildren(undefined);
+    chk('一级节点数 = 2（按 cwd 精确分组）', folders.length === 2,
+      JSON.stringify(folders.map((f) => f.cwd)));
+    const folderA = folders.find((f) => f.cwd === '/proj/a');
+    const folderB = folders.find((f) => f.cwd === '/proj/b');
+    chk('文件夹 A 下有 2 条', !!folderA && folderA.entries.length === 2);
+    chk('文件夹 B 下有 1 条', !!folderB && folderB.entries.length === 1);
+
+    // ---- 二级：展开文件夹 A 拿到条目 ----
+    const entriesInA = await provider.getChildren(folderA);
+    chk('二级节点都是 EntryTreeItem', entriesInA.every((n) => n instanceof EntryTreeItem));
+    const a1Node = entriesInA.find((n) => n.entry.id === 't-a1');
+    const a2Node = entriesInA.find((n) => n.entry.id === 't-a2');
+    chk('有任务名的条目 collapsibleState = Expanded (2)', a1Node.collapsibleState === 2,
+      String(a1Node.collapsibleState));
+    chk('没有任务名的条目 collapsibleState = None (0)', a2Node.collapsibleState === 0,
+      String(a2Node.collapsibleState));
+
+    // ---- 三级：只有 a1 应该展开出任务名节点 ----
+    const a1Children = await provider.getChildren(a1Node);
+    chk('有任务名的条目展开出 1 个 TaskTreeItem', a1Children.length === 1 &&
+      a1Children[0] instanceof TaskTreeItem);
+    chk('TaskTreeItem 标签就是 taskName', a1Children[0].label === '编译');
+    const a2Children = await provider.getChildren(a2Node);
+    chk('★ 没有任务名的条目绝不生成三级节点', a2Children.length === 0,
+      JSON.stringify(a2Children));
+
+    // ---- 拖拽：同文件夹内允许，跨文件夹整体 no-op ----
+    const dragSame = new DataTransfer();
+    await provider.handleDrag([a2Node], dragSame);
+    await provider.handleDrop(a1Node, dragSame);
+    chk('同文件夹内拖拽：store.reorder 被调用了一次',
+      treeStore.reorderCalls.length === 1, JSON.stringify(treeStore.reorderCalls));
+    chk('同文件夹内拖拽：a2 被插到了 a1 前面',
+      treeStore.reorderCalls[0].indexOf('t-a2') < treeStore.reorderCalls[0].indexOf('t-a1'),
+      JSON.stringify(treeStore.reorderCalls[0]));
+    chk('组外 id（t-b1）相对顺序未变',
+      treeStore.reorderCalls[0].indexOf('t-b1') === 2, JSON.stringify(treeStore.reorderCalls[0]));
+
+    treeStore.reorderCalls.length = 0;
+    const entriesInB = await provider.getChildren(folderB);
+    const b1Node = entriesInB[0];
+    const dragCross = new DataTransfer();
+    await provider.handleDrag([a1Node], dragCross);
+    await provider.handleDrop(b1Node, dragCross); // 跨文件夹：a1(/proj/a) 拖到 b1(/proj/b) 上
+    chk('★ 跨文件夹拖拽是纯 no-op：store.reorder 完全没被调用',
+      treeStore.reorderCalls.length === 0, JSON.stringify(treeStore.reorderCalls));
+
+    // 拖到文件夹节点本身（而不是某个条目）：同文件夹允许
+    treeStore.reorderCalls.length = 0;
+    const dragToFolder = new DataTransfer();
+    await provider.handleDrag([a2Node], dragToFolder);
+    await provider.handleDrop(folderA, dragToFolder);
+    chk('拖到同文件夹的文件夹节点本身：允许（落到该文件夹末尾）',
+      treeStore.reorderCalls.length === 1, JSON.stringify(treeStore.reorderCalls));
   }
 
   console.log('\n=== 15. 清理 + 用户环境未被触碰 ===');
