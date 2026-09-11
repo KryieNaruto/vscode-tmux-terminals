@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { commandFor } from './core/command';
+import { EntryActivity } from './core/activity';
 import { shortLabels } from './core/labels';
 import { sessionNameFor } from './core/tmux';
 import { TerminalEntry } from './core/types';
@@ -26,6 +27,14 @@ function conversationLabel(entry: TerminalEntry): string {
   return `\`${id.slice(0, 8)}…\`（启动时接回这条）`;
 }
 
+/** activity 状态对应的中文描述，用于 tooltip。 */
+function activityLabel(activity: EntryActivity | undefined): string {
+  if (activity === undefined) return '（未知，尚未轮询到）';
+  if (activity.state === 'running') return '🔵 运行中';
+  if (activity.state === 'done-unseen') return '🟢 刚完成，等待查看';
+  return '⚪ 空闲';
+}
+
 /**
  * 清单里的一行。
  *
@@ -33,6 +42,17 @@ function conversationLabel(entry: TerminalEntry): string {
  * 见 package.json 里 `viewItem == aliveSession` 的 when 条件。
  *
  * 存活与否用**图标形状**表示，profile 用**颜色**表示 —— 两个维度互不覆盖。
+ * 运行状态（activity）在此基础上**临时覆盖**图标：运行中换成原生转圈动画
+ * （`loading~spin`，颜色仍用 profile 色，不丢失 profile 信息）；刚运行完
+ * 且未查看时图标变实心绿点，直到用户点开该条目（ActivityTracker.markSeen）
+ * 才恢复成 profile 色。
+ *
+ * 任务名徽章：activity.taskName 非空时拼在名称后面，用
+ * `TreeItemLabel.highlights` 渲染成一个带背景色的小块（VS Code 没有开放
+ * 任意自定义背景色的徽章控件，高亮色由主题决定，这是能拿到的最接近效果）。
+ * blinkOn 为 false 时不给 highlights 区间，靠外部轮询在 true/false 间来回
+ * 切换制造闪烁——只有 running 态才会被这样驱动，其余状态 blinkOn 恒为
+ * true（徽章常驻显示，不闪）。
  */
 export class EntryTreeItem extends vscode.TreeItem {
   constructor(
@@ -40,8 +60,21 @@ export class EntryTreeItem extends vscode.TreeItem {
     public readonly alive: boolean,
     /** 由 shortLabels() 算好的短路径，冲突时带父目录 */
     public readonly shortPath: string,
+    /** 由 ActivityTracker 轮询得来的当前活动状态；未轮询到时为 undefined */
+    public readonly activity: EntryActivity | undefined,
+    /** 徽章此刻该不该显示为「亮」的一相；只有 running 态下才会真的来回切换 */
+    blinkOn: boolean,
   ) {
-    super(entry.name, vscode.TreeItemCollapsibleState.None);
+    const taskName = activity?.taskName ?? '';
+    const label: string | vscode.TreeItemLabel = taskName.length > 0
+      ? {
+          label: `${entry.name}  ${taskName}`,
+          highlights: blinkOn
+            ? [[entry.name.length + 2, entry.name.length + 2 + taskName.length]]
+            : [],
+        }
+      : entry.name;
+    super(label, vscode.TreeItemCollapsibleState.None);
     this.id = entry.id;
     this.contextValue = alive ? 'aliveSession' : 'deadSession';
     this.description = alive ? shortPath : `${shortPath}（无会话）`;
@@ -55,13 +88,17 @@ export class EntryTreeItem extends vscode.TreeItem {
         `- 基础命令：\`${commandFor(entry)}\``,
         `- 对话：${conversationLabel(entry)}`,
         `- 状态：${alive ? '🟢 会话存活，点击接回原进程' : '⚪ 无会话，点击重建并接回该对话'}`,
+        `- 任务：${taskName.length > 0 ? taskName : '（无）'} · ${activityLabel(activity)}`,
         `- 参与全部恢复：${entry.autoRestore ? '是' : '否'}`,
       ].join('\n'),
     );
-    this.iconPath = new vscode.ThemeIcon(
-      alive ? 'circle-filled' : 'circle-outline',
-      profileColor(entry),
-    );
+    this.iconPath = !alive
+      ? new vscode.ThemeIcon('circle-outline', profileColor(entry))
+      : activity?.state === 'running'
+        ? new vscode.ThemeIcon('loading~spin', profileColor(entry))
+        : activity?.state === 'done-unseen'
+          ? new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.green'))
+          : new vscode.ThemeIcon('circle-filled', profileColor(entry));
     this.command = {
       command: 'tmuxTerminals.open',
       title: '打开终端',
@@ -96,6 +133,17 @@ export class EntryTreeProvider
       load(): Promise<TerminalEntry[]>;
       reorder(ids: string[]): Promise<void>;
     },
+    /**
+     * 活动状态的只读查询接口，由 extension.ts 传入真正的 ActivityTracker。
+     * 用最小接口而不是具体类型，让 tree.ts 不必知道 ActivityTracker 的
+     * 轮询细节（与上面 store 参数同样的处理方式）。省略时所有条目的
+     * activity 都是 undefined（不挂徽章，图标退回默认逻辑），不影响
+     * 既有调用方（比如批量面板用的是另一个 Provider，不受影响）。
+     */
+    private readonly activity?: {
+      activityFor(entryId: string): EntryActivity | undefined;
+      blinkOn(entryId: string): boolean;
+    },
   ) {}
 
   refresh(): void {
@@ -123,7 +171,13 @@ export class EntryTreeProvider
     if (this.entries.length === 0) return [new EmptyTreeItem()];
     const labels = shortLabels(this.entries.map((e) => e.cwd));
     return this.entries.map(
-      (e, i) => new EntryTreeItem(e, this.alive.has(sessionNameFor(e.id)), labels[i]),
+      (e, i) => new EntryTreeItem(
+        e,
+        this.alive.has(sessionNameFor(e.id)),
+        labels[i],
+        this.activity?.activityFor(e.id),
+        this.activity?.blinkOn(e.id) ?? true,
+      ),
     );
   }
 

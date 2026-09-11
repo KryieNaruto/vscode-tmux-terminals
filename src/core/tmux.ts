@@ -99,3 +99,36 @@ export function isShellReady(currentCommand: string): boolean {
   const base = cmd.split('/').pop() ?? cmd;
   return LOGIN_SHELLS.has(base.replace(/^-/, ''));
 }
+
+/** claude 还没给对话起具体任务名时的占位符 —— 视为「没有任务名」，调用方不应据此显示徽章。 */
+export const DEFAULT_TASK_TITLE = 'Claude Code';
+
+/**
+ * pane title 前导字符是否是 claude 用来表示「正在运行」的旋转指示符。
+ *
+ * 实测：claude 把 pane title 设成 `<指示符> <文字>`。运行中前导字符在
+ * Braille 点阵字符（U+2800–U+28FF）之间轮转（实测抓到 ⠐/⠂ 约每 1.5s
+ * 切换一次）；空闲时固定为 ✳ 之类的普通符号，不在这个 Unicode 分区。
+ * 只认分区、不锁定具体字符，避免字符集变化就失效。
+ */
+export function isRunningTitle(title: string): boolean {
+  const trimmed = title.trim();
+  if (trimmed.length === 0) return false;
+  const code = trimmed.codePointAt(0);
+  return code !== undefined && code >= 0x2800 && code <= 0x28ff;
+}
+
+/**
+ * 从 pane title 里取任务名（去掉前导指示符及其后的空白）。
+ *
+ * 占位符 DEFAULT_TASK_TITLE（还没起具体任务名）与空串一律返回空串——
+ * 调用方据此判断「没有任务名可显示」，不挂徽章。绝不把占位符原样
+ * 当作任务名显示出去，那对用户没有任何信息量。
+ */
+export function taskNameFromTitle(title: string): string {
+  const trimmed = title.trim();
+  if (trimmed.length === 0) return '';
+  const chars = [...trimmed];
+  const rest = chars.slice(1).join('').trimStart();
+  return rest === DEFAULT_TASK_TITLE ? '' : rest;
+}
