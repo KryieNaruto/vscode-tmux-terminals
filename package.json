@@ -2,7 +2,7 @@
   "name": "vscode-tmux-terminals",
   "displayName": "Tmux Terminals",
   "description": "一键恢复 Remote-SSH 断开后的终端工作区",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "KryieNaruto",
   "license": "MIT",
   "repository": {
