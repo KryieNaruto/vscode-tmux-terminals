@@ -247,10 +247,12 @@ private readonly activity?: {
 4. **`FolderTreeItem`/`TaskTreeItem` 的 `id` 必须是确定性的纯函数**
    （`folder:${cwd}` / `task:${entry.id}`），不能用数组下标之类会因增删条目
    而漂移的东西——否则用户展开状态会在无关操作后被 VS Code 错误保留/丢失。
-5. `markSeen` 的触发点从"点击 `EntryTreeItem`"迁移到"点击 `TaskTreeItem`"后，
-   点击 `EntryTreeItem` 本身（没有任务名子节点、或用户没展开就直接点了
-   二级行）**仍然要能打开终端**，只是不需要 `markSeen`（没有 done-unseen
-   状态可清，因为二级图标已经不带这个状态了）。
+5. `markSeen` **不区分点击的是二级（`EntryTreeItem`）还是三级
+   （`TaskTreeItem`）**——`extension.ts` 的 `tmuxTerminals.open` 处理函数
+   对两者一视同仁地调用 `tracker.markSeen(it.entry.id)`，与 v0.1.3 完全
+   一致（本节曾考虑过"只在点三级时才清"，但重新推敲后放弃：打开终端这个
+   动作本身就是"看到了"，用户没展开到三级也不代表没看——不应该让状态
+   停留在 done-unseen 直到用户恰好点中那一行子节点）。
 
 ## 9. 测试计划
 
