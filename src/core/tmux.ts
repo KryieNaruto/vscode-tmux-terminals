@@ -70,6 +70,17 @@ export function shellQuote(s: string): string {
 }
 
 /**
+ * `display-message` 数值输出的公共解析：整串必须是纯十进制数字。
+ *
+ * 不导出 —— 各调用方（parseAttachedCount / parsePid）语义不同、JSDoc 与
+ * 契约各自独立，仅解析形状一致，故只共享这一层实现。
+ */
+function parseNumericOrNull(stdout: string): number | null {
+  const s = stdout.trim();
+  return /^\d+$/.test(s) ? Number(s) : null;
+}
+
+/**
  * 解析 `#{session_attached}` 的输出。
  *
  * **空输出/非数字必须返回 null（未知），不能当成 0。** 与 isShellReady
@@ -80,8 +91,7 @@ export function shellQuote(s: string): string {
  * 由调用方按保守方向处理。
  */
 export function parseAttachedCount(stdout: string): number | null {
-  const s = stdout.trim();
-  return /^\d+$/.test(s) ? Number(s) : null;
+  return parseNumericOrNull(stdout);
 }
 
 /**
@@ -92,8 +102,7 @@ export function parseAttachedCount(stdout: string): number | null {
  * 「未知」单独成一个值，由调用方按保守方向处理；绝不能当成 0 或某个 pid。
  */
 export function parsePid(stdout: string): number | null {
-  const s = stdout.trim();
-  return /^\d+$/.test(s) ? Number(s) : null;
+  return parseNumericOrNull(stdout);
 }
 
 const LOGIN_SHELLS = new Set(['bash', 'zsh', 'sh', 'dash', 'fish', 'ksh', 'tcsh', 'csh']);
@@ -134,10 +143,12 @@ export function isRunningTitle(title: string): boolean {
  * 从 pane title 里取任务名。
  *
  * claude 把 title 设成 `<指示符> <文字>`（指示符见 isRunningTitle），此时剥掉
- * 指示符。但**首码点是字母/数字时绝不能剥** —— 那是 shell 自己设的标题
- * （claude 退出后 bash 会把 title 设成 `user@host:cwd`），原实现无条件
- * `chars.slice(1)` 把它削成了 `iansenwei@H:~/workspace`；连 `bash` 都会被
- * 削成 `ash`（实测）。
+ * 指示符。**判据除了「首码点不是字母/数字」，还要求它后面跟空白（或本身就是
+ * 串尾）** —— 否则任何标点开头的标题都会掉一个字符：`-bash` → `bash`、
+ * `~/proj` → `/proj`、`/home/user` → `home/user`（与「首码点是字母」是同一类
+ * bug，只是更窄）。shell 自己设的标题（claude 退出后 bash 会把它设成
+ * `user@host:cwd`）原实现无条件 `chars.slice(1)` 削成 `iansenwei@H:~/workspace`；
+ * 连 `bash` 都被削成 `ash`（实测）。
  *
  * 占位符 DEFAULT_TASK_TITLE（还没起具体任务名）与空串一律返回空串 ——
  * 调用方据此判断「没有任务名可显示」，转而走 aiTitle 回退。
@@ -148,6 +159,7 @@ export function taskNameFromTitle(title: string): string {
   const chars = [...trimmed];
   const first = chars[0];
   const isIndicator = !/[\p{L}\p{N}]/u.test(first);
-  const name = (isIndicator ? chars.slice(1).join('') : trimmed).trim();
+  const followedByBreak = chars.length === 1 || /\s/.test(chars[1]);
+  const name = (isIndicator && followedByBreak ? chars.slice(1).join('') : trimmed).trim();
   return name.length === 0 || name === DEFAULT_TASK_TITLE ? '' : name;
 }
