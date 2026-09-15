@@ -7,6 +7,7 @@ import {
   formatCandidate,
   formatCandidateWithOwner,
   ownersOf,
+  parseAiTitle,
   parseConversationHead,
 } from '../../src/core/conversation';
 
@@ -190,5 +191,42 @@ describe('formatCandidateWithOwner —— 选择框里标注归属', () => {
     const s = formatCandidateWithOwner(c(), 'UI_Worker-01');
     assert.ok(s.includes('已绑给「UI_Worker-01」'), s);
     assert.ok(s.startsWith(formatCandidate(c())), s);
+  });
+});
+
+describe('parseAiTitle —— 从 transcript 尾部取最后一条 ai-title', () => {
+  const ai = (title: string) => line({ type: 'ai-title', sessionId: 'x', aiTitle: title });
+
+  it('单条 ai-title', () => {
+    assert.strictEqual(parseAiTitle([USER_LINE('hi'), ai('继续 Krita 编译')].join('\n')), '继续 Krita 编译');
+  });
+
+  it('★ 多条时取**最后**一条（标题会变，最后一条才是当前标题）', () => {
+    const text = [ai('旧标题'), USER_LINE('hi'), ai('中间标题'), ai('当前标题')].join('\n');
+    assert.strictEqual(parseAiTitle(text), '当前标题');
+  });
+
+  it('aiTitle 里含被 JSON 转义的引号时原样取出', () => {
+    assert.strictEqual(parseAiTitle(ai('他说"改一下"')), '他说"改一下"');
+  });
+
+  it('一条都没有 / 空串 → undefined', () => {
+    assert.strictEqual(parseAiTitle([USER_LINE('hi')].join('\n')), undefined);
+    assert.strictEqual(parseAiTitle(''), undefined);
+  });
+
+  it('aiTitle 是空串 / 非字符串 → 跳过（不当作标题）', () => {
+    assert.strictEqual(parseAiTitle([line({ type: 'ai-title', aiTitle: '' }), ai('真标题')].join('\n')), '真标题');
+    assert.strictEqual(parseAiTitle(line({ type: 'ai-title', aiTitle: 42 })), undefined);
+  });
+
+  it('★ 首行被截断（尾部窗口的起点落在一条记录中间）不抛且仍能取到后面的标题', () => {
+    const broken = '{"type":"mode","sessionId":"x","cwd":"/a/b_c';
+    assert.strictEqual(parseAiTitle([broken, ai('窗口内的标题')].join('\n')), '窗口内的标题');
+  });
+
+  it('★ ai-title 之后还有别的记录时仍要取到（真实 transcript 里标题几乎不在末行）', () => {
+    const text = [ai('旧标题'), ai('当前标题'), USER_LINE('起了标题之后又聊了几句')].join('\n');
+    assert.strictEqual(parseAiTitle(text), '当前标题');
   });
 });

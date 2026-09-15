@@ -1,6 +1,6 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { ConversationCandidate, parseConversationHead } from './core/conversation';
+import { ConversationCandidate, belongsToCwd, parseConversationHead } from './core/conversation';
 
 /**
  * 枚举 `~/.claude/projects/**` + `**\/*.jsonl` 下所有可接回的对话。
@@ -66,6 +66,71 @@ async function readHead(file: string, bytes: number): Promise<string> {
   } finally {
     await fh.close();
   }
+}
+
+/**
+ * 尾部读取窗口。**不是** HEAD_BYTES 的别名 —— 语义不同（这里读文件尾），
+ * 数值相同只是巧合，两者各自独立演进。
+ */
+export const TAIL_BYTES = 64 * 1024;
+
+/**
+ * 读文件**尾部** bytes 字节（文件更短时返回全部）。
+ *
+ * 为什么必须能读尾部：`ai-title` 是**追加**记录不是头部字段，实测首次出现
+ * 位置有 82/184 落在 64 KB 之后，而最后一次距 EOF 最远 53887 B ——
+ * 只读头部会读不到 45% 的文件的标题。
+ */
+export async function readTail(file: string, bytes: number): Promise<string> {
+  const fh = await fs.open(file, 'r');
+  try {
+    const { size } = await fh.stat();
+    const start = Math.max(0, size - bytes);
+    const len = size - start;
+    const buf = Buffer.alloc(len);
+    const { bytesRead } = await fh.read(buf, 0, len, start);
+    return buf.subarray(0, bytesRead).toString('utf8');
+  } finally {
+    await fh.close();
+  }
+}
+
+/**
+ * 按 id + cwd 精确定位会话文件，返回它的**绝对路径**。
+ *
+ * 与 findConversations 有意重复一部分（都在 projects 下 readdir + 读头部）：
+ * 那个函数的返回形状是 cwd 字符串数组、不含文件路径，而尾部读取必须先拿到
+ * 路径才能 seek；想复用它就得改签名并牵动既有 3 个调用点，得不偿失。
+ * 两者遵守同一套约定：目录名只用来找文件，归属一律以文件内记录的 cwd 为准。
+ *
+ * 找不到返回 undefined —— 绝不靠目录名转义规则反推。
+ */
+export async function findConversationFile(
+  home: string,
+  id: string,
+  cwd: string,
+): Promise<string | undefined> {
+  const root = path.join(home, '.claude', 'projects');
+  let dirs: string[];
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    dirs = entries.filter((d) => d.isDirectory()).map((d) => d.name);
+  } catch {
+    return undefined; // 没有 ~/.claude/projects —— 正常情况
+  }
+
+  const file = `${id}.jsonl`;
+  const hits = await mapLimited(dirs, CONCURRENCY, async (dir) => {
+    const full = path.join(root, dir, file);
+    try {
+      const head = await readHead(full, HEAD_BYTES); // 不存在会抛，跳过
+      const parsed = parseConversationHead(head);
+      return parsed.cwd !== undefined && belongsToCwd(parsed.cwd, cwd) ? full : undefined;
+    } catch {
+      return undefined;
+    }
+  });
+  return hits.find((f): f is string => f !== undefined);
 }
 
 /**

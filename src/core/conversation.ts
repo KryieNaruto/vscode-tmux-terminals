@@ -91,6 +91,39 @@ export function parseConversationHead(text: string): { cwd?: string; summary?: s
   };
 }
 
+/**
+ * 从一段（通常是**尾部**）jsonl 文本里取**最后一条** ai-title 记录。
+ * 一条都没有 / 解析不出 → undefined。
+ *
+ * 为什么读尾部而不是头部：实测 `ai-title` 是**追加**记录，不是头部字段 ——
+ * 一个文件里最多出现 21 次，首次出现位置有 82/184 落在 64 KB 之后，而
+ * **最后一次**距 EOF 最远 53887 B。所以从尾部读一个 64 KB 的窗口即可全覆盖。
+ *
+ * 为什么取最后一条：实测 7/184 个文件的标题真的变过，取最后一条才是当前标题。
+ *
+ * 容错是契约。注意**截断位置在窗口的首行、不在末行** —— 尾部读是 seek 到
+ * 文件中段开始的，第一条记录只有后半截；而末行一直写到 EOF，是完整的。
+ * 故「跳过解析不出的行」这条规则同时覆盖两者，别把它理解成「末行不可信」。
+ */
+export function parseAiTitle(text: string): string | undefined {
+  let title: string | undefined;
+  for (const raw of text.split('\n')) {
+    if (raw.length === 0) continue;
+    let o: unknown;
+    try {
+      o = JSON.parse(raw);
+    } catch {
+      continue; // 窗口起点处被截断的那一行 / 不认识的行
+    }
+    if (typeof o !== 'object' || o === null) continue;
+    const rec = o as Record<string, unknown>;
+    if (rec.type !== 'ai-title') continue;
+    const t = rec.aiTitle;
+    if (typeof t === 'string' && t.trim().length > 0) title = t;
+  }
+  return title;
+}
+
 /** 只忽略末尾斜杠，其余精确比较（`/a/b` 与 `/a/bc` 不是同一个目录）。 */
 function normalize(p: string): string {
   if (p.length === 0) return p;
