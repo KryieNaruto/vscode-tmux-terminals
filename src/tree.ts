@@ -68,8 +68,14 @@ export class EntryTreeItem extends vscode.TreeItem {
     public readonly alive: boolean,
     /** 由 ActivityTracker 轮询得来的当前活动状态；未轮询到时为 undefined */
     public readonly activity: EntryActivity | undefined,
+    /**
+     * 显示用的任务名：pane title 优先，回退到绑定对话的 aiTitle；'' = 不显示三级。
+     * 由 `EntryTreeProvider.taskNameFor` 算好传进来（不再各自去读
+     * activity.taskName —— 否则二级的 collapsibleState 会和三级是否真能
+     * 展开不一致）。
+     */
+    public readonly taskName: string,
   ) {
-    const taskName = activity?.taskName ?? '';
     super(
       entry.name,
       taskName.length > 0
@@ -116,15 +122,20 @@ export class EntryTreeItem extends vscode.TreeItem {
 export class TaskTreeItem extends vscode.TreeItem {
   constructor(
     public readonly entry: TerminalEntry,
-    public readonly activity: EntryActivity,
+    /** 可能是 undefined —— 回退来的名字没有对应的本次采样状态。 */
+    public readonly activity: EntryActivity | undefined,
+    /** `label`/`id` 用它；图标仍按 `activity?.state` 三态，undefined 走 idle 分支。 */
+    public readonly taskName: string,
   ) {
-    super(activity.taskName, vscode.TreeItemCollapsibleState.None);
+    super(taskName, vscode.TreeItemCollapsibleState.None);
     this.id = `task:${entry.id}`;
     this.contextValue = 'task';
+    // 图标仍按活动状态三态。回退来的名字通常伴随 idle（或 activity 干脆是
+    // undefined：该条目没被采过样），两者一并落到 idle 分支，**不新增状态**。
     this.iconPath =
-      activity.state === 'running'
+      activity?.state === 'running'
         ? new vscode.ThemeIcon('loading~spin', profileColor(entry))
-        : activity.state === 'done-unseen'
+        : activity?.state === 'done-unseen'
           ? new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.green'))
           : new vscode.ThemeIcon('circle-filled', profileColor(entry));
     this.command = {
@@ -200,6 +211,23 @@ export class EntryTreeProvider
     return this.alive.has(session);
   }
 
+  /**
+   * 显示用的任务名：pane title（live，权威）→ 绑定对话的 aiTitle（回退）
+   * → ''（不显示第三级）。
+   *
+   * **全都无从得知时返回空串** —— 不加灰色占位、不退化成
+   * `~/.claude/sessions` 的 derived slug、不用首条用户消息摘要：把「不知道」
+   * 伪装成「知道」是误导（spec §8 不变量 6）。
+   *
+   * 纯读：`peek` 同步、不发 IO、不触发观测（观测统一由 extension.ts 驱动）。
+   */
+  private taskNameFor(entry: TerminalEntry): string {
+    const fromPane = this.activity?.activityFor(entry.id)?.taskName ?? '';
+    return fromPane.length > 0
+      ? fromPane
+      : this.titleFallback?.peek(entry.conversationId) ?? '';
+  }
+
   async getChildren(element?: TreeNode): Promise<TreeNode[]> {
     if (element === undefined) {
       this.entries = await this.store.load();
@@ -214,13 +242,15 @@ export class EntryTreeProvider
           e,
           this.alive.has(sessionNameFor(e.id)),
           this.activity?.activityFor(e.id),
+          this.taskNameFor(e), // ← 新增参数
         ),
       );
     }
     if (element instanceof EntryTreeItem) {
       const activity = this.activity?.activityFor(element.entry.id);
-      return activity !== undefined && activity.taskName.length > 0
-        ? [new TaskTreeItem(element.entry, activity)]
+      // 有名字才生三级 —— 名字可能来自回退，所以判据是 taskName 而不是 activity
+      return element.taskName.length > 0
+        ? [new TaskTreeItem(element.entry, activity, element.taskName)]
         : [];
     }
     return [];
