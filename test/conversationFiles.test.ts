@@ -2,7 +2,8 @@ import * as assert from 'assert';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { findConversations, listConversations } from '../src/conversationFiles';
+import { findConversationFile, findConversations, listConversations, readTail } from '../src/conversationFiles';
+import { parseAiTitle } from '../src/core/conversation';
 
 /**
  * 枚举 `~/.claude/projects/**` 下可接回的对话。
@@ -138,5 +139,64 @@ describe('findConversations —— 按 id 直查（判断该用 --session-id 还
     const empty = await fs.mkdtemp(path.join(os.tmpdir(), 'tmuxterm-conv-none-'));
     homes.push(empty);
     assert.deepStrictEqual(await findConversations(empty, UUID), []);
+  });
+});
+
+describe('findConversationFile —— 按 id + cwd 精确定位文件（供尾部读取）', () => {
+  const homes: string[] = [];
+  const mk = async (files: Record<string, string>) => {
+    const h = await makeHome(files);
+    homes.push(h);
+    return h;
+  };
+  after(async () => {
+    for (const h of homes) await fs.rm(h, { recursive: true, force: true });
+  });
+
+  it('命中时返回文件的绝对路径', async () => {
+    const home = await mk({
+      [`-ssd-foo/${UUID}.jsonl`]: [line({ type: 'attachment', cwd: '/ssd/foo' }), userLine('hi', '/ssd/foo')].join('\n'),
+    });
+    assert.strictEqual(
+      await findConversationFile(home, UUID, '/ssd/foo'),
+      path.join(home, '.claude', 'projects', '-ssd-foo', `${UUID}.jsonl`),
+    );
+  });
+
+  it('id 存在但 cwd 不符 → undefined（归属以文件内字段为准）', async () => {
+    const home = await mk({ [`-a/${UUID}.jsonl`]: line({ type: 'attachment', cwd: '/a' }) });
+    assert.strictEqual(await findConversationFile(home, UUID, '/b'), undefined);
+  });
+
+  it('id 不存在 / projects 目录不存在 → undefined，不抛', async () => {
+    const home = await mk({});
+    assert.strictEqual(await findConversationFile(home, UUID, '/a'), undefined);
+
+    const empty = await fs.mkdtemp(path.join(os.tmpdir(), 'tmuxterm-conv-none-'));
+    homes.push(empty);
+    assert.strictEqual(await findConversationFile(empty, UUID, '/a'), undefined);
+  });
+
+  it('★ 标题落在文件尾部时也能读出来（头部 >64 KB、ai-title 只在末尾）', async () => {
+    const padding = Array.from({ length: 2000 }, (_, i) =>
+      line({ type: 'attachment', cwd: '/a/b', attachment: { i, pad: 'x'.repeat(200) } }));
+    const home = await mk({
+      [`-a-b/${UUID}.jsonl`]: [
+        line({ type: 'attachment', cwd: '/a/b' }),
+        ...padding,
+        line({ type: 'ai-title', sessionId: UUID, aiTitle: '尾部才有的标题' }),
+      ].join('\n'),
+    });
+    const file = await findConversationFile(home, UUID, '/a/b');
+    assert.ok(file !== undefined, '必须按 id + cwd 命中');
+    const tail = await readTail(file!, 64 * 1024);
+    assert.strictEqual(parseAiTitle(tail), '尾部才有的标题');
+  });
+
+  it('文件比窗口短时 readTail 返回全部内容', async () => {
+    const home = await mk({ [`-a-b/${UUID}.jsonl`]: line({ type: 'attachment', cwd: '/a/b' }) });
+    const file = await findConversationFile(home, UUID, '/a/b');
+    const tail = await readTail(file!, 64 * 1024);
+    assert.strictEqual(tail, line({ type: 'attachment', cwd: '/a/b' }));
   });
 });
