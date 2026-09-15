@@ -142,7 +142,7 @@ Expected: FAIL（`liveSessionId` 尚不存在于 `TerminalEntry`，`tsc` 报错 
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `npm run compile && npx mocha out/test/core/migrate.test.js`
-Expected: PASS（原有 11 项 + 新增 5 项全绿；其中「已是 v2 形态 → 原样返回（幂等）」这条也仍绿 —— 它的 v2 字面量里没有 `liveSessionId`，迁移结果同样没有）
+Expected: PASS（原有 **14** 项 + 新增 5 项 = **19** 项全绿。原有 14 项 = `isV1Shape` 3 + `migrateEntry` 7 + `conversationId` 4；其中「已是 v2 形态 → 原样返回（幂等）」这条也仍绿 —— 它的 v2 字面量里没有 `liveSessionId`，迁移结果同样没有）
 
 - [ ] **Step 5: 提交**
 
@@ -1710,21 +1710,26 @@ git commit -m "feat: 新增 TaskTitleCache（异步预取 + 同步 peek）并接
 
 ### Task 8: `TerminalManager` —— reconcile 与恢复路径改造
 
+> **行号快照警告**：本 Task 引用的行号是 **Task 7 之前**的快照。Task 7 在 `src/terminalManager.ts`／`src/tree.ts`／`src/extension.ts` 的构造函数附近插入了若干行，靠后的行号会相应偏移。**一律以代码块内容为锚点定位，不要按行号跳转。**
+
 **Files:**
 - Modify: `src/terminalManager.ts:246`（`resolveLaunchSpec` 签名与兜底 D）
-- Modify: `src/terminalManager.ts:384-504`（`openEntry` 先 reconcile）
+- Modify: `src/terminalManager.ts:384-504`（`openEntry` 先 reconcile，并接受可选 `opts`）
+- Modify: `src/terminalManager.ts:542-558`（`restoreAll` 整批共用一份快照）
 - Modify: `src/terminalManager.ts:596-630`（`restartClaude` 先 reconcile）
+- Modify: `src/terminalManager.ts:838-856`（`duplicateEntry` 剥掉 `liveSessionId`）
 - Modify: `src/terminalManager.ts`（新增 `reconcileAll` / `reconcileOne` / `liveFor`）
 - Modify: `src/terminalManager.ts:1-28`（import）
 
 **Interfaces:**
 - Consumes: `reconcileBinding`（Task 3）、`readLiveness` / `liveSessionIn` / `LivenessSnapshot`（Task 6）、`TaskTitleCache.prewarm`（Task 7）、`candidatesForCwd` / `listConversations` / `cwdFor` / `store`（既有）
 - Produces:
-  - `async reconcileAll(entries: readonly TerminalEntry[]): Promise<boolean>` —— Task 9（`extension.ts` 的 `reconcileNow`）调用
-  - `private async reconcileOne(entry): Promise<{ entry: TerminalEntry; live: string | undefined }>`
+  - `async reconcileAll(entries: readonly TerminalEntry[], snap?: LivenessSnapshot): Promise<boolean>` —— Task 9（`extension.ts` 的 `reconcileNow`）与 `restoreAll` 调用；第二个参数可选，传入则复用该快照
+  - `private async reconcileOne(entry, snap?: LivenessSnapshot): Promise<{ entry: TerminalEntry; live: string | undefined }>`（第二个参数可选：传入则复用该快照，不传才自己读一份）
+  - `async openEntry(entry: TerminalEntry, opts?: { snap?: LivenessSnapshot }): Promise<void>`（`opts.snap` 透传给 `reconcileOne`）
   - `private async resolveLaunchSpec(entry: TerminalEntry, live: string | undefined): Promise<LaunchSpec | undefined>`（签名多一个参数）
 
-**测试说明（重要）：** 本 Task 改的全是 `vscode` 依赖的类内部逻辑，无法用纯 mocha 单测（`core/*` 那部分规则已在 Task 3 单测过）。正确性由 **Task 11 的 e2e harness**（真 tmux + 真 `ps` + 假 HOME）覆盖 —— 其中「`/new` 自愈」「切 profile 先 reconcile」「手动改绑不被冲掉」「观测不到就不动」「兜底 D 两侧与等价路径」全部对应本 Task 的改动。本 Task 的验证闸门是**严格类型检查**。
+**测试说明（重要）：** 本 Task 改的全是 `vscode` 依赖的类内部逻辑，无法用纯 mocha 单测（`core/*` 那部分规则已在 Task 3 单测过）。正确性由 **Task 11 的 e2e harness**（真 tmux + 真 `ps` + 假 HOME）覆盖 —— 其中「`/new` 自愈」「切 profile 先 reconcile」「手动改绑不被冲掉」「观测不到就不动」「兜底 D 两侧与等价路径」「复制品不继承 `liveSessionId`」全部对应本 Task 的改动。本 Task 的验证闸门是**严格类型检查** + Task 11 的 e2e。
 
 - [ ] **Step 1: 补 import**
 
@@ -1769,14 +1774,21 @@ import { reconcileBinding } from './core/reconcile';
    * - 顺带预热任务名缓存：渲染层才能同步 peek 到「绑定对话的 aiTitle」。
    *   预热的是**回写之后**的 conversationId（那才是渲染层要看的键），
    *   没有回写时就是原值。
+   *
+   * `snap` 传入则复用该快照（restoreAll 走这条：它要拿同一份再逐条喂给
+   * openEntry → reconcileOne），不传才自己读一份。
    */
-  async reconcileAll(entries: readonly TerminalEntry[]): Promise<boolean> {
+  async reconcileAll(
+    entries: readonly TerminalEntry[],
+    /** 整批共用的一份快照（可选）。传入则复用；不传则自己 `readLiveness` 一份。 */
+    snap?: LivenessSnapshot,
+  ): Promise<boolean> {
     const alive = new Set(await this.tmux.listSessions());
-    const snap = await readLiveness(this.home());
+    const snapshot = snap ?? (await readLiveness(this.home()));
     let wrote = false;
     for (const entry of entries) {
       if (!alive.has(sessionNameFor(entry.id))) continue; // 会话都不在了 → 不观测
-      const live = await this.liveFor(snap, entry);
+      const live = await this.liveFor(snapshot, entry);
       const patch = reconcileBinding(
         { conversationId: entry.conversationId, liveSessionId: entry.liveSessionId },
         live,
@@ -1790,23 +1802,33 @@ import { reconcileBinding } from './core/reconcile';
   }
 
   /**
-   * 单条版本；两处触发用 —— openEntry 的点击 与 restartClaude 的切 profile。
+   * 单条版本；三处触发用 —— openEntry 的点击、restartClaude 的切 profile、
+   * 以及 restoreAll 批量恢复时逐条复用同一份快照。
    * 返回回写后的条目（无变化时原样返回）**与本次观测到的活跃会话 id** ——
    * 后者供 resolveLaunchSpec 的兜底 D 判断「claude 是不是真的不在了」，
    * 免得为同一个判断再观测一次（多 spawn 一个 `ps`，还可能得出不一致的结论）。
    *
+   * **`snap` 传入则复用、不传才自己读一份。** 这是 spec §4.3/§8「整批条目
+   * 共用一份快照，`ps` 只 spawn 一次」在单条入口上的落点：restoreAll 先读
+   * **一份**、跑一次 reconcileAll，再把同一份逐条透传进来 —— 否则 N 个条目
+   * 会各 spawn 一次 `ps`，恰好在**最常用的批量动作**上违背该约束。
+   *
    * tmux 会话不存在时不做任何观测，返回 { 原条目, undefined }。
-   * 刻意**不**经 reconcileAll 的 in-flight 合并：这两处都是低频动作，
+   * 刻意**不**经 reconcileAll 的 in-flight 合并：这几处都是低频动作，
    * 且用户就在等结果（见 spec §5.1 / §5.4）。
    */
   private async reconcileOne(
     entry: TerminalEntry,
+    /**
+     * 整批共用的一份快照（可选）。传入则复用；不传则自己 `readLiveness` 一份。
+     */
+    snap?: LivenessSnapshot,
   ): Promise<{ entry: TerminalEntry; live: string | undefined }> {
     const session = sessionNameFor(entry.id);
     if (!(await this.tmux.hasSession(session))) return { entry, live: undefined };
 
-    const snap = await readLiveness(this.home());
-    const live = await this.liveFor(snap, entry);
+    const snapshot = snap ?? (await readLiveness(this.home()));
+    const live = await this.liveFor(snapshot, entry);
     const patch = reconcileBinding(
       { conversationId: entry.conversationId, liveSessionId: entry.liveSessionId },
       live,
@@ -1875,9 +1897,30 @@ import { reconcileBinding } from './core/reconcile';
 
 （注意「未绑定 + claude 还活着」根本到不了这里：`reconcileOne` 的**首观测**规则 —— `liveSessionId` 为空、`live` 有值 → 回写两者 —— 已经把它绑上了。所以 D 分支面对的一定是「claude 真的不在了」这一种情况。）
 
-- [ ] **Step 4: 改 `openEntry`（先 reconcile，后续一律用改绑后的快照）**
+- [ ] **Step 4: 改 `openEntry`（接受可选 `opts.snap`；先 reconcile，后续一律用改绑后的快照）**
 
-把 `src/terminalManager.ts:386-388` 的
+先把 `src/terminalManager.ts:384` 的签名行
+
+```ts
+  async openEntry(entry: TerminalEntry): Promise<void> {
+```
+
+改成（只**追加**一个可选参数，其余一字未改）：
+
+```ts
+  async openEntry(
+    entry: TerminalEntry,
+    /**
+     * 批量恢复（restoreAll）传入的**共享快照**：透传给 reconcileOne，
+     * 让整批只 spawn 一次 `ps`（spec §4.3/§8）。
+     * 单条触发（点击条目、⟳ 刷新、切 profile）省略它，由 reconcileOne
+     * 自己读一份。
+     */
+    opts?: { snap?: LivenessSnapshot },
+  ): Promise<void> {
+```
+
+再把 `src/terminalManager.ts:386-388` 的
 
 ```ts
     // tmux 会话名由条目 id 派生，与显示名解耦（显示名可随意改名）。
@@ -1896,7 +1939,9 @@ import { reconcileBinding } from './core/reconcile';
     // 必须在算 --resume 之前：/new 之后「这个终端在用哪条会话」已经变了，
     // 正确答案得重新观测。返回改绑后的新快照（后续一律用它）与本次观测到
     // 的活跃会话 id（兜底 D 要用它判断 claude 是不是真的不在了）。
-    const { entry: current, live } = await this.reconcileOne(entry);
+    // opts?.snap 由 restoreAll 批量透传 —— 单条触发时为 undefined，
+    // reconcileOne 自己读一份。
+    const { entry: current, live } = await this.reconcileOne(entry, opts?.snap);
 ```
 
 再把 `:485` 的
@@ -1935,7 +1980,74 @@ import { reconcileBinding } from './core/reconcile';
     if (spec.kind === 'resume') await this.warnIfResumeFailed(session, current);
 ```
 
-- [ ] **Step 5: 改 `restartClaude`（切 profile 也是触发点）**
+- [ ] **Step 5: 改 `restoreAll`（整批共用一份快照）**
+
+`restoreAll`（`src/terminalManager.ts:542-558`）原来对每条 `autoRestore` 条目
+`void this.openEntry(e)`；而 `openEntry` 会调自带 `hasSession` + `readLiveness`
+（spawn 一次 `ps`）+ `panePid` 的 `reconcileOne`。于是**最常用的批量动作**在
+N 条上 spawn N 次 `ps`，而 spec §4.3/§8 明确要求「整批共用一份快照，`ps` 只
+spawn 一次」。改成先读**一份**快照、跑一次 `reconcileAll(snap)`，再把同一份
+逐条 `openEntry(e, { snap })`。
+
+把 `src/terminalManager.ts:550` 的
+
+```ts
+      for (const e of entries) {
+        void this.openEntry(e).catch(() => {
+```
+
+改成：
+
+```ts
+      // 整批共用**一份** LivenessSnapshot：先跑一次 reconcileAll 回写绑定，
+      // 再把同一份快照逐条透传给 openEntry → reconcileOne，全程只 spawn 一次
+      // `ps`。spec §4.3/§8 的「共享快照」约束必须在**最常用的批量路径**上
+      // 成立 —— 否则 N 个条目各 spawn 一次 `ps`。
+      const snap = await readLiveness(this.home());
+      await this.reconcileAll(entries, snap);
+      for (const e of entries) {
+        void this.openEntry(e, { snap }).catch(() => {
+```
+
+（`reconcileAll` 为此多一个可选的 `snap` 参数 —— Step 2 的代码块里已经带上。）
+
+- [ ] **Step 6: 改 `duplicateEntry`（复制品不得继承 `liveSessionId`）**
+
+`duplicateEntry`（`src/terminalManager.ts:852`）用
+`const { order: _dropOrder, conversationId: _dropConv, ...rest } = entry;`
+剥掉 `conversationId`，但 `liveSessionId` 会随 `...rest` **一起复制给复制品**。
+后果：复制品带着源条目的「已观测会话」出生，`reconcileBinding` 的第二分支
+（`live === liveSessionId`）会误判「没变化」而不改绑 —— 复制品永远跟着源条目
+那条会话走。这是 spec §4.1/§8 不变量 3（手动改绑保护）的**同一条不变量在
+复制路径上的必要延伸**。
+
+把 `src/terminalManager.ts:852` 的
+
+```ts
+    const { order: _dropOrder, conversationId: _dropConv, ...rest } = entry;
+```
+
+改成（命名与既有 `_dropOrder` / `_dropConv` 同形）：
+
+```ts
+    // liveSessionId 也**必须剥掉**：它是「上一次**已确认观测到**的活跃会话」，
+    // 属于源条目的终端。随 ...rest 一起复制，复制品就会带着源条目的已观测值
+    // 出生，reconcileBinding 第二分支（live === liveSessionId）随即误判
+    // 「没变化」而不改绑 —— 复制品从此永远跟着源条目那条会话走。
+    // 与 conversationId 一样：复制品是另一个终端，一切都该从「未观测」开始。
+    const {
+      order: _dropOrder,
+      conversationId: _dropConv,
+      liveSessionId: _dropLive,
+      ...rest
+    } = entry;
+```
+
+**断言**：在 Task 11 的第 19 节补一条 19g 用例 —— 对带 `liveSessionId` 的条目调
+`duplicateEntry`，断言复制品的 `liveSessionId === undefined`（Task 11 的代码块
+里已含该用例）。
+
+- [ ] **Step 7: 改 `restartClaude`（切 profile 也是触发点）**
 
 把 `src/terminalManager.ts:600-601` 的
 
@@ -1974,24 +2086,26 @@ import { reconcileBinding } from './core/reconcile';
 
 （原「没有绑定就拒绝」的守卫整段一字不改 —— 它现在用 reconcile **之后**的 `bound` 判断：`reconcileOne` 可能把原本未绑定的条目绑上（首观测规则），此时守卫放行，这正是「切 profile 时终端确实在用某条会话」的正确行为；观测不到时 `current.conversationId` 不变，未绑定仍按原逻辑拒绝。）
 
-- [ ] **Step 6: 严格类型检查**
+- [ ] **Step 8: 严格类型检查**
 
 Run: `npx tsc -p ./ --noEmit`
 Expected: 退出码 0，无输出。（若报 `resolveLaunchSpec` 参数数量不符，说明 `openEntry` 那处调用点没改；若报 `panePid` / `readLiveness` 不存在，说明 Task 6 没做完。）
 
-- [ ] **Step 7: 提交**
+- [ ] **Step 9: 提交**
 
 ```bash
 git add src/terminalManager.ts
-git commit -m "feat: TerminalManager 新增 reconcileAll/reconcileOne，恢复与切 profile 先 reconcile"
+git commit -m "feat: TerminalManager reconcile（批量共用快照、恢复/切 profile 先 reconcile、复制不继承 liveSessionId）"
 ```
 
 ---
 
 ### Task 9: `extension.ts` —— 采样闸门竞态修复 + reconcile 触发点
 
+> **行号快照警告**：本 Task 引用的行号是 **Task 7 之前**的快照。Task 7 在 `src/terminalManager.ts`／`src/tree.ts`／`src/extension.ts` 的构造函数附近插入了若干行，靠后的行号会相应偏移。**一律以代码块内容为锚点定位，不要按行号跳转。**
+
 **Files:**
-- Modify: `src/extension.ts:78-96`（采样闸门，`pollActivity`）
+- Modify: `src/extension.ts:101-114`（采样闸门，`pollActivity`；`:78-96` 是 `poll` + `restartPolling`，不是 `pollActivity`）
 - Modify: `src/extension.ts:123-140`（`reconcileNow` + 触发点注册）
 - Modify: `src/extension.ts:234-237`（`tmuxTerminals.refresh`）
 
@@ -2003,7 +2117,7 @@ git commit -m "feat: TerminalManager 新增 reconcileAll/reconcileOne，恢复�
 
 - [ ] **Step 1: 修采样闸门竞态**
 
-把 `src/extension.ts:102-114` 的
+把 `src/extension.ts:101-114` 的（即 `let activityInFlight = false;` 起、到 `pollActivity` 的 `};` 止）
 
 ```ts
   let activityInFlight = false;
@@ -2157,6 +2271,8 @@ git commit -m "fix: 活动采样闸门改用权威 tmux 查询；reconcile 挂�
 ---
 
 ### Task 10: `tree.ts` —— 三级任务名走 `taskNameFor`
+
+> **行号快照警告**：本 Task 引用的行号是 **Task 7 之前**的快照。Task 7 在 `src/terminalManager.ts`／`src/tree.ts`／`src/extension.ts` 的构造函数附近插入了若干行，靠后的行号会相应偏移。**一律以代码块内容为锚点定位，不要按行号跳转。**
 
 **Files:**
 - Modify: `src/tree.ts:65-105`（`EntryTreeItem` 构造函数）
@@ -2350,7 +2466,8 @@ git commit -m "feat: 三级任务名走 pane title → 绑定对话 aiTitle 的�
 ### Task 11: e2e harness —— 会话身份与任务名回退链场景
 
 **Files:**
-- Modify: `test/e2e-harness.js:192-200` 附近（新增模块级常量与辅助函数）
+- Modify: `test/e2e-harness.js:191-200`（既有的 `BIN_DIR` / `launchBin` 常量区，新常量紧邻此处；`:192-200` 就是这段常量，不是插入点）
+- Modify: `test/e2e-harness.js:263` 之后（**Step 1 的真正插入点**：`writeConversation` 的闭合 `}` 之后，插入新增的模块级辅助函数）
 - Modify: `test/e2e-harness.js:1176`（在第 18 节之后、第 15 节清理之前插入新的第 19、20 节）
 - Modify: `test/e2e-harness.js:1178-1210`（清理节：杀掉桩进程 + 清掉新目录）
 
@@ -2361,7 +2478,7 @@ git commit -m "feat: 三级任务名走 pane title → 绑定对话 aiTitle 的�
 **接缝（沿用 harness 已有的「pane 内以绝对路径拉起假进程」惯例）：**
 
 1. `tmux.newSession` 建会话，再 `sendLiteral` 一个**绝对路径**的假 claude 桩并回车 —— 这样不会被 PATH 桩换掉，也不会触到 `/usr/bin/claude`。
-2. 桩脚本把自己的 `$$` 写进**命令行给它的绝对路径**（`PID_DIR/<id>`），harness 读这个文件即拿到真实 pid。**这个 pid 就是生产代码将要看到的后代 pid。**
+2. 后台桩脚本把自己的 `$$` 写进**命令行给它的绝对路径**（`PID_DIR/<id>`），harness 读这个文件即拿到真实 pid。**这个 pid 就是生产代码将要看到的后代 pid。**（前台夹具 `FIXTURE_FG` 是**真二进制副本**、写不了 pid，19b 改为从 pane 反查：`#{pane_pid}` → `pgrep -P`，见 `foregroundPid`。）
 3. 写 `HOME/.claude/sessions/<pid>.json` = `{ pid, sessionId, cwd, startedAt }`（目录不存在就先 mkdir -p）—— 这是**唯一**需要注入的东西，走 `home`。
 4. 断言时用同一个 pid；`startedAt` 由用例显式给，保证确定性。
 
@@ -2380,20 +2497,55 @@ git commit -m "feat: 三级任务名走 pane title → 绑定对话 aiTitle 的�
  * 那个 pid 就是生产代码将要在 `ps` 里看到的后代 pid。
  */
 const PID_DIR = '/tmp/tmuxterm-e2e-pids';
-/** 后台挂住的假 claude：写 pid 后 exec sleep，作为 pane shell 的真实后代存活。 */
+/**
+ * 后台假 claude 的**桩脚本**：写 pid 后 exec sleep，作为 pane shell 的真实
+ * 后代存活。脚本被 execve 后 tmux 看到的 command 是解释器 `sh`，但这不影响
+ * 19a/19c —— 它们只要求「pane 里有这个后代进程」，不要求前台是 claude。
+ */
 const FIXTURE_BG = path.join(BIN_DIR, 'claude-fixture-bg');
-/** 前台假 claude：写 pid 后等一行输入，收到 /exit 即退出（供切 profile 用例）。 */
+/**
+ * 前台假 claude：**真二进制的副本**（`cp /bin/head`），**不是 shebang 脚本**。
+ *
+ * 必须是真二进制。shebang 脚本被 execve 之后，tmux 的
+ * `#{pane_current_command}` 取到的是**解释器**的 basename（本机 /bin/sh →
+ * dash → `sh`），于是：
+ *   - 19b 的前置断言（`front.startsWith('claude')`）直接红；
+ *   - `restartClaude` → `canSendControl`（terminalManager.ts:569-571）→
+ *     `isClaudeCommand`（core/claude.ts:14）判否 → `refuse()` 并
+ *     `return false`，一条命令都不会发 → 19b 四条断言全红。
+ * harness 既有惯例本就是真二进制的副本（`cp /bin/sleep /tmp/…/claude`，
+ * `cp /bin/head …/claude-once`，既有断言 `front === 'claude'`），这里沿用。
+ *
+ * 选 `/bin/head` 而非 `/bin/cat`：19b 要求它在收到 `/exit` 后**退出**，
+ * `restartClaude` 的 `waitForShell` 才过得去 —— `/bin/cat` 只在 stdin EOF
+ * 时退出，会一直挂着把这条用例卡死。`head -n 1` 读到一行（就是 `/exit`）
+ * 即退出，正好是原桩脚本 `read _line; exit 0` 的真二进制等价物。
+ *
+ * 名字以 `claude` 开头 → `isClaudeCommand` 认它；而它**不会**被 harness 的
+ * PATH 桩正则 `/(^|\s|\/)claude(-direct)?(\s|$)/` 命中 —— 该正则要求 `claude`
+ * 之后紧跟空白或行尾，而这里跟的是 `-fixture-fg`（已用 `node -e` 对该正则
+ * 实测核对：`/tmp/tmuxterm-e2e-bin/claude-fixture-fg /tmp/…` 不匹配），
+ * 故调用它不会被换成 PATH 桩，也不会触到真实的 /usr/bin/claude。
+ */
 const FIXTURE_FG = path.join(BIN_DIR, 'claude-fixture-fg');
 /** 兜底 D 的专用 cwd（那里只放一个条目）。 */
 const SOLE_CWD = '/tmp/tmuxterm-e2e-sole';
 
-/** 写桩脚本（绝对路径调用：不受 PATH 桩影响；名字以 claude 开头以便 isClaudeCommand 认它）。 */
+/**
+ * 准备两个假 claude（都用**绝对路径**调用：不受 PATH 桩影响，名字以 claude
+ * 开头以便 isClaudeCommand 认它）：
+ * - `FIXTURE_BG` 是**桩脚本**（写 pid 后 exec sleep）：它自己就能把真实 pid
+ *   写进命令行给它的落盘路径，19a/19c 用 `readFakePid` 读。
+ * - `FIXTURE_FG` 是**真二进制的副本**（理由见常量注释）：它写不了 pid，19b
+ *   的 pid 只能启动后从 pane 反查（`foregroundPid`）。
+ */
 async function writeFixtures() {
   await fs.promises.mkdir(BIN_DIR, { recursive: true });
   await fs.promises.mkdir(PID_DIR, { recursive: true });
   await fs.promises.writeFile(FIXTURE_BG, '#!/bin/sh\necho $$ > "$1"\nexec sleep 600\n', 'utf8');
-  await fs.promises.writeFile(FIXTURE_FG, '#!/bin/sh\necho $$ > "$1"\nread _line\nexit 0\n', 'utf8');
   await fs.promises.chmod(FIXTURE_BG, 0o755);
+  // 真二进制的副本：execve 之后 basename 即文件名本身 = claude-fixture-fg
+  await fs.promises.copyFile('/bin/head', FIXTURE_FG);
   await fs.promises.chmod(FIXTURE_FG, 0o755);
 }
 
@@ -2405,6 +2557,36 @@ async function readFakePid(name) {
       const t = (await fs.promises.readFile(file, 'utf8')).trim();
       if (/^\d+$/.test(t)) return Number(t);
     } catch { /* 还没写出来 */ }
+    await sleep(100);
+  }
+  return null;
+}
+
+/**
+ * 反查 pane 前台那个**真二进制**假 claude（`FIXTURE_FG`）的真实 pid ——
+ * 它自己写不了 pid 落盘文件。
+ *
+ * 路径：`#{pane_pid}`（外层 shell）→ 它的直接子进程即被 shell fork/exec 出来
+ * 的假 claude。实测：
+ *   `tmux display-message -p -t '=<session>:' '#{pane_pid}'` → shell 的 pid
+ *   `pgrep -P <pane_pid>` → 假 claude 的 pid
+ *
+ * 只在恰好一个子进程时返回它（多个就说明 pane 里不止这一个前台进程，宁可不猜）。
+ * 超时 / 查不到返回 null。
+ */
+async function foregroundPid(id) {
+  for (let i = 0; i < 40; i++) {
+    try {
+      const { stdout } = await run('tmux', [
+        'display-message', '-p', '-t', `=${S(id)}:`, '#{pane_pid}',
+      ]);
+      const panePid = Number(stdout.trim());
+      if (Number.isInteger(panePid) && panePid > 0) {
+        const kids = (await run('pgrep', ['-P', String(panePid)])).stdout.trim().split(/\s+/);
+        const pid = Number(kids[0]);
+        if (kids.length === 1 && Number.isInteger(pid) && pid > 0) return pid;
+      }
+    } catch { /* tmux / pgrep 还没就绪 */ }
     await sleep(100);
   }
   return null;
@@ -2518,14 +2700,21 @@ async function writeTranscript(uuid, cwd, projectDir, aiTitle, paddingLines) {
       await writeConversation(sessionB, BOUND_CWD, '切 profile 时该接回的新对话', PROJECT);
       store.entries.push(mk(id, 'IDENTITY2', BOUND_CWD, { conversationId: sessionA, model: 'deepseek-chat' }));
 
-      // 前台假 claude：收到 /exit 即退出，restartClaude 的 waitForShell 才过得去
+      // 前台假 claude：**真二进制副本**（head -n 1），读到一行（就是 restartClaude
+      // 发来的 `/exit`）即退出 —— restartClaude 的 waitForShell 才过得去。
       await tmux.newSession(S(id), BOUND_CWD);
       await sleep(500);
-      await tmux.sendLiteral(S(id), `${FIXTURE_FG} ${path.join(PID_DIR, id)}`);
+      await tmux.sendLiteral(S(id), `${FIXTURE_FG} -n 1`);
       await tmux.sendEnter(S(id));
-      const pid = await readFakePid(id);
       chk('19b 前置条件：pane 前台就是假 claude',
         (await tmux.currentCommand(S(id))).startsWith('claude'), await tmux.currentCommand(S(id)));
+      // 前台夹具是真二进制、不会写 pid 落盘文件 —— 从 pane 反查它的真实 pid：
+      // `#{pane_pid}`（外层 shell）→ `pgrep -P` 给出被 exec 出来的假 claude。
+      const pid = await foregroundPid(id);
+      // 守卫不可省：foregroundPid 超时会返回 null，此时 writeSessionRecord 会写出
+      // 一个 `null.json` 注册表文件（生产代码永远读不到），真实失败原因被掩盖成
+      // 「绑定没刷成」，四条断言全红却指向错误的方向。
+      chk('19b 前置条件：反查到了假 claude 的真实 pid', typeof pid === 'number' && pid > 0, String(pid));
       await writeSessionRecord(pid, sessionB, BOUND_CWD, 1789433265980);
 
       resetCalls();
@@ -2665,6 +2854,26 @@ async function writeTranscript(uuid, cwd, projectDir, aiTitle, paddingLines) {
       chk('19f ★ 一条启动命令都没发', literalsTo(S(idA)).length === 0, JSON.stringify(literalsTo(S(idA))));
       chk('19f 绑定未被改动', local.entries[0].conversationId === undefined,
         String(local.entries[0].conversationId));
+    }
+
+    // ---- 19g. 复制条目：复制品不得继承 liveSessionId（不变量 3 在复制路径上的延伸）----
+    {
+      const id = 'e2eidentity8';
+      const observed = 'bbbbbbbb-0013-0000-0000-000000000000';
+      store.entries.push(mk(id, 'IDENTITY5', BOUND_CWD, { conversationId: observed, liveSessionId: observed }));
+
+      const mgr = newManager();
+      await mgr.duplicateEntry(fresh(id));
+      const copy = store.entries[store.entries.length - 1];
+
+      // 若 liveSessionId 随 ...rest 一起被复制：复制品一出生就带着源条目的
+      // 「已观测会话」，reconcileBinding 第二分支（live === liveSessionId）
+      // 会误判「没变化」而不改绑 —— 复制品永远跟着源条目那条会话走。
+      chk('19g ★ 复制品不带 liveSessionId（否则 reconcile 第二分支会误判「没变化」而不改绑）',
+        copy.liveSessionId === undefined, String(copy.liveSessionId));
+      chk('19g 复制品另有自己的 conversationId（不照抄源条目的绑定）',
+        typeof copy.conversationId === 'string' && copy.conversationId !== observed,
+        String(copy.conversationId));
     }
   }
 ```
@@ -2837,7 +3046,7 @@ Expected: 末尾 `端到端全部通过 ✓`
 1. 去掉 `core/migrate.ts` 里 `liveSessionId` 那一行 → `test/core/migrate.test.js` 的 `liveSessionId 保留`应红。
 2. 把 `core/reconcile.ts` 的第二分支（`live === entry.liveSessionId`）删掉 → `test/core/reconcile.test.js` 的「手动改绑专项」应红。
 3. 去掉第一分支的 `live.trim() === ''` 守卫（只留 `live === undefined`）→ 空串用例应红。
-4. 把 `taskNameFromTitle` 退回无条件 `chain.slice(1)` 的写法 → `qiansenwei@H:~/workspace` 与 `bash` 两个用例应红。
+4. 把 `taskNameFromTitle` 退回无条件 `chars.slice(1)` 的写法（`src/core/tmux.ts:131-132` 的 `const chars = [...trimmed]; const rest = chars.slice(1)...`）→ `qiansenwei@H:~/workspace` 与 `bash` 两个用例应红。
 5. 把兜底 D 的唯一性判据退回**原始串**比较（`e.cwd === entry.cwd`）→ e2e 第 19f 节应红。
 
 注：**不要**再用「`startedAt` 改成取第一个候选」做变异点 —— 实测的孤儿场景两个 pid 同 sessionId，改与不改结果相同，该变异不会让任何断言变红。
@@ -2863,8 +3072,10 @@ Expected: 无输出、退出码 0
 
 - [ ] **Step 8: 确认没有遗留的旧调用点**
 
-Run: `grep -rn "taskNameFromTitle\|liveSessionIn\|reconcileBinding\|panePid" src/ | grep -v "core/tmux.ts\|core/reconcile.ts\|core/liveSession.ts\|liveSessions.ts\|tmuxClient.ts\|terminalManager.ts\|tree.ts\|activityTracker.ts"`
+Run: `grep -rn "taskNameFromTitle\|liveSessionIn\|reconcileBinding\|panePid" src/ | grep -v "core/tmux.ts\|core/reconcile.ts\|core/liveSession.ts\|core/activity.ts\|liveSessions.ts\|tmuxClient.ts\|terminalManager.ts\|tree.ts\|activityTracker.ts"`
 Expected: 无输出
+
+（排除表里的 `core/activity.ts` 不可省 —— 它的**注释**里就含 `taskNameFromTitle`（实测 `:6`、`:26` 命中），漏掉它这条断言会**假红**。）
 
 - [ ] **Step 9: 最终提交**
 
