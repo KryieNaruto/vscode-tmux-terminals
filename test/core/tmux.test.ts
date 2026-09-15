@@ -197,6 +197,16 @@ describe('taskNameFromTitle —— 只在首码点确实是指示符时才剥', 
     assert.strictEqual(taskNameFromTitle('bash'), 'bash');
   });
 
+  it('★ 首码点是标点（非字母数字）时同样绝不剥 —— 只有「指示符 + 空白」才是指示符', () => {
+    // 回归：`!isLetterOrDigit` 这个否定式判据会把任何标点开头也当成指示符，
+    // 于是 `-bash` 被削成 `bash`、`/home/user` 被削成 `home/user` ——
+    // 与「首码点是字母」是同一类 bug，只是更窄。故再要求指示符后必须
+    // 跟空白（或本身就是串尾）才剥。
+    assert.strictEqual(taskNameFromTitle('-bash'), '-bash');
+    assert.strictEqual(taskNameFromTitle('~/proj'), '~/proj');
+    assert.strictEqual(taskNameFromTitle('/home/user'), '/home/user');
+  });
+
   it('空串 / 纯空白返回空串', () => {
     assert.strictEqual(taskNameFromTitle(''), '');
     assert.strictEqual(taskNameFromTitle('   '), '');
