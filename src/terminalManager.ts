@@ -426,6 +426,13 @@ export class TerminalManager {
    *   预热的是**回写之后**的 conversationId（那才是渲染层要看的键），
    *   没有回写时就是原值。
    *
+   * **本方法绝不 reject；每个条目都被尝试过。** store.update 是这里唯一
+   * 可能抛的一环（store.load / listSessions / readLiveness / panePid 全都在
+   * 内部各自吞掉异常），所以单条的写回失败必须**在循环里**捕获：否则一次
+   * `保存` 失败会让 restoreAll 的整批恢复停在半路 —— 后面的条目一条都不再
+   * reconcile，连 `openEntry` 循环都进不去，而 reject 会掉进
+   * `void (async …)()` 里无声消失（同 applyToMany 的「一条失败不影响其余」）。
+   *
    * `snap` 传入则复用该快照（restoreAll 走这条：它要拿同一份再逐条喂给
    * openEntry → reconcileOne），不传才自己读一份。
    */
@@ -439,15 +446,20 @@ export class TerminalManager {
     let wrote = false;
     for (const entry of entries) {
       if (!alive.has(sessionNameFor(entry.id))) continue; // 会话都不在了 → 不观测
-      const live = await this.liveFor(snapshot, entry);
-      const patch = reconcileBinding(
-        { conversationId: entry.conversationId, liveSessionId: entry.liveSessionId },
-        live,
-      );
-      this.titles?.prewarm(patch?.conversationId ?? entry.conversationId, this.cwdFor(entry));
-      if (patch === undefined) continue;
-      await this.store.update(entry.id, patch);
-      wrote = true;
+      try {
+        const live = await this.liveFor(snapshot, entry);
+        const patch = reconcileBinding(
+          { conversationId: entry.conversationId, liveSessionId: entry.liveSessionId },
+          live,
+        );
+        this.titles?.prewarm(patch?.conversationId ?? entry.conversationId, this.cwdFor(entry));
+        if (patch === undefined) continue;
+        await this.store.update(entry.id, patch);
+        wrote = true;
+      } catch {
+        // 单条写回失败不该中断整批（见本方法注释与 restoreAll 的契约）。
+        // 这条绑定没刷成，但其余条目照常观测、照常回写。
+      }
     }
     return wrote;
   }

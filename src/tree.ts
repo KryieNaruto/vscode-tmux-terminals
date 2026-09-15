@@ -111,13 +111,20 @@ export class EntryTreeItem extends vscode.TreeItem {
 }
 
 /**
- * 三级节点：任务名。只在 `activity.taskName` 非空时才会被创建
+ * 三级节点：任务名。只在 `taskName` 非空时才会被创建
  * （由 `EntryTreeProvider.getChildren` 保证，见下）。
  *
- * 图标按活动状态三态：running → 原生转圈动画；done-unseen → 实心绿点
- * （直到用户点开该节点，见 ActivityTracker.markSeen）；idle → 实心
- * profile 色点（有任务名但当前空闲是正常状态，见 core/activity.ts 的
- * 说明——taskName 不随 state 变化而清空）。
+ * **判据是 `taskName`，不是 `activity.taskName`。** 名字有两个来源：本次
+ * 采样的 pane title，以及没有采样时从绑定对话的 aiTitle 回退来的名字。回退
+ * 来的名字**没有**对应的本次采样状态，所以 `activity` 可以是 undefined ——
+ * 这正是构造参数类型写成 `EntryActivity | undefined` 的原因。拿 activity
+ * 判空，会让「有回退名字但这次没被采样」的条目凭空少一级。
+ *
+ * 图标按活动状态**四输入三出口**：running → 原生转圈动画；done-unseen →
+ * 实心绿点（直到用户点开该节点，见 ActivityTracker.markSeen）；idle **与
+ * activity 为 undefined**（回退名字 / 该条目这次没被采样）→ 实心 profile
+ * 色点 —— 后两者一并落进 idle 分支，不新增状态（有任务名但当前空闲是正常
+ * 状态，见 core/activity.ts 的说明——taskName 不随 state 变化而清空）。
  */
 export class TaskTreeItem extends vscode.TreeItem {
   constructor(
