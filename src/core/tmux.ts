@@ -84,6 +84,18 @@ export function parseAttachedCount(stdout: string): number | null {
   return /^\d+$/.test(s) ? Number(s) : null;
 }
 
+/**
+ * 解析 `#{pane_pid}`。
+ *
+ * **空输出/非数字必须返回 null（未知）** —— 与 parseAttachedCount 同一个坑：
+ * pane 目标漏冒号时 `display-message` 是 **exit 0 + 空输出**，静默失败。
+ * 「未知」单独成一个值，由调用方按保守方向处理；绝不能当成 0 或某个 pid。
+ */
+export function parsePid(stdout: string): number | null {
+  const s = stdout.trim();
+  return /^\d+$/.test(s) ? Number(s) : null;
+}
+
 const LOGIN_SHELLS = new Set(['bash', 'zsh', 'sh', 'dash', 'fish', 'ksh', 'tcsh', 'csh']);
 
 /**
@@ -119,16 +131,23 @@ export function isRunningTitle(title: string): boolean {
 }
 
 /**
- * 从 pane title 里取任务名（去掉前导指示符及其后的空白）。
+ * 从 pane title 里取任务名。
  *
- * 占位符 DEFAULT_TASK_TITLE（还没起具体任务名）与空串一律返回空串——
- * 调用方据此判断「没有任务名可显示」，不挂徽章。绝不把占位符原样
- * 当作任务名显示出去，那对用户没有任何信息量。
+ * claude 把 title 设成 `<指示符> <文字>`（指示符见 isRunningTitle），此时剥掉
+ * 指示符。但**首码点是字母/数字时绝不能剥** —— 那是 shell 自己设的标题
+ * （claude 退出后 bash 会把 title 设成 `user@host:cwd`），原实现无条件
+ * `chars.slice(1)` 把它削成了 `iansenwei@H:~/workspace`；连 `bash` 都会被
+ * 削成 `ash`（实测）。
+ *
+ * 占位符 DEFAULT_TASK_TITLE（还没起具体任务名）与空串一律返回空串 ——
+ * 调用方据此判断「没有任务名可显示」，转而走 aiTitle 回退。
  */
 export function taskNameFromTitle(title: string): string {
   const trimmed = title.trim();
   if (trimmed.length === 0) return '';
   const chars = [...trimmed];
-  const rest = chars.slice(1).join('').trimStart();
-  return rest === DEFAULT_TASK_TITLE ? '' : rest;
+  const first = chars[0];
+  const isIndicator = !/[\p{L}\p{N}]/u.test(first);
+  const name = (isIndicator ? chars.slice(1).join('') : trimmed).trim();
+  return name.length === 0 || name === DEFAULT_TASK_TITLE ? '' : name;
 }
