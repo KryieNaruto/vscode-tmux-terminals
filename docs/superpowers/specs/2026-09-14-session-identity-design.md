@@ -1014,3 +1014,14 @@ const manager = new TerminalManager(store, tmux, titles);         // reconcile�
    边界**做（`TaskTitleCache.load` 存 `title?.trim()`），顺带修掉「全空白被
    当成有效标题缓存住」。`core/conversation.ts` 里的这条根因**有意不修**：
    它是纯函数，改它会牵动既有 `parseAiTitle` 单测的语义，由消费侧归一化更局部。
+5. **三个方法的签名都多了一个可选的 `LivenessSnapshot` 参数** —— §4.3（`:349`）
+   与 §5.1（`:358`、`:387`）写的是 `reconcileAll(entries)` /
+   `reconcileOne(entry)` / `openEntry(entry)`，实现分别是
+   `reconcileAll(entries, snap?)`（`src/terminalManager.ts:439`）、
+   `reconcileOne(entry, snap?)`（`:483`）、
+   `openEntry(entry, opts?: { snap?: LivenessSnapshot })`（`:525`）。
+   理由：§4.3/§8 要求「整批条目共用一份快照，`ps` 只 spawn 一次」，而批量恢复
+   （`restoreAll`）是最常用的批量路径 —— 它必须把**同一份**快照先喂给
+   `reconcileAll`、再逐条透传给 `openEntry`，否则 N 个条目会各 spawn 一次
+   `ps`，恰好在最常用的动作上违背该约束。参数是**可选**的：单条触发点
+   （点击条目、切 profile、⟳）都不传，由 `reconcileOne` 自己读一份。
