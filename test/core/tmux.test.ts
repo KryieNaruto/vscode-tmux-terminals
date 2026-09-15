@@ -10,6 +10,7 @@ import {
   parseAttachedCount,
   parsePid,
   SESSION_PREFIX,
+  DEFAULT_TASK_TITLE,
   isRunningTitle,
   taskNameFromTitle,
 } from '../../src/core/tmux';
@@ -179,9 +180,11 @@ describe('taskNameFromTitle —— 只在首码点确实是指示符时才剥', 
     assert.strictEqual(taskNameFromTitle('⠐ VSCode 终端会话管理插件'), 'VSCode 终端会话管理插件');
   });
 
-  it('占位符「Claude Code」返回空串（无论运行中还是空闲）', () => {
-    assert.strictEqual(taskNameFromTitle('✳ Claude Code'), '');
-    assert.strictEqual(taskNameFromTitle('⠐ Claude Code'), '');
+  it(`占位符「${DEFAULT_TASK_TITLE}」返回空串（无论运行中还是空闲）`, () => {
+    // 用源码常量插值而不是手写字符串：占位符一旦改名（claude 改文案），
+    // 这条测试必须跟着动，而不是继续对着一个已经不存在的老字符串常绿。
+    assert.strictEqual(taskNameFromTitle(`✳ ${DEFAULT_TASK_TITLE}`), '');
+    assert.strictEqual(taskNameFromTitle(`⠐ ${DEFAULT_TASK_TITLE}`), '');
   });
 
   it('只有指示符没有文字时返回空串', () => {

@@ -309,11 +309,20 @@ const SOLE_CWD = '/tmp/tmuxterm-e2e-sole';
  *   写进命令行给它的落盘路径，19a/19c 用 `readFakePid` 读。
  * - `FIXTURE_FG` 是**真二进制的副本**（理由见常量注释）：它写不了 pid，19b
  *   的 pid 只能启动后从 pane 反查（`foregroundPid`）。
+ *
+ * `FIXTURE_BG` 必须带上 `TMUXTERM_E2E_FIXTURE=$$` 的环境标记：`exec sleep`
+ * 之后 argv 只剩 `sleep 600`，从命令行**认不出这是我们的桩**；而环境块会随
+ * exec 保留下来，`isOurs()` 才能在被杀之前验明正身（见那里的注释：pid 会被
+ * OS 回收，误杀的是别人的进程）。`$$` 就是写进 pid 文件的那个 pid。
  */
 async function writeFixtures() {
   await fs.promises.mkdir(BIN_DIR, { recursive: true });
   await fs.promises.mkdir(PID_DIR, { recursive: true });
-  await fs.promises.writeFile(FIXTURE_BG, '#!/bin/sh\necho $$ > "$1"\nexec sleep 600\n', 'utf8');
+  await fs.promises.writeFile(
+    FIXTURE_BG,
+    '#!/bin/sh\necho $$ > "$1"\nexport TMUXTERM_E2E_FIXTURE=$$\nexec sleep 600\n',
+    'utf8',
+  );
   await fs.promises.chmod(FIXTURE_BG, 0o755);
   // 真二进制的副本：execve 之后 basename 即文件名本身 = claude-fixture-fg
   await fs.promises.copyFile('/bin/head', FIXTURE_FG);
@@ -375,14 +384,51 @@ async function writeSessionRecord(pid, sessionId, cwd, startedAt) {
 }
 
 /**
+ * `/proc/<pid>` 里此刻真的是**本 harness 的**桩进程吗？
+ *
+ * **为什么非验不可：pid 会被 OS 回收。** pid 文件是桩启动时写下的，到
+ * `killFakePids` 之间隔着整轮测试（`killAll` 之后还有 500ms）；桩若已经退出，
+ * 这个 pid 完全可能被**无关进程**复用，此时一发 SIGKILL 就打到别人身上 ——
+ * 而本 harness 的契约是「用户环境必须不被触碰」（这台机器上有 8 条活的
+ * 用户 tmux 会话，还有用户自己的 claude）。
+ *
+ * 判据（任一成立即可，都指向本 harness 自己的夹具）：
+ * - argv 里含夹具的绝对路径（桩 `exec` 之前，以及 `FIXTURE_FG` 这类真二进制
+ *   副本 —— 它们按绝对路径调用，argv[0] 就是那个路径）；
+ * - 环境里含 `TMUXTERM_E2E_FIXTURE=<pid>`（桩 `exec sleep` 之后 argv 只剩
+ *   `sleep 600`，只有环境块跨 exec 保留下来 —— 见 writeFixtures）。
+ *
+ * **读不到 / 对不上就返回 false（不发信号）**：宁可漏杀（下一次清场还会扫
+ * PID_DIR、tmux 会话也已 killAll），绝不误杀一个陌生进程。
+ */
+function isOurs(pid) {
+  try {
+    if (fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes(`${BIN_DIR}/claude-fixture`)) {
+      return true;
+    }
+    const env = fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
+    return env.includes(`TMUXTERM_E2E_FIXTURE=${pid}`);
+  } catch {
+    // 已退出（/proc/<pid> 不在）/ 非本用户（environ 不可读）→ 认不出来就不动它
+    return false;
+  }
+}
+
+/**
  * 杀掉所有桩进程。
  * 后台任务可能不在 pane 的**前台**进程组里，杀 tmux 会话不保证把它带走。
+ *
+ * **发信号前必须过 `isOurs`** —— 见那里的注释：pid 回收窗口里 SIGKILL 会
+ * 打到无关进程上。
  */
 async function killFakePids() {
   for (const name of await fs.promises.readdir(PID_DIR).catch(() => [])) {
     try {
       const t = (await fs.promises.readFile(path.join(PID_DIR, name), 'utf8')).trim();
-      if (/^\d+$/.test(t)) process.kill(Number(t), 'SIGKILL');
+      if (!/^\d+$/.test(t)) continue;
+      const pid = Number(t);
+      if (!isOurs(pid)) continue; // pid 已被回收 / 桩早已退出 → 绝不发信号
+      process.kill(pid, 'SIGKILL');
     } catch { /* 已经退出了 */ }
   }
 }
@@ -1672,8 +1718,12 @@ async function projectSnapshot() {
       // 进程组」且**不抛错** —— 于是 0 会被当成真泄漏塞进 stragglers，
       // 让这条断言无故变红。
       if (!/^\d+$/.test(t)) continue;
-      process.kill(Number(t), 0);   // 不抛 = 还活着
-      stragglers.push(Number(t));
+      const pid = Number(t);
+      // ★ 同一把尺子：pid 若已被回收，占着它的是**无关进程** —— 报成
+      //   「桩残留」是假警报，而且正是在这条断言最容易变红的时候。
+      if (!isOurs(pid)) continue;
+      process.kill(pid, 0);   // 不抛 = 还活着
+      stragglers.push(pid);
     } catch { /* 已退出 */ }
   }
   chk('★ 假 claude 桩进程没有残留', stragglers.length === 0, stragglers.join(','));
