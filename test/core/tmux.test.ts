@@ -8,10 +8,10 @@ import {
   sessionNameFor,
   escapeSessionName,
   parseAttachedCount,
+  parsePid,
   SESSION_PREFIX,
   isRunningTitle,
   taskNameFromTitle,
-  DEFAULT_TASK_TITLE,
 } from '../../src/core/tmux';
 
 describe('sessionNameFor / escapeSessionName', () => {
@@ -172,22 +172,53 @@ describe('isRunningTitle', () => {
   });
 });
 
-describe('taskNameFromTitle', () => {
-  it('占位符「Claude Code」返回空串（无论运行中还是空闲）', () => {
-    assert.strictEqual(taskNameFromTitle('✳ Claude Code'), '');
-    assert.strictEqual(taskNameFromTitle('⠂ Claude Code'), '');
-    assert.strictEqual(taskNameFromTitle(`✳ ${DEFAULT_TASK_TITLE}`), '');
-  });
-  it('取出具体任务名', () => {
+describe('taskNameFromTitle —— 只在首码点确实是指示符时才剥', () => {
+  it('Braille / ✳ 指示符后被剥掉，取出具体任务名', () => {
+    assert.strictEqual(taskNameFromTitle('⠐ 创建多引擎版 /ask 命令并统一'), '创建多引擎版 /ask 命令并统一');
     assert.strictEqual(taskNameFromTitle('✳ 继续 Krita MSVC 编译工程'), '继续 Krita MSVC 编译工程');
     assert.strictEqual(taskNameFromTitle('⠐ VSCode 终端会话管理插件'), 'VSCode 终端会话管理插件');
   });
-  it('空串返回空串', () => {
-    assert.strictEqual(taskNameFromTitle(''), '');
-    assert.strictEqual(taskNameFromTitle('   '), '');
+
+  it('占位符「Claude Code」返回空串（无论运行中还是空闲）', () => {
+    assert.strictEqual(taskNameFromTitle('✳ Claude Code'), '');
+    assert.strictEqual(taskNameFromTitle('⠐ Claude Code'), '');
   });
+
   it('只有指示符没有文字时返回空串', () => {
     assert.strictEqual(taskNameFromTitle('✳'), '');
     assert.strictEqual(taskNameFromTitle('✳ '), '');
+  });
+
+  it('★ 首码点是字母/数字时绝不剥 —— shell 自己设的标题必须原样保留', () => {
+    // 回归：claude 退出后 bash 把 title 设成 user@host:cwd，原实现无条件
+    // slice(1) 把它削成了 `iansenwei@H:~/workspace`
+    assert.strictEqual(taskNameFromTitle('qiansenwei@H:~/workspace'), 'qiansenwei@H:~/workspace');
+    // 连 `bash` 都会被削成 `ash`
+    assert.strictEqual(taskNameFromTitle('bash'), 'bash');
+  });
+
+  it('空串 / 纯空白返回空串', () => {
+    assert.strictEqual(taskNameFromTitle(''), '');
+    assert.strictEqual(taskNameFromTitle('   '), '');
+  });
+});
+
+describe('parsePid —— 解析 `#{pane_pid}`', () => {
+  it('解析出数字 pid', () => {
+    assert.strictEqual(parsePid('287661'), 287661);
+    assert.strictEqual(parsePid('  287661  \n'), 287661);
+  });
+
+  it('★ 空串 → null（display-message 目标写错时是 exit 0 + 空输出，静默失败）', () => {
+    assert.strictEqual(parsePid(''), null);
+    assert.strictEqual(parsePid('\n'), null);
+    assert.strictEqual(parsePid('   '), null);
+  });
+
+  it('非数字 / 负数一律 null（读取失败或格式被改）', () => {
+    assert.strictEqual(parsePid('abc'), null);
+    assert.strictEqual(parsePid('-1'), null);
+    assert.strictEqual(parsePid('1.5'), null);
+    assert.strictEqual(parsePid('1 2'), null);
   });
 });
