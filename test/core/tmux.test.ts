@@ -13,6 +13,9 @@ import {
   DEFAULT_TASK_TITLE,
   isRunningTitle,
   taskNameFromTitle,
+  PANE_SAMPLE_SEPARATOR,
+  parsePaneSample,
+  taskNameFromSample,
 } from '../../src/core/tmux';
 
 describe('sessionNameFor / escapeSessionName', () => {
@@ -233,5 +236,88 @@ describe('parsePid —— 解析 `#{pane_pid}`', () => {
     assert.strictEqual(parsePid('-1'), null);
     assert.strictEqual(parsePid('1.5'), null);
     assert.strictEqual(parsePid('1 2'), null);
+  });
+});
+
+describe('parsePaneSample —— 一次 display-message 拆出前台命令与标题', () => {
+  const raw = (foreground: string, title: string): string =>
+    `${foreground}${PANE_SAMPLE_SEPARATOR}${title}`;
+
+  it('分隔符是可打印定串（控制字符会被 tmux 转义成八进制字面量，见常量注释）', () => {
+    assert.strictEqual(PANE_SAMPLE_SEPARATOR, '__tmuxterm_field_sep__');
+    // 控制字符当分隔符在这里不管用：实测 tmux 3.4 的 display-message -p 会把
+    // 格式串里的 0x1F 转义成四个可打印字符 `\037`，那个字节到不了输出里。
+    assert.strictEqual(/[\x00-\x1f\x7f]/.test(PANE_SAMPLE_SEPARATOR), false);
+    assert.ok(PANE_SAMPLE_SEPARATOR.length >= 8, '太短会撞上真进程名');
+  });
+
+  it('拆出两个字段（并吃掉 tmux 输出末尾的换行）', () => {
+    assert.deepStrictEqual(parsePaneSample(raw('claude', '⠐ 编译内核') + '\n'),
+      { foreground: 'claude', title: '⠐ 编译内核' });
+  });
+
+  it('任一侧为空串时另一侧仍各归各位', () => {
+    assert.deepStrictEqual(parsePaneSample(raw('bash', '')),
+      { foreground: 'bash', title: '' });
+    assert.deepStrictEqual(parsePaneSample(raw('', 'some title')),
+      { foreground: '', title: 'some title' });
+  });
+
+  it('★ 只按第一个分隔符切 —— 标题自带的同一个 token 也伤不到切分', () => {
+    // 纵深防御：能破坏切分的只有「命令字段里含分隔符」（标题是尾字段）。
+    // 按第一个切时，标题里多出来的 token 留在标题那一段里。
+    assert.deepStrictEqual(parsePaneSample(raw('claude', `a${PANE_SAMPLE_SEPARATOR}b`)),
+      { foreground: 'claude', title: `a${PANE_SAMPLE_SEPARATOR}b` });
+  });
+
+  it('★ 畸形响应（空输出 / 没有分隔符）→ 两个空串，不抛错也不把整串当标题', () => {
+    // 空输出正是 display-message 的 pane 目标写错时的形态（exit 0 + 空）。
+    // 若把整串当标题，那段「未知」会被下游当成一个真标题显示出来。
+    for (const bad of ['', '\n', '   ', 'bash', 'claude']) {
+      assert.deepStrictEqual(parsePaneSample(bad), { foreground: '', title: '' },
+        `畸形输入 ${JSON.stringify(bad)} 应判为两个字段都未知`);
+    }
+  });
+});
+
+describe('taskNameFromSample —— pane 前台不是 claude 就不采信 pane title', () => {
+  const s = (foreground: string, title: string) => ({ foreground, title });
+
+  it('★ 前台不是 claude 时，shell 提示符形状的标题一律不算任务名', () => {
+    // 本次新增的闸门，也是本任务的核心：claude 退出后 pane 前台变回 shell，
+    // 标题成了 `user@host:~/path`。改前这条链（taskNameFromTitle）会原样
+    // 保留它（同一输入在 test/core/tmux.test.ts 的 taskNameFromTitle 一节
+    // 有断言，正是「保留」），于是三级显示提示符、aiTitle 回退永远轮不到。
+    for (const shell of ['bash', '-bash', 'sh', 'zsh', 'nvim', 'node']) {
+      assert.strictEqual(
+        taskNameFromSample(s(shell, 'qiansenwei@H:~/workspace')), '',
+        `前台是 ${shell} 时不应采信 pane title`);
+    }
+  });
+
+  it('★ 前台不是 claude 时，占位符与空标题同样不算任务名', () => {
+    assert.strictEqual(taskNameFromSample(s('bash', `✳ ${DEFAULT_TASK_TITLE}`)), '');
+    assert.strictEqual(taskNameFromSample(s('bash', '')), '');
+  });
+
+  it('前台是 claude：照旧取出标题里的任务名（含剥掉 ⠐ 指示符）', () => {
+    assert.strictEqual(
+      taskNameFromSample(s('claude', '⠐ 创建多引擎版 /ask 命令并统一')),
+      '创建多引擎版 /ask 命令并统一');
+    assert.strictEqual(
+      taskNameFromSample(s('/usr/local/bin/claude', '✳ 继续 Krita MSVC 编译工程')),
+      '继续 Krita MSVC 编译工程');
+  });
+
+  it('前台是 claude 但标题只是占位符/空 → 空串（与改前一致，交给 aiTitle 回退）', () => {
+    assert.strictEqual(taskNameFromSample(s('claude', `✳ ${DEFAULT_TASK_TITLE}`)), '');
+    assert.strictEqual(taskNameFromSample(s('claude', '⠐')), '');
+    assert.strictEqual(taskNameFromSample(s('claude', '')), '');
+  });
+
+  it('★ 采样未知（畸形响应）→ 空串，不退化成显示什么', () => {
+    assert.strictEqual(taskNameFromSample({ foreground: '', title: '' }), '');
+    // 未知前台 + 一段看似任务名的标题：不能因为「标题好看」就采信
+    assert.strictEqual(taskNameFromSample(s('', '创建多引擎版 /ask 命令并统一')), '');
   });
 });

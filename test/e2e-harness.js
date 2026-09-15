@@ -1621,9 +1621,11 @@ async function projectSnapshot() {
     const { taskNameFromTitle } = require(path.join(ROOT, 'out/src/core/tmux.js'));
 
     // 本节的接缝在**渲染层**：activity 用假的（pane title → taskName 那条链的
-    // 解析已被 test/core/tmux.test.ts 与 test/activityTracker.test.ts 覆盖，
-    // 且这段代码本次未改），titleFallback 用**真的** TaskTitleCache +
-    // **真的**磁盘 transcript —— 这才正好覆盖本次新增的 taskNameFor 回退逻辑。
+    // 解析与采样层的闸门已被 test/core/tmux.test.ts 与 test/activityTracker.test.ts
+    // 覆盖 —— 含 Task 13 新增的「前台不是 claude ⇒ 空串」，故 20c 里那段
+    // shell 标题只可能在渲染层出现，真实链路上采样层早已把它压成空串），
+    // titleFallback 用**真的** TaskTitleCache + **真的**磁盘 transcript ——
+    // 这才正好覆盖本次新增的 taskNameFor 回退逻辑。
     const storeFor = (entry) => ({
       entries: [entry],
       async load() { return this.entries.map((e) => ({ ...e })); },

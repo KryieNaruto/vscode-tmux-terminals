@@ -1025,3 +1025,42 @@ const manager = new TerminalManager(store, tmux, titles);         // reconcile�
    `reconcileAll`、再逐条透传给 `openEntry`，否则 N 个条目会各 spawn 一次
    `ps`，恰好在最常用的动作上违背该约束。参数是**可选**的：单条触发点
    （点击条目、切 profile、⟳）都不传，由 `reconcileOne` 自己读一份。
+
+### 后续修订（2026-09-14，Task 13）：§10 推迟的 pane title 闸门**提前落地**
+
+§10「**pane title 权威**」一行把「claude 不在跑就不采信 pane title」记成待办、
+留作后续。用户随后要求本次一并做掉 —— 这是**推迟项的提前**，不是设计变更。
+落地形态与 §10 设想的**位置不同**：
+
+- **闸门在采样层，不在 `taskNameFor`。** §10 写的是「在 `taskNameFor` 前加一道
+  `isClaudeCommand(pane 前台)` 闸门」，但 `taskNameFor`（`src/tree.ts:231`）是
+  同步纯读、在渲染路径上每帧都调，不能在那里 shell out。实现改为在
+  `ActivityTracker.poll`（`src/activityTracker.ts:69`，采样在 `:78`）采样时就判定：前台不是
+  claude ⇒ `EntryActivity.taskName` 存**空串**。`tree.ts` 的回退链
+  （`src/tree.ts:231-236`）**一行未改**，于是空串自然让它轮到 aiTitle。
+- **仍是一次 tmux 调用。** 原 `TmuxClient.paneTitle` 被 `paneSample`
+  （`src/tmuxClient.ts:171`）取代，格式串是
+  `#{pane_current_command}<PANE_SAMPLE_SEPARATOR>#{pane_title}`，一次
+  `display-message -p` 同时取回两个字段 —— 采样循环每 ≈900 ms 对每个条目跑一次
+  （`extension.ts` 的 `ACTIVITY_POLL_INTERVAL_MS`），拆成两次等于让这一层的进程数
+  翻倍。
+- **分隔符实测结论（与常规做法相反）**：原打算用 ASCII US（U+001F）。实测
+  tmux 3.4 的 `display-message -p` 会把**格式串里的控制字符转义成八进制字面量**再
+  输出 —— 放一个真实 0x1F 进去，拿回来的是四个可打印字符 `\037`（与直接写 `\037`
+  逐字节相同）。故改用可打印定串 `__tmuxterm_field_sep__`
+  （`src/core/tmux.ts:186`），并**只按第一个分隔符切**（标题是尾字段，即便自带
+  同一 token 也伤不到切分；能破坏切分的只有命令字段）。
+- **判据复用 `isClaudeCommand`**（`src/core/claude.ts:14`），不另立第二套
+  「像不像 claude」—— 它本就是「切模型/切 profile 会不会把控制序列打进用户进程」
+  的安全判据，问的是同一个问题。
+- **只闸任务名，不闸 `running`。** `running` 由 `isRunningTitle` 的 Braille 分区
+  判据给出，claude 退出后 title 变回 `user@host:~/path`、首字符不在 U+2800–U+28FF，
+  本来就判否；把 running 也闸上会改动 done-unseen 状态机（§8 的不变量）的输入，
+  超出本次范围。
+- **`paneSample` 多取了一个字段，语义没变**：`pane_current_command` 的读法与
+  §3.1/§5 已用的 `panePid`/`currentCommand` 同源同门（`=name:` 目标、空输出即
+  「未知」），故 8 个真实会话实测全部报 `claude`，闸门不会误伤在跑的 claude。
+- 纯解析/闸门在 `src/core/tmux.ts`（`parsePaneSample` / `taskNameFromSample`），
+  单测在 `test/core/tmux.test.ts`；IO 侧在 `test/tmuxClient.integration.test.ts`
+  （含「前台换成 sleep 后采样真的反映出来」的端到端一条）；采样层的闸门与
+  「每条目每轮只采样一次」在 `test/activityTracker.test.ts`。

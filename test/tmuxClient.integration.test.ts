@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { TmuxClient } from '../src/tmuxClient';
+import { taskNameFromSample } from '../src/core/tmux';
 
 const run = promisify(execFile);
 const client = new TmuxClient('tmux');
@@ -82,6 +83,45 @@ describe('TmuxClient（集成，需要本机有 tmux）', function () {
   it('waitForShell 对就绪会话返回 true', async () => {
     await run('tmux', ['new-session', '-d', '-s', A]);
     assert.strictEqual(await client.waitForShell(A, 3000), true);
+  });
+
+  describe('paneSample —— 一次调用取回前台命令与标题（任务名闸门的输入）', () => {
+    it('一次 display-message 同时取回两个字段', async () => {
+      await run('tmux', ['new-session', '-d', '-s', A]);
+      assert.strictEqual(await client.waitForShell(A, 3000), true);
+      await run('tmux', ['select-pane', '-t', `=${A}:`, '-T', 'PANESAMPLE 探针']);
+      const s = await client.paneSample(A);
+      assert.deepStrictEqual(s, { foreground: 'bash', title: 'PANESAMPLE 探针' });
+    });
+
+    it('关键：会话不存在时返回两个空串（未知），不是把整串当标题', async () => {
+      // display-message 目标写错/会话不存在时 tmux 是 exit 0 + 空输出，
+      // 静默失败。此时「未知」必须显式表达，否则下游会把空当成一个真标题。
+      assert.deepStrictEqual(await client.paneSample('tmuxterm-cafebabe'),
+        { foreground: '', title: '' });
+    });
+
+    it('★ 前台换成非 claude 进程后，采样真的反映出来（闸门端到端）', async () => {
+      // 闸门的判据是 pane 前台进程：这里把前台从 bash 换成 sleep，模拟
+      // 「claude 退出、前台变回别的进程」。标题仍留着提示符形状 —— 改前
+      // taskNameFromTitle 会把它原样当任务名（三级显示提示符、aiTitle 回退
+      // 永远轮不到），闸门后必须是空串，回退才有机会。
+      await run('tmux', ['new-session', '-d', '-s', A]);
+      assert.strictEqual(await client.waitForShell(A, 3000), true);
+      await run('tmux', ['select-pane', '-t', `=${A}:`, '-T', 'qiansenwei@H:~/workspace']);
+      await client.sendLiteral(A, 'exec sleep 30');
+      await client.sendEnter(A);
+
+      let s = await client.paneSample(A);
+      for (let i = 0; i < 30 && s.foreground !== 'sleep'; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        s = await client.paneSample(A);
+      }
+      assert.strictEqual(s.foreground, 'sleep', '前台没换成 sleep');
+      assert.strictEqual(s.title, 'qiansenwei@H:~/workspace', '标题应仍是提示符形状');
+      assert.strictEqual(taskNameFromSample(s), '',
+        '非 claude 前台不应采信 pane title（否则回退链接不上）');
+    });
   });
 
   it('waitForShell 对不存在的会话在超时后返回 false', async () => {
