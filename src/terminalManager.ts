@@ -68,6 +68,13 @@ export class TerminalManager {
   constructor(
     private readonly store: EntryStore,
     private readonly tmux: TmuxClient,
+    /**
+     * 任务名回退源（只读内存缓存）。reconcile 时对**当前绑定**调一次
+     * prewarm 预热，渲染层才能同步 peek 到「绑定对话的 aiTitle」。
+     * 用最小接口而不是具体类型，与 tree.ts 的 store/activity 同一处理方式。
+     * 省略 = 不预热（既有调用方不受影响）。
+     */
+    private readonly titles?: { prewarm(conversationId: string | undefined, cwd: string): void },
   ) {
     vscode.window.onDidCloseTerminal((t) => {
       this.busy.delete(t);

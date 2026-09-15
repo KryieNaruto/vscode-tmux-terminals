@@ -171,6 +171,14 @@ export class EntryTreeProvider
     private readonly activity?: {
       activityFor(entryId: string): EntryActivity | undefined;
     },
+    /**
+     * 任务名回退源：**同步读内存缓存，不发 IO、不触发观测**（观测统一由
+     * extension.ts 驱动，provider 不持有 reconciler）。
+     * 省略 = 无回退（只剩 pane title 一个来源）。
+     */
+    private readonly titleFallback?: {
+      peek(conversationId: string | undefined): string | undefined;
+    },
   ) {}
 
   refresh(): void {

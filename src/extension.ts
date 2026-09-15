@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as os from 'os';
 import { EntryStore } from './core/store';
 import { TmuxClient } from './tmuxClient';
 import { EntryTreeItem, EntryTreeProvider, TaskTreeItem } from './tree';
@@ -7,6 +8,7 @@ import { BatchTreeProvider } from './batchTree';
 import { readProfileConfig } from './claudeConfig';
 import { TerminalManager } from './terminalManager';
 import { ActivityTracker } from './activityTracker';
+import { TaskTitleCache } from './taskTitles';
 import { sessionNameFor } from './core/tmux';
 
 let pollTimer: NodeJS.Timeout | undefined;
@@ -37,11 +39,15 @@ export function activate(context: vscode.ExtensionContext): void {
       `清单已按空列表继续，可从中手动恢复条目。`,
     );
   });
+  // 任务名回退源：**只有一个实例**，同时注入 provider（渲染时 peek）
+  // 与 manager（reconcile 时 prewarm）。home 与 manager.home() 同源
+  // （扩展进程里 os.homedir() 就是它）。
+  const titles = new TaskTitleCache(os.homedir());
   // TmuxClient 已经有 paneTitle(name) 方法，结构上满足 ActivityTracker
   // 需要的最小接口，不需要额外适配。
   const tracker = new ActivityTracker(tmux);
-  const provider = new EntryTreeProvider(store, tracker);
-  const manager = new TerminalManager(store, tmux);
+  const provider = new EntryTreeProvider(store, tracker, titles);   // 渲染：peek
+  const manager = new TerminalManager(store, tmux, titles);         // reconcile：prewarm
 
   const view = vscode.window.createTreeView('tmuxTerminals.list', {
     treeDataProvider: provider,
