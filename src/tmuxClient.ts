@@ -2,11 +2,15 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import {
   isShellReady,
+  PANE_SAMPLE_SEPARATOR,
+  PaneSample,
   paneTarget,
   parseAttachedCount,
+  parsePaneSample,
   parsePid,
   parseSessionList,
   sessionTarget,
+  UNKNOWN_PANE_SAMPLE,
 } from './core/tmux';
 
 const run = promisify(execFile);
@@ -146,20 +150,33 @@ export class TmuxClient {
   }
 
   /**
-   * 取 pane title —— claude 会把当前状态（运行中/空闲）和任务名编码进
-   * 这里（见 core/tmux.ts 的 isRunningTitle / taskNameFromTitle）。
+   * 一次取回 pane 的前台进程名与标题：
+   * `#{pane_current_command}<PANE_SAMPLE_SEPARATOR>#{pane_title}`。
    *
-   * 目标同样必须走 paneTarget（带冒号），漏写时 tmux 静默返回空串，
-   * 解析函数对空串的处理已经是「判为空闲、无任务名」，方向安全。
+   * **必须一次调用取两个字段，不能拆成两次 display-message。** 这是
+   * `ActivityTracker` 每 ≈900 ms 对每个条目跑一次的采样路径
+   * （extension.ts 的 ACTIVITY_POLL_INTERVAL_MS），拆开等于让这层的 tmux
+   * 进程数翻倍；而且两个字段本就来自同一个 pane 的同一瞬间，分开取还多一个
+   * 「命令与标题不同步」的窗口。
+   *
+   * 分隔符与解析见 core/tmux.ts 的 PANE_SAMPLE_SEPARATOR / parsePaneSample。
+   * 前台进程名喂 isClaudeCommand 决定「要不要采信 pane title」，标题喂
+   * isRunningTitle / taskNameFromTitle（claude 把它编码成
+   * `<指示符> <任务名>`）。
+   *
+   * 目标同样必须走 paneTarget（带冒号），漏写时 tmux 静默返回空（exit 0），
+   * parsePaneSample 对空输出给回「两个字段都未知」—— 未知名不进任务名，
+   * 方向安全。
    */
-  async paneTitle(name: string): Promise<string> {
+  async paneSample(name: string): Promise<PaneSample> {
     try {
       const { stdout } = await run(this.tmuxPath, [
-        'display-message', '-p', '-t', paneTarget(name), '#{pane_title}',
+        'display-message', '-p', '-t', paneTarget(name),
+        `#{pane_current_command}${PANE_SAMPLE_SEPARATOR}#{pane_title}`,
       ]);
-      return stdout.trim();
+      return parsePaneSample(stdout);
     } catch {
-      return '';
+      return { ...UNKNOWN_PANE_SAMPLE };
     }
   }
 

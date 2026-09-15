@@ -14,6 +14,8 @@
  *   **exit 0 + 空输出**，静默无声，极难排查。
  */
 
+import { isClaudeCommand } from './claude';
+
 /** session 级目标，用于 has-session / kill-session */
 export function sessionTarget(name: string): string {
   return `=${name}`;
@@ -162,4 +164,83 @@ export function taskNameFromTitle(title: string): string {
   const followedByBreak = chars.length === 1 || /\s/.test(chars[1]);
   const name = (isIndicator && followedByBreak ? chars.slice(1).join('') : trimmed).trim();
   return name.length === 0 || name === DEFAULT_TASK_TITLE ? '' : name;
+}
+
+/**
+ * 一次 `display-message` 里两个字段之间的分隔符。
+ *
+ * **为什么不用控制字符（U+001F）—— 实测踩到的坑，勿改回去：** tmux 3.4 的
+ * `display-message -p` 会把格式串里出现的控制字符**转义成八进制字面量**再输出：
+ * 格式串里放一个真实的 0x1F，拿回来的却是四个可打印字符 `\037`（与直接在格式串
+ * 里写 `\037` 的输出逐字节相同）。于是「拿不可打印字符当分隔符」这条常规做法在
+ * 这里失效 —— 那个字节根本不会以它自己的身份出现在输出里。
+ *
+ * **可打印的定串 token 反而安全**，靠两层保证：
+ * 1. 它是 23 个字符的固定串，`pane_current_command`（进程 basename）不可能正好
+ *    含它 —— 而它是**唯一**能破坏切分的字段：parsePaneSample 只按**第一个**分隔符
+ *    切，标题是尾字段，即便自带同一个 token 也只伤到它自己那一段。
+ * 2. 实测 tmux 对可打印文本逐字节透传（中文、`|`、反斜杠都不动）。唯一会变的
+ *    是 `#{…}` 形态的元字符（会被再展开一次、整段消失）—— 那是**改前就有**的行为
+ *    （原 paneTitle 走同一条 display-message），与本次闸门无关。
+ */
+export const PANE_SAMPLE_SEPARATOR = '__tmuxterm_field_sep__';
+
+/** 一次采样拆出的两个字段（见 TmuxClient.paneSample）。 */
+export interface PaneSample {
+  /** 前台进程名 `#{pane_current_command}`；'' 表示未知。 */
+  foreground: string;
+  /** pane 标题 `#{pane_title}`；'' 表示未知。 */
+  title: string;
+}
+
+/** 采样读不出任何东西时的值：两个字段都是「未知」。 */
+export const UNKNOWN_PANE_SAMPLE: PaneSample = { foreground: '', title: '' };
+
+/**
+ * 解析 `#{pane_current_command}<PANE_SAMPLE_SEPARATOR>#{pane_title}` 的输出。
+ *
+ * 一次 display-message 同时取回两个字段，是为了**不额外多起一个 tmux 进程**：
+ * 采样循环每 ≈900 ms 对每个条目跑一次（extension.ts 的
+ * ACTIVITY_POLL_INTERVAL_MS），翻倍是这一层实打实的开销；何况两个字段本就来自
+ * 同一个 pane 的同一瞬间，分开取还多一个「命令与标题不同步」的窗口。
+ *
+ * **只按第一个分隔符切。** 万一标题自带同一个 token，按第一个切时它留在标题
+ * 那一段里、两个字段仍各归各位；命令字段被截短只会让 `isClaudeCommand` 判否
+ * —— 方向是「不显示任务名」，安全侧。
+ *
+ * **畸形响应（没有分隔符、空输出）返回两个空串**，不抛错、也不把整串当标题：
+ * 空输出正是 display-message 的 pane 目标写错时的形态（exit 0 + 空，见本文件
+ * 顶部注释），此时「未知」必须显式表达，由调用方按安全侧处理。
+ */
+export function parsePaneSample(stdout: string): PaneSample {
+  const text = stdout.trim();
+  const at = text.indexOf(PANE_SAMPLE_SEPARATOR);
+  if (at < 0) return { ...UNKNOWN_PANE_SAMPLE };
+  return {
+    foreground: text.slice(0, at).trim(),
+    title: text.slice(at + PANE_SAMPLE_SEPARATOR.length).trim(),
+  };
+}
+
+/**
+ * 一次采样 → 任务名：**pane 前台不是 claude 就不采信 pane title。**
+ *
+ * 没有这道闸门时，claude 一退出、pane 前台变回 shell，title 就成了
+ * `user@host:~/path` 这类提示符 —— `taskNameFromTitle` 按「pane title 权威」
+ * 原样保留它（那正是修首字符误剥时想要的行为），于是三级显示的是提示符，而
+ * **恰恰在此时最有用的** aiTitle 回退永远轮不到（spec §10 的取舍）。闸门把
+ * 「前台不是 claude」时的任务名压成空串，回退链（tree.ts 的 taskNameFor）
+ * 自然接手。
+ *
+ * 判据复用 `isClaudeCommand`（core/claude.ts）—— 「切模型/切 profile 会不会
+ * 把控制序列打进用户进程」用的就是它，问的是同一个问题，不另立第二套
+ * 「像不像 claude」的判定。
+ *
+ * **只闸任务名，不闸 running。** running 来自 `isRunningTitle` 对 Braille 分区
+ * （U+2800–U+28FF）的判断，claude 退出后 title 变回提示符，首字符不在那个分区，
+ * 本来就判否；把 running 也闸上等于改 done-unseen 状态机（core/activity.ts）
+ * 的输入，超出本次范围。
+ */
+export function taskNameFromSample(sample: PaneSample): string {
+  return isClaudeCommand(sample.foreground) ? taskNameFromTitle(sample.title) : '';
 }

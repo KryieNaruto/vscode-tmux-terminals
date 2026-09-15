@@ -43,8 +43,9 @@ export function activate(context: vscode.ExtensionContext): void {
   // 与 manager（reconcile 时 prewarm）。home 与 manager.home() 同源
   // （扩展进程里 os.homedir() 就是它）。
   const titles = new TaskTitleCache(os.homedir());
-  // TmuxClient 已经有 paneTitle(name) 方法，结构上满足 ActivityTracker
-  // 需要的最小接口，不需要额外适配。
+  // TmuxClient 已经有 paneSample(name) 方法（一次 display-message 同时取回
+  // 前台进程名与 pane title），结构上满足 ActivityTracker 需要的最小接口，
+  // 不需要额外适配。
   const tracker = new ActivityTracker(tmux);
   const provider = new EntryTreeProvider(store, tracker, titles);   // 渲染：peek
   const manager = new TerminalManager(store, tmux, titles);         // reconcile：prewarm
