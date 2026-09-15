@@ -154,13 +154,16 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   context.subscriptions.push(
-    view.onDidChangeVisibility(() => {
+    view.onDidChangeVisibility((e) => {
       restartPolling();
       restartActivityPolling();
       // 面板变为可见 = reconcile 的触发点之一。onDidExpandElement 单独用
       // 不够：它的语义是「**由用户**展开时」，而 FolderTreeItem 默认就是
       // Expanded，默认展开的文件夹节点不会发那个事件 —— 这里兜底。
-      void reconcileNow();
+      // ★ 必须判 `e.visible`：这个事件在**隐藏**时也发一次，而一次 reconcile
+      //   要跑 `tmux ls` + 每个活条目一次 display-message + 一次 prewarm。
+      //   隐藏不需要新观测（面板都看不见），那是纯浪费。
+      if (e.visible) void reconcileNow();
     }),
     // 用户展开节点（折叠后再展开 / 展开一个默认折叠的文件夹）= 触发点之一。
     // 刻意挂在事件上而不是 getChildren：900ms 的活动轮询会让根 getChildren
