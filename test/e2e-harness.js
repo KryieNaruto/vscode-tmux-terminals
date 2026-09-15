@@ -463,7 +463,7 @@ async function projectSnapshot() {
 
   const projectsBefore = await projectSnapshot();
 
-  // 清场：上一次跑残留的会话、假 HOME、假 claude、scratch 目录
+  // 清场：上一次跑残留的会话、假 HOME、假 claude、scratch 目录、假 claude 的 pid 文件
   await killAll(ALL);
   await detachRealClient();
   await fs.promises.rm(HOME, { recursive: true, force: true });
@@ -472,6 +472,16 @@ async function projectSnapshot() {
     await fs.promises.rm(d, { recursive: true, force: true });
     await fs.promises.mkdir(d, { recursive: true });
   }
+  // ★ pid 目录必须清空，且**不能**只在读取端兜底：`readFakePid` 是在发桩
+  // 之后**立刻**读的（早于新桩写盘），所以上一轮遗留的文件会先被读到。
+  // 后果有两条，第二条不可接受：
+  //   1. 陈旧 pid 交给 writeSessionRecord → 生产代码在真实进程表里找不到该
+  //      后代 → 19a/19c 以「绑定没刷成」的形式失败，报错指向 reconcile 而
+  //      不是夹具，排查方向被带偏；
+  //   2. killFakePids 会对**此刻占用该 pid 的任意进程**发 SIGKILL —— 本
+  //      harness 的契约是「用户环境必须不被触碰」（用户有活的 tmux 会话）。
+  // 异常退出（Ctrl-C 足够，末尾的 .catch 会跳过全部清理）正是残留的来源。
+  await fs.promises.rm(PID_DIR, { recursive: true, force: true });
   await fs.promises.mkdir(QUIET_BIN, { recursive: true });
   await fs.promises.mkdir(FAIL_BIN, { recursive: true });
   // 按绝对路径调用的假进程：cp 二进制，comm 就是文件名
@@ -1334,6 +1344,10 @@ async function projectSnapshot() {
     const launchBackgroundClaude = async (id, cwd) => {
       await tmux.newSession(S(id), cwd);
       await sleep(500);
+      // 先删同名文件：读发生在**发桩之后、新桩写盘之前**，不删就会把上一轮
+      // 遗留的 pid 当成这次的（进而绑到无关进程上、并被 killFakePids 误杀）。
+      // 跑前清场已清空整个 PID_DIR，这是同一隐患的第二道闸门。
+      await fs.promises.rm(path.join(PID_DIR, id), { force: true });
       await tmux.sendLiteral(S(id), `${FIXTURE_BG} ${path.join(PID_DIR, id)} &`);
       await tmux.sendEnter(S(id));
       return readFakePid(id);
@@ -1652,9 +1666,14 @@ async function projectSnapshot() {
   const stragglers = [];
   for (const name of await fs.promises.readdir(PID_DIR).catch(() => [])) {
     try {
-      const t = Number((await fs.promises.readFile(path.join(PID_DIR, name), 'utf8')).trim());
-      process.kill(t, 0);   // 不抛 = 还活着
-      stragglers.push(t);
+      const t = (await fs.promises.readFile(path.join(PID_DIR, name), 'utf8')).trim();
+      // 与 killFakePids 用同一个守卫：空文件 / 截断文件会得到
+      // `Number('') === 0`，而 `process.kill(0, 0)` 是「探测调用者自己的
+      // 进程组」且**不抛错** —— 于是 0 会被当成真泄漏塞进 stragglers，
+      // 让这条断言无故变红。
+      if (!/^\d+$/.test(t)) continue;
+      process.kill(Number(t), 0);   // 不抛 = 还活着
+      stragglers.push(Number(t));
     } catch { /* 已退出 */ }
   }
   chk('★ 假 claude 桩进程没有残留', stragglers.length === 0, stragglers.join(','));
