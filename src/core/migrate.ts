@@ -45,10 +45,16 @@ export function migrateEntry(raw: unknown, index: number): TerminalEntry | undef
     // 用户的绑定 —— 下一次恢复又变成「新建一条对话顶掉原来的」。
     // 缺字段/ 空串/ 非字符串一律视为**未绑定**：绝不编造一个 id。
     const conversationId = str(o.conversationId);
+    // 「上一次观测到的活跃会话」同样必须原样带过。漏这一行不是「字段丢了」
+    // 这么轻 —— migrateEntry 是 EntryStore.load() 的**唯一守门人**，漏掉它
+    // 等于每次 load 都把它静默吞掉，手动改绑保护随之失效，且没有任何报错。
+    // 缺字段 / 空串 / 非字符串一律视为「从未观测过」：绝不编造一个 id。
+    const liveSessionId = str(o.liveSessionId);
     return {
       id, name, cwd, profile,
       ...(model !== undefined && model.length > 0 ? { model } : {}),
       ...(conversationId !== undefined && conversationId.length > 0 ? { conversationId } : {}),
+      ...(liveSessionId !== undefined && liveSessionId.length > 0 ? { liveSessionId } : {}),
       autoRestore: o.autoRestore === true,
       order: typeof o.order === 'number' ? o.order : index,
     };

@@ -82,3 +82,39 @@ describe('conversationId 迁移 —— 保留已有绑定，绝不编造', () =>
     assert.strictEqual(migrateEntry({ ...base, conversationId: '' }, 0)?.conversationId, undefined);
   });
 });
+
+describe('liveSessionId 迁移 —— 只记录观测值，绝不编造', () => {
+  it('v2 条目带 liveSessionId → 原样保留（不能被迁移吞掉）', () => {
+    const id = '7af4c86a-ea5d-4f25-9d9c-8ba7e620a5a0';
+    const v2 = {
+      id: 'a', name: 'n', cwd: '/t', profile: 'ccr', autoRestore: true, order: 1,
+      conversationId: id, liveSessionId: id,
+    };
+    assert.strictEqual(migrateEntry(v2, 0)?.liveSessionId, id);
+  });
+
+  it('★ v2 条目没有 liveSessionId → 保持 undefined（语义正是「从未观测过」）', () => {
+    const v2 = { id: 'a', name: 'n', cwd: '/t', profile: 'ccr', autoRestore: true, order: 1 };
+    assert.strictEqual(migrateEntry(v2, 0)?.liveSessionId, undefined);
+  });
+
+  it('v1 条目（本来就没有这个概念）→ undefined', () => {
+    assert.strictEqual(migrateEntry(v1({ commands: [] }), 0)?.liveSessionId, undefined);
+  });
+
+  it('非字符串 / 空串的 liveSessionId 视为「从未观测过」（手改坏了不至于崩）', () => {
+    const base = { id: 'a', name: 'n', cwd: '/t', profile: 'ccr', autoRestore: true, order: 1 };
+    assert.strictEqual(migrateEntry({ ...base, liveSessionId: 42 }, 0)?.liveSessionId, undefined);
+    assert.strictEqual(migrateEntry({ ...base, liveSessionId: '' }, 0)?.liveSessionId, undefined);
+  });
+
+  it('liveSessionId 与 conversationId 各自独立带过（不互相覆盖）', () => {
+    const v2 = {
+      id: 'a', name: 'n', cwd: '/t', profile: 'ccr', autoRestore: true, order: 1,
+      conversationId: '手动选的', liveSessionId: '亲眼看到的',
+    };
+    const m = migrateEntry(v2, 0)!;
+    assert.strictEqual(m.conversationId, '手动选的');
+    assert.strictEqual(m.liveSessionId, '亲眼看到的');
+  });
+});
