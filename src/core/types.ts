@@ -30,6 +30,21 @@ export interface TerminalEntry {
    * 靠 `/resume` 翻列表根本分不清哪个终端对应哪条对话。
    */
   conversationId?: string;
+  /**
+   * 上一次**已确认观测到**的活跃会话 id。
+   *
+   * 与 `conversationId` 的区别是语义：`conversationId` 是「下次启动要接回
+   * 哪条」，可能来自自动观测、也可能来自用户手动改绑；本字段只记录「我们
+   * 亲眼看到这个终端在跑哪条会话」。
+   *
+   * 它存在的**唯一理由**是保护手动改绑：用户趁 claude 活着把绑定改成 X 时，
+   * 下一次 reconcile 会看到 live 仍是 Y —— 若只看 live，就会把 X 冲回 Y。
+   * 有了它，`live === liveSessionId` 即判为「没变化」，X 得以保留。
+   *
+   * 未设 = 从未观测过（老条目，或本功能上线后还没触发过一次 reconcile）。
+   * 只在观测到 live 变成**另一个**会话时才回写。
+   */
+  liveSessionId?: string;
   /** 是否参与「全部恢复」 */
   autoRestore: boolean;
   /** 拖拽排序序号，从 0 递增，不保证连续 */
