@@ -295,7 +295,10 @@ describe('taskNameFromSample —— pane 前台不是 claude 就不采信 pane t
     }
   });
 
-  it('★ 前台不是 claude 时，占位符与空标题同样不算任务名', () => {
+  // 回归护栏，**不是**判别性断言：这两个输入在改前（对 title 直接调
+  // taskNameFromTitle）本来就返回 ''，所以它在「拆掉闸门」的变异下照样绿。
+  // 它守的是「闸门没顺手把占位符/空标题变成别的值」这件事，别拿它去证明闸门存在。
+  it('前台不是 claude 时，占位符与空标题同样不算任务名', () => {
     assert.strictEqual(taskNameFromSample(s('bash', `✳ ${DEFAULT_TASK_TITLE}`)), '');
     assert.strictEqual(taskNameFromSample(s('bash', '')), '');
   });

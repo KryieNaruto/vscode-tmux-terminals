@@ -1,4 +1,7 @@
 import * as assert from 'assert';
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { TmuxClient } from '../src/tmuxClient';
@@ -121,6 +124,67 @@ describe('TmuxClient（集成，需要本机有 tmux）', function () {
       assert.strictEqual(s.title, 'qiansenwei@H:~/workspace', '标题应仍是提示符形状');
       assert.strictEqual(taskNameFromSample(s), '',
         '非 claude 前台不应采信 pane title（否则回退链接不上）');
+    });
+  });
+
+  describe('paneSample —— 每个条目每次采样只起一个 tmux 进程', () => {
+    // **为什么必须数进程，而不是数调用次数或看返回值：** 「一次 display-message
+    // 同时取回两个字段」这条约束，光断言返回值钉不住 —— 先取命令、再取标题、
+    // 然后合并的实现能通过全部返回值断言（连标题写着「一次调用」的那条也照样绿），
+    // 而它恰好就是这条约束要防的失败模式（每条目每采样一个进程 × ≈900ms × N 条目）。
+    // 这里把 tmuxPath 指向一个「记一行再转发给真 tmux」的壳，**实测到进程数为止**，
+    // 与上面 currentCommand 用真 tmux 钉 pane 目标那套是同一个路子。
+    let dir: string;
+    let log: string;
+    let wrapper: string;
+
+    before(async () => {
+      dir = await fs.mkdtemp(path.join(os.tmpdir(), 'tmuxterm-tmcalls-'));
+      log = path.join(dir, 'calls.log');
+      wrapper = path.join(dir, 'tmux-wrapper.sh');
+      const real = (await run('sh', ['-c', 'command -v tmux'])).stdout.trim();
+      assert.notStrictEqual(real, '', '找不到真 tmux，壳无从转发');
+      await fs.writeFile(wrapper, [
+        '#!/bin/sh',
+        '# 数进程用的壳：先往日志追加一行，再原样转发给真 tmux。',
+        `printf '%s\\n' "$*" >> '${log}'`,
+        `exec '${real}' "$@"`,
+        '',
+      ].join('\n'), 'utf8');
+      await fs.chmod(wrapper, 0o755);
+    });
+
+    after(async () => {
+      await fs.rm(dir, { recursive: true, force: true });
+    });
+
+    const calls = async (): Promise<string[]> =>
+      (await fs.readFile(log, 'utf8')).split('\n').filter((l) => l.trim().length > 0);
+
+    it('★ 一次 paneSample 恰好一个 tmux 进程，且这一次就把两个字段都取了', async () => {
+      await run('tmux', ['new-session', '-d', '-s', A]);
+      assert.strictEqual(await client.waitForShell(A, 3000), true);
+      await run('tmux', ['select-pane', '-t', `=${A}:`, '-T', 'ONE-CALL 探针']);
+      await fs.writeFile(log, '', 'utf8');
+
+      const counted = new TmuxClient(wrapper);
+      const s = await counted.paneSample(A);
+
+      const lines = await calls();
+      assert.strictEqual(lines.length, 1,
+        `一次 paneSample 应只起一个 tmux 进程，实际 ${lines.length} 次：${JSON.stringify(lines)}`);
+      // 两次 display-message（先命令、后标题）同样能满足上面的返回值断言 —— 故钉住
+      // 这**唯一**一次调用同时点名了两个字段。
+      assert.ok(
+        lines[0].includes('#{pane_current_command}') && lines[0].includes('#{pane_title}'),
+        `那一次调用必须同时取两个字段，实际：${lines[0]}`);
+      // 一次调用确实把两个字段都带回来了（值也要对，免得「一次调用但只取一个字段」蒙混）
+      assert.deepStrictEqual(s, { foreground: 'bash', title: 'ONE-CALL 探针' });
+
+      // 计数器自证：再来一次就应多一行。壳要是根本没记，上面那条会先红 —— 这条
+      // 用来证明「1 行」确实是「1 个进程」而不是「壳没工作」。
+      await counted.paneSample(A);
+      assert.strictEqual((await calls()).length, 2, '计数器没有随调用递增，上面那条断言就不可信');
     });
   });
 
