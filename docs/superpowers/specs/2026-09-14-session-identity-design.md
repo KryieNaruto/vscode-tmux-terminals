@@ -990,3 +990,27 @@ const manager = new TerminalManager(store, tmux, titles);         // reconcile�
 ## 11. 实施后修订
 
 （本节在实施完成后回填，记录与设计不符之处，沿用 v1 / v2 / tree-hierarchy 的做法）
+
+### 实施偏差（2026-09-14，Task 12 整体收尾时回填）
+
+1. **`readTail` / `TAIL_BYTES` 必须导出（§3.1 与本实现不自洽）** —— §3.1 的
+   代码块里两者都没写 `export`（本文件 `:605`、`:608`），但 §6.2（`:648`）
+   又要求 `TaskTitleCache` 调 `readTail(file, TAIL_BYTES)`，两者互斥。
+   实现以 §6.2 为准：`TAIL_BYTES` 与 `readTail` 都标为 `export`
+   （`src/conversationFiles.ts:75` / `:84`）。
+2. **e2e 桩脚本的 pid 落盘路径由命令参数传入，不再是 `$HOME/.e2e-fake-pid`**
+   —— §9（`:928`）写的是让桩把自己的 `$$` 写进 `$HOME/.e2e-fake-pid`。但
+   harness **从不覆写 `process.env.HOME`**（只把假 HOME 当参数传给被测代码），
+   照此实现会把 pid 文件写进**用户真实的家目录**。实现改为把绝对路径当
+   **参数**传给后台桩（`echo $$ > "$1"`），落点由调用方指定。
+3. **前台假 claude 用真二进制副本，不是 shebang 脚本** —— 前台桩用
+   `cp /bin/head` 得到的真二进制。shebang 脚本被 `execve` 之后，tmux 报告的
+   `#{pane_current_command}` 是**解释器**的 basename（`sh`），`isClaudeCommand`
+   会据此拒绝它，「前台是 claude」的用例根本立不起来。后台桩（只用来记
+   pid、不参与 `pane_current_command` 判据）仍是 shebang 脚本，不受影响。
+4. **`parseAiTitle` 的 `trim` 只用于判空、赋的仍是原值** —— 实现保持 §3.2 的
+   形态：`if (typeof t === 'string' && t.trim().length > 0) title = t`
+   （赋 `t` 而非 `t.trim()`），于是 `"  Foo  "` 会原样穿出。去空白改在**缓存
+   边界**做（`TaskTitleCache.load` 存 `title?.trim()`），顺带修掉「全空白被
+   当成有效标题缓存住」。`core/conversation.ts` 里的这条根因**有意不修**：
+   它是纯函数，改它会牵动既有 `parseAiTitle` 单测的语义，由消费侧归一化更局部。
