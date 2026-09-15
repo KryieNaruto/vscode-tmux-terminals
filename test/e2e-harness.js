@@ -263,6 +263,155 @@ async function writeConversation(uuid, cwd, summary, projectDir) {
 }
 
 /**
+ * 假 claude 的 pid 落盘目录。
+ * 每会话一个文件：桩脚本把自己的真实 pid 写进去，harness 读它 ——
+ * 那个 pid 就是生产代码将要在 `ps` 里看到的后代 pid。
+ */
+const PID_DIR = '/tmp/tmuxterm-e2e-pids';
+/**
+ * 后台假 claude 的**桩脚本**：写 pid 后 exec sleep，作为 pane shell 的真实
+ * 后代存活。脚本被 execve 后 tmux 看到的 command 是解释器 `sh`，但这不影响
+ * 19a/19c —— 它们只要求「pane 里有这个后代进程」，不要求前台是 claude。
+ */
+const FIXTURE_BG = path.join(BIN_DIR, 'claude-fixture-bg');
+/**
+ * 前台假 claude：**真二进制的副本**（`cp /bin/head`），**不是 shebang 脚本**。
+ *
+ * 必须是真二进制。shebang 脚本被 execve 之后，tmux 的
+ * `#{pane_current_command}` 取到的是**解释器**的 basename（本机 /bin/sh →
+ * dash → `sh`），于是：
+ *   - 19b 的前置断言（`front.startsWith('claude')`）直接红；
+ *   - `restartClaude` → `canSendControl`（terminalManager.ts:569-571）→
+ *     `isClaudeCommand`（core/claude.ts:14）判否 → `refuse()` 并
+ *     `return false`，一条命令都不会发 → 19b 四条断言全红。
+ * harness 既有惯例本就是真二进制的副本（`cp /bin/sleep /tmp/…/claude`，
+ * `cp /bin/head …/claude-once`，既有断言 `front === 'claude'`），这里沿用。
+ *
+ * 选 `/bin/head` 而非 `/bin/cat`：19b 要求它在收到 `/exit` 后**退出**，
+ * `restartClaude` 的 `waitForShell` 才过得去 —— `/bin/cat` 只在 stdin EOF
+ * 时退出，会一直挂着把这条用例卡死。`head -n 1` 读到一行（就是 `/exit`）
+ * 即退出，正好是原桩脚本 `read _line; exit 0` 的真二进制等价物。
+ *
+ * 名字以 `claude` 开头 → `isClaudeCommand` 认它；而它**不会**被 harness 的
+ * PATH 桩正则 `/(^|\s|\/)claude(-direct)?(\s|$)/` 命中 —— 该正则要求 `claude`
+ * 之后紧跟空白或行尾，而这里跟的是 `-fixture-fg`（已用 `node -e` 对该正则
+ * 实测核对：`/tmp/tmuxterm-e2e-bin/claude-fixture-fg /tmp/…` 不匹配），
+ * 故调用它不会被换成 PATH 桩，也不会触到真实的 /usr/bin/claude。
+ */
+const FIXTURE_FG = path.join(BIN_DIR, 'claude-fixture-fg');
+/** 兜底 D 的专用 cwd（那里只放一个条目）。 */
+const SOLE_CWD = '/tmp/tmuxterm-e2e-sole';
+
+/**
+ * 准备两个假 claude（都用**绝对路径**调用：不受 PATH 桩影响，名字以 claude
+ * 开头以便 isClaudeCommand 认它）：
+ * - `FIXTURE_BG` 是**桩脚本**（写 pid 后 exec sleep）：它自己就能把真实 pid
+ *   写进命令行给它的落盘路径，19a/19c 用 `readFakePid` 读。
+ * - `FIXTURE_FG` 是**真二进制的副本**（理由见常量注释）：它写不了 pid，19b
+ *   的 pid 只能启动后从 pane 反查（`foregroundPid`）。
+ */
+async function writeFixtures() {
+  await fs.promises.mkdir(BIN_DIR, { recursive: true });
+  await fs.promises.mkdir(PID_DIR, { recursive: true });
+  await fs.promises.writeFile(FIXTURE_BG, '#!/bin/sh\necho $$ > "$1"\nexec sleep 600\n', 'utf8');
+  await fs.promises.chmod(FIXTURE_BG, 0o755);
+  // 真二进制的副本：execve 之后 basename 即文件名本身 = claude-fixture-fg
+  await fs.promises.copyFile('/bin/head', FIXTURE_FG);
+  await fs.promises.chmod(FIXTURE_FG, 0o755);
+}
+
+/** 等桩脚本把 pid 写进 PID_DIR/<name>，返回它。超时返回 null。 */
+async function readFakePid(name) {
+  const file = path.join(PID_DIR, name);
+  for (let i = 0; i < 40; i++) {
+    try {
+      const t = (await fs.promises.readFile(file, 'utf8')).trim();
+      if (/^\d+$/.test(t)) return Number(t);
+    } catch { /* 还没写出来 */ }
+    await sleep(100);
+  }
+  return null;
+}
+
+/**
+ * 反查 pane 前台那个**真二进制**假 claude（`FIXTURE_FG`）的真实 pid ——
+ * 它自己写不了 pid 落盘文件。
+ *
+ * 路径：`#{pane_pid}`（外层 shell）→ 它的直接子进程即被 shell fork/exec 出来
+ * 的假 claude。实测：
+ *   `tmux display-message -p -t '=<session>:' '#{pane_pid}'` → shell 的 pid
+ *   `pgrep -P <pane_pid>` → 假 claude 的 pid
+ *
+ * 只在恰好一个子进程时返回它（多个就说明 pane 里不止这一个前台进程，宁可不猜）。
+ * 超时 / 查不到返回 null。
+ */
+async function foregroundPid(id) {
+  for (let i = 0; i < 40; i++) {
+    try {
+      const { stdout } = await run('tmux', [
+        'display-message', '-p', '-t', `=${S(id)}:`, '#{pane_pid}',
+      ]);
+      const panePid = Number(stdout.trim());
+      if (Number.isInteger(panePid) && panePid > 0) {
+        const kids = (await run('pgrep', ['-P', String(panePid)])).stdout.trim().split(/\s+/);
+        const pid = Number(kids[0]);
+        if (kids.length === 1 && Number.isInteger(pid) && pid > 0) return pid;
+      }
+    } catch { /* tmux / pgrep 还没就绪 */ }
+    await sleep(100);
+  }
+  return null;
+}
+
+/** 写注册表文件 ~/.claude/sessions/<pid>.json（生产代码唯一的注入点：home）。 */
+async function writeSessionRecord(pid, sessionId, cwd, startedAt) {
+  const dir = path.join(HOME, '.claude', 'sessions');
+  await fs.promises.mkdir(dir, { recursive: true });
+  await fs.promises.writeFile(
+    path.join(dir, `${pid}.json`),
+    JSON.stringify({ pid, sessionId, cwd, startedAt, status: 'busy', name: 'e2e', nameSource: 'derived' }),
+    'utf8',
+  );
+}
+
+/**
+ * 杀掉所有桩进程。
+ * 后台任务可能不在 pane 的**前台**进程组里，杀 tmux 会话不保证把它带走。
+ */
+async function killFakePids() {
+  for (const name of await fs.promises.readdir(PID_DIR).catch(() => [])) {
+    try {
+      const t = (await fs.promises.readFile(path.join(PID_DIR, name), 'utf8')).trim();
+      if (/^\d+$/.test(t)) process.kill(Number(t), 'SIGKILL');
+    } catch { /* 已经退出了 */ }
+  }
+}
+
+/**
+ * 造一个带 `aiTitle` 的 transcript（可选在 ai-title **之前**塞大量填充行，
+ * 用来证明「标题在文件尾部也能读到」）。`aiTitle` 为 undefined 时不写该行。
+ */
+async function writeTranscript(uuid, cwd, projectDir, aiTitle, paddingLines) {
+  const dir = path.join(HOME, '.claude', 'projects', projectDir);
+  await fs.promises.mkdir(dir, { recursive: true });
+  const lines = [
+    JSON.stringify({ type: 'mode', sessionId: uuid }),
+    JSON.stringify({ type: 'attachment', cwd }),
+    JSON.stringify({
+      type: 'user', userType: 'external', isSidechain: false, cwd,
+      message: { role: 'user', content: '占位摘要' },
+    }),
+  ];
+  for (let i = 0; i < paddingLines; i++) {
+    lines.push(JSON.stringify({ type: 'attachment', cwd, attachment: { i, pad: 'x'.repeat(200) } }));
+  }
+  if (aiTitle !== undefined) {
+    lines.push(JSON.stringify({ type: 'ai-title', sessionId: uuid, aiTitle }));
+  }
+  await fs.promises.writeFile(path.join(dir, `${uuid}.jsonl`), lines.join('\n'), 'utf8');
+}
+
+/**
  * 用户真实 ~/.claude/projects 的**文件级**快照（路径 → 体积/mtime）。
  *
  * 只比目录集合是不够的：真 claude 若跑在一个**已存在**的 project 目录下，
@@ -1175,9 +1324,340 @@ async function projectSnapshot() {
       treeStore.reorderCalls.length === 1, JSON.stringify(treeStore.reorderCalls));
   }
 
+  console.log('\n=== 19. 会话身份：/new 后自动改绑 + 切 profile 前先 reconcile ===');
+  {
+    await fs.promises.rm(SOLE_CWD, { recursive: true, force: true });
+    await fs.promises.mkdir(SOLE_CWD, { recursive: true });
+    await writeFixtures();
+
+    /** 起一个 pane，并在其中**后台**跑假 claude（前台仍是 shell，openEntry 才肯发命令）。 */
+    const launchBackgroundClaude = async (id, cwd) => {
+      await tmux.newSession(S(id), cwd);
+      await sleep(500);
+      await tmux.sendLiteral(S(id), `${FIXTURE_BG} ${path.join(PID_DIR, id)} &`);
+      await tmux.sendEnter(S(id));
+      return readFakePid(id);
+    };
+
+    // ---- 19a. /new 自愈：注册表记 sessionB、条目绑 sessionA ----
+    {
+      const id = 'e2eidentity1';
+      const sessionA = 'bbbbbbbb-0001-0000-0000-000000000000';
+      const sessionB = 'bbbbbbbb-0002-0000-0000-000000000000';
+      ALL.push(id);
+      // 只写 sessionB 的 .jsonl（不写 sessionA）：这样「没 reconcile」的旧行为
+      // 会发 --session-id sessionA，两个断言都会红 —— 回归强度更高。
+      await writeConversation(sessionB, BOUND_CWD, '/new 之后的新对话', PROJECT);
+      store.entries.push(mk(id, 'IDENTITY', BOUND_CWD, { conversationId: sessionA }));
+
+      const pid = await launchBackgroundClaude(id, BOUND_CWD);
+      chk('19a 前置条件：假 claude 已作为 pane 的后代在跑', typeof pid === 'number' && pid > 0, String(pid));
+      await writeSessionRecord(pid, sessionB, BOUND_CWD, 1789433265980);
+
+      resetCalls();
+      const mgr = newManager();
+      await mgr.openEntry(fresh(id));
+      await sleep(2500);
+
+      chk('19a ★ 绑定被刷成注册表里的新会话（/new 自愈）', bound(id) === sessionB, `实际 ${bound(id)}`);
+      chk('19a ★ liveSessionId 记为观测值', fresh(id).liveSessionId === sessionB, String(fresh(id).liveSessionId));
+      const sent = literalsTo(S(id));
+      chk('19a ★ 发出去的是 --resume 新会话，绝不是旧会话',
+        sent.some((t) => t.includes(`--resume '${sessionB}'`)) &&
+        !sent.some((t) => t.includes(`--resume '${sessionA}'`)) &&
+        !sent.some((t) => t.includes(`--session-id '${sessionA}'`)), JSON.stringify(sent));
+    }
+
+    // ---- 19b. 切 profile 前先 reconcile（restartClaude 是第二条 --resume 路径）----
+    {
+      const id = 'e2eidentity2';
+      const sessionA = 'bbbbbbbb-0003-0000-0000-000000000000';
+      const sessionB = 'bbbbbbbb-0004-0000-0000-000000000000';
+      ALL.push(id);
+      await writeConversation(sessionB, BOUND_CWD, '切 profile 时该接回的新对话', PROJECT);
+      store.entries.push(mk(id, 'IDENTITY2', BOUND_CWD, { conversationId: sessionA, model: 'deepseek-chat' }));
+
+      // 前台假 claude：**真二进制副本**（head -n 1），读到一行（就是 restartClaude
+      // 发来的 `/exit`）即退出 —— restartClaude 的 waitForShell 才过得去。
+      await tmux.newSession(S(id), BOUND_CWD);
+      await sleep(500);
+      await tmux.sendLiteral(S(id), `${FIXTURE_FG} -n 1`);
+      await tmux.sendEnter(S(id));
+      chk('19b 前置条件：pane 前台就是假 claude',
+        (await tmux.currentCommand(S(id))).startsWith('claude'), await tmux.currentCommand(S(id)));
+      // 前台夹具是真二进制、不会写 pid 落盘文件 —— 从 pane 反查它的真实 pid：
+      // `#{pane_pid}`（外层 shell）→ `pgrep -P` 给出被 exec 出来的假 claude。
+      const pid = await foregroundPid(id);
+      // 守卫不可省：foregroundPid 超时会返回 null，此时 writeSessionRecord 会写出
+      // 一个 `null.json` 注册表文件（生产代码永远读不到），真实失败原因被掩盖成
+      // 「绑定没刷成」，四条断言全红却指向错误的方向。
+      chk('19b 前置条件：反查到了假 claude 的真实 pid', typeof pid === 'number' && pid > 0, String(pid));
+      await writeSessionRecord(pid, sessionB, BOUND_CWD, 1789433265980);
+
+      resetCalls();
+      modalAnswer = '切换';
+      const mgr = newManager();
+      await mgr.setProfileInteractive(fresh(id));
+      modalAnswer = undefined;
+      await sleep(2500);
+
+      const sent = literalsTo(S(id));
+      chk('19b ★ 重启时接回的是注册表里的新会话（先 reconcile 再拼 --resume）',
+        sent.some((t) => t.includes(`--resume '${sessionB}'`)) &&
+        !sent.some((t) => t.includes(`--resume '${sessionA}'`)), JSON.stringify(sent));
+      chk('19b profile 已切换为 direct', fresh(id).profile === 'direct', String(fresh(id).profile));
+      chk('19b model 被清空', fresh(id).model === undefined, String(fresh(id).model));
+      chk('19b 绑定也同步刷成新会话', bound(id) === sessionB, String(bound(id)));
+    }
+
+    // ---- 19c. 手动改绑不被下一次 reconcile 冲掉 ----
+    {
+      const id = 'e2eidentity3';
+      const manual = 'bbbbbbbb-0005-0000-0000-000000000000';
+      const observed = 'bbbbbbbb-0006-0000-0000-000000000000';
+      ALL.push(id);
+      await writeConversation(manual, BOUND_CWD, '用户手动选的对话', PROJECT);
+      store.entries.push(mk(id, 'IDENTITY3', BOUND_CWD, { conversationId: manual, liveSessionId: observed }));
+
+      const pid = await launchBackgroundClaude(id, BOUND_CWD);
+      chk('19c 前置条件：假 claude 已作为 pane 的后代在跑', typeof pid === 'number' && pid > 0, String(pid));
+      await writeSessionRecord(pid, observed, BOUND_CWD, 1789433265980);
+
+      resetCalls();
+      const mgr = newManager();
+      await mgr.openEntry(fresh(id));
+      await sleep(2500);
+
+      chk('19c ★ 手动改绑的 conversationId 没有被冲回观测值',
+        bound(id) === manual, `实际 ${bound(id)}`);
+      chk('19c liveSessionId 保持为观测值', fresh(id).liveSessionId === observed, String(fresh(id).liveSessionId));
+      chk('19c 接回的仍是用户手动选的那条',
+        literalsTo(S(id)).some((t) => t.includes(`--resume '${manual}'`)), JSON.stringify(literalsTo(S(id))));
+    }
+
+    // ---- 19d. 观测不到就不动 ----
+    {
+      const id = 'e2eidentity4';
+      const bound0 = 'bbbbbbbb-0007-0000-0000-000000000000';
+      ALL.push(id);
+      await writeConversation(bound0, BOUND_CWD, '没有假 claude 在跑时该原样保留', PROJECT);
+      store.entries.push(mk(id, 'IDENTITY4', BOUND_CWD, { conversationId: bound0, liveSessionId: undefined }));
+
+      // 只有 bash：没有后代 claude，注册表里也没有它
+      await tmux.newSession(S(id), BOUND_CWD);
+      await sleep(500);
+
+      resetCalls();
+      const mgr = newManager();
+      await mgr.openEntry(fresh(id));
+      await sleep(2500);
+
+      chk('19d ★ 观测不到活跃会话 → 绑定一字未改（liveSessionId 仍是空）',
+        bound(id) === bound0 && fresh(id).liveSessionId === undefined,
+        `conv=${bound(id)} live=${fresh(id).liveSessionId}`);
+    }
+
+    // ---- 19e. 兜底 D 正面：单条目 + claude 已死 → 自动接回最新候选，不问 ----
+    {
+      const id = 'e2eidentity5';
+      ALL.push(id);
+      const older = 'bbbbbbbb-0008-0000-0000-000000000000';
+      const newer = 'bbbbbbbb-0009-0000-0000-000000000000';
+      await writeConversation(older, SOLE_CWD, '旧的', '-tmp-tmuxterm-e2e-sole');
+      await writeConversation(newer, SOLE_CWD, '新的', '-tmp-tmuxterm-e2e-sole');
+      // mtime 显式给定，排序才确定（同一毫秒内写两个文件时 mtime 可能相同）
+      const dir = path.join(HOME, '.claude', 'projects', '-tmp-tmuxterm-e2e-sole');
+      await fs.promises.utimes(path.join(dir, `${older}.jsonl`), 1_000_000, 1_000_000);
+      await fs.promises.utimes(path.join(dir, `${newer}.jsonl`), 2_000_000, 2_000_000);
+
+      const local = {
+        entries: [mk(id, 'SOLE', SOLE_CWD)],
+        async load() { return this.entries.map((e) => ({ ...e })); },
+        async update(entryId, patch) {
+          const i = this.entries.findIndex((e) => e.id === entryId);
+          if (i >= 0) this.entries[i] = { ...this.entries[i], ...patch };
+        },
+      };
+      await tmux.newSession(S(id), SOLE_CWD);   // 只有 bash：claude 已死
+      await sleep(500);
+
+      resetCalls();
+      const mgr = new TerminalManager(local, tmux);
+      mgr.home = () => HOME;
+      await mgr.openEntry(local.entries[0]);
+      await sleep(2500);
+
+      chk('19e ★ 单条目 + claude 已死 → 自动接回同 cwd 下 mtime 最新的对话',
+        literalsTo(S(id)).some((t) => t.includes(`--resume '${newer}'`)), JSON.stringify(literalsTo(S(id))));
+      chk('19e ★ 没有弹选择框（收窄后的 D 正是为了不问）', calls.quickPicks.length === 0,
+        JSON.stringify(calls.quickPicks.map((q) => q.opts && q.opts.title)));
+      chk('19e 绑定被落下（推断值）', local.entries[0].conversationId === newer,
+        String(local.entries[0].conversationId));
+      chk('19e ★ 推断不冒充观测：liveSessionId 保持未设',
+        local.entries[0].liveSessionId === undefined, String(local.entries[0].liveSessionId));
+    }
+
+    // ---- 19f. 兜底 D 反面：展开后同一个 cwd 的两个条目 → 不得启用 D ----
+    {
+      const idA = 'e2eidentity6';
+      const idB = 'e2eidentity7';
+      ALL.push(idA, idB);
+      // `~/shared` 与 `<HOME>/shared` 原始串不同、展开后是同一个目录
+      const realCwd = path.join(HOME, 'shared');
+      await fs.promises.mkdir(realCwd, { recursive: true });
+      const conv = 'bbbbbbbb-0010-0000-0000-000000000000';
+      await writeConversation(conv, realCwd, '共用目录下的对话', '-tmp-tmuxterm-e2e-home-shared');
+
+      const local = {
+        entries: [mk(idA, 'SHARED-A', '~/shared'), mk(idB, 'SHARED-B', realCwd)],
+        async load() { return this.entries.map((e) => ({ ...e })); },
+        async update(entryId, patch) {
+          const i = this.entries.findIndex((e) => e.id === entryId);
+          if (i >= 0) this.entries[i] = { ...this.entries[i], ...patch };
+        },
+      };
+      await tmux.newSession(S(idA), realCwd);
+      await sleep(500);
+
+      resetCalls();
+      quickPickAnswer = undefined;              // 用户按 Esc = 什么都不启动
+      const mgr = new TerminalManager(local, tmux);
+      mgr.home = () => HOME;
+      await mgr.openEntry(local.entries[0]);
+      await sleep(1500);
+
+      chk('19f ★ 展开后同 cwd 的两个条目 → D 不生效，退回弹选择框问用户',
+        calls.quickPicks.length === 1, JSON.stringify(calls.quickPicks.length));
+      chk('19f ★ 一条启动命令都没发', literalsTo(S(idA)).length === 0, JSON.stringify(literalsTo(S(idA))));
+      chk('19f 绑定未被改动', local.entries[0].conversationId === undefined,
+        String(local.entries[0].conversationId));
+    }
+
+    // ---- 19g. 复制条目：复制品不得继承 liveSessionId（不变量 3 在复制路径上的延伸）----
+    {
+      const id = 'e2eidentity8';
+      const observed = 'bbbbbbbb-0013-0000-0000-000000000000';
+      store.entries.push(mk(id, 'IDENTITY5', BOUND_CWD, { conversationId: observed, liveSessionId: observed }));
+
+      const mgr = newManager();
+      await mgr.duplicateEntry(fresh(id));
+      const copy = store.entries[store.entries.length - 1];
+
+      // 若 liveSessionId 随 ...rest 一起被复制：复制品一出生就带着源条目的
+      // 「已观测会话」，reconcileBinding 第二分支（live === liveSessionId）
+      // 会误判「没变化」而不改绑 —— 复制品永远跟着源条目那条会话走。
+      chk('19g ★ 复制品不带 liveSessionId（否则 reconcile 第二分支会误判「没变化」而不改绑）',
+        copy.liveSessionId === undefined, String(copy.liveSessionId));
+      chk('19g 复制品另有自己的 conversationId（不照抄源条目的绑定）',
+        typeof copy.conversationId === 'string' && copy.conversationId !== observed,
+        String(copy.conversationId));
+    }
+  }
+
+  console.log('\n=== 20. 任务名回退链：pane title → 绑定对话的 aiTitle → 不显示三级 ===');
+  {
+    const { EntryTreeProvider, TaskTreeItem } = require(path.join(ROOT, 'out/src/tree.js'));
+    const { TaskTitleCache } = require(path.join(ROOT, 'out/src/taskTitles.js'));
+    const { taskNameFromTitle } = require(path.join(ROOT, 'out/src/core/tmux.js'));
+
+    // 本节的接缝在**渲染层**：activity 用假的（pane title → taskName 那条链的
+    // 解析已被 test/core/tmux.test.ts 与 test/activityTracker.test.ts 覆盖，
+    // 且这段代码本次未改），titleFallback 用**真的** TaskTitleCache +
+    // **真的**磁盘 transcript —— 这才正好覆盖本次新增的 taskNameFor 回退逻辑。
+    const storeFor = (entry) => ({
+      entries: [entry],
+      async load() { return this.entries.map((e) => ({ ...e })); },
+      async reorder() {},
+    });
+    const noName = { activityFor: () => ({ state: 'idle', taskName: '' }) };
+
+    /**
+     * 记录 `peek` 收到的**全部实参**。
+     *
+     * 只断言 `peekIds.includes(<某个 id>)` 抓不到「用错键调用」——多传一个别的
+     * id 也照样命中 includes（Task 10 review 的教训）。这里断言**观测到的键集合**
+     * 本身：键必须从绑定的对话 id 派生，且绝不是条目 id / 会话名。
+     */
+    const watchPeek = (cache) => {
+      const keys = [];
+      const orig = cache.peek.bind(cache);
+      cache.peek = (id) => { keys.push(id); return orig(id); };
+      return keys;
+    };
+    /** 键集合的断言：每一个键都从 convId 派生，且没有一个等于条目 id / 会话名。 */
+    const keysOk = (keys, convId, entryId, entryName) =>
+      keys.length > 0 &&
+      keys.every((k) => typeof k === 'string' && k.startsWith(convId)) &&
+      !keys.some((k) => k === entryId || k === entryName || k === `tmuxterm-${entryId}`);
+
+    // ---- 20a. 无 pane 任务名 → 回退到绑定对话的 aiTitle（且要读文件尾部）----
+    const conv = 'bbbbbbbb-0011-0000-0000-000000000000';
+    const aiTitle = '创建多引擎版 /ask 命令并统一';
+    await writeTranscript(conv, BOUND_CWD, PROJECT, aiTitle, 2000);   // >64KB，标题只在尾部
+    const titles = new TaskTitleCache(HOME);
+    titles.prewarm(conv, BOUND_CWD);
+    await sleep(300);
+    chk('20a 前置条件：aiTitle 已从 transcript **尾部**取到（文件 >64KB）',
+      titles.peek(conv) === aiTitle, JSON.stringify(titles.peek(conv)));
+
+    const peekIds = watchPeek(titles);
+    const p1 = new EntryTreeProvider(storeFor(mk('t-title1', 'T1', BOUND_CWD, { conversationId: conv })), noName, titles);
+    const node1 = (await p1.getChildren((await p1.getChildren(undefined))[0]))[0];
+    chk('20a ★ 三级回退到绑定对话的 aiTitle', node1.taskName === aiTitle, JSON.stringify(node1.taskName));
+    chk('20a 二级 collapsibleState = Expanded (2)', node1.collapsibleState === 2, String(node1.collapsibleState));
+    const third1 = await p1.getChildren(node1);
+    chk('20a 三级节点标签就是 aiTitle',
+      third1.length === 1 && third1[0] instanceof TaskTreeItem && third1[0].label === aiTitle,
+      JSON.stringify(third1.map((t) => t.label)));
+    chk('20a ★ peek 的键集合全部从绑定对话 id 派生（不是条目 id / 会话名 / 显示名）',
+      keysOk(peekIds, conv, 't-title1', 'T1'), JSON.stringify(peekIds));
+
+    // ---- 20b. transcript 里没有 aiTitle → 不生成三级 ----
+    const convEmpty = 'bbbbbbbb-0012-0000-0000-000000000000';
+    await writeTranscript(convEmpty, BOUND_CWD, PROJECT, undefined, 10);
+    const titles2 = new TaskTitleCache(HOME);
+    titles2.prewarm(convEmpty, BOUND_CWD);
+    await sleep(300);
+    const peekIds2 = watchPeek(titles2);
+    const p2 = new EntryTreeProvider(storeFor(mk('t-title2', 'T2', BOUND_CWD, { conversationId: convEmpty })), noName, titles2);
+    const node2 = (await p2.getChildren((await p2.getChildren(undefined))[0]))[0];
+    chk('20b ★ 都无从得知时 taskName 为空串（不用灰色占位/derived slug 冒充）',
+      node2.taskName === '', JSON.stringify(node2.taskName));
+    chk('20b 二级 collapsibleState = None (0)', node2.collapsibleState === 0, String(node2.collapsibleState));
+    chk('20b ★ 不生成三级节点', (await p2.getChildren(node2)).length === 0);
+    chk('20b ★ 负例下 peek 的键集合同样从绑定对话 id 派生',
+      keysOk(peekIds2, convEmpty, 't-title2', 'T2'), JSON.stringify(peekIds2));
+
+    // ---- 20c. 首字符回归：shell 自己设的标题不得被削 ----
+    const shellTitle = 'qiansenwei@H:~/workspace';
+    const parsed = taskNameFromTitle(shellTitle);
+    chk('20c 前置条件：shell 标题解析后原样保留', parsed === shellTitle, JSON.stringify(parsed));
+    const p3 = new EntryTreeProvider(
+      storeFor(mk('t-title3', 'T3', BOUND_CWD, { conversationId: conv })),
+      { activityFor: () => ({ state: 'idle', taskName: parsed }) },
+      titles,
+    );
+    const node3 = (await p3.getChildren((await p3.getChildren(undefined))[0]))[0];
+    chk('20c ★ pane title 优先，三级显示原文', node3.taskName === shellTitle, JSON.stringify(node3.taskName));
+    const third3 = await p3.getChildren(node3);
+    chk('20c 三级节点标签是原文',
+      third3.length === 1 && third3[0].label === shellTitle, JSON.stringify(third3.map((t) => t.label)));
+  }
+
   console.log('\n=== 15. 清理 + 用户环境未被触碰 ===');
   await detachRealClient();
   await killAll(ALL);
+  await killFakePids();     // 后台桩可能不在 pane 前台进程组里，杀会话不保证带走
+  await sleep(500);         // 给 init 一点时间回收僵尸
+  const stragglers = [];
+  for (const name of await fs.promises.readdir(PID_DIR).catch(() => [])) {
+    try {
+      const t = Number((await fs.promises.readFile(path.join(PID_DIR, name), 'utf8')).trim());
+      process.kill(t, 0);   // 不抛 = 还活着
+      stragglers.push(t);
+    } catch { /* 已退出 */ }
+  }
+  chk('★ 假 claude 桩进程没有残留', stragglers.length === 0, stragglers.join(','));
   const left = (await tmux.listSessions()).filter((s) => s.startsWith('tmuxterm-e2e'));
   chk('无残留测试会话', left.length === 0, left.join(', '));
 
@@ -1203,7 +1683,7 @@ async function projectSnapshot() {
   const fakeHomeBefore = fs.existsSync(HOME);
   await fs.promises.rm(HOME, { recursive: true, force: true });
   await fs.promises.rm(BIN_DIR, { recursive: true, force: true });
-  for (const d of [SCRATCH, CONV_CWD, BOUND_CWD]) {
+  for (const d of [SCRATCH, CONV_CWD, BOUND_CWD, SOLE_CWD, PID_DIR]) {
     await fs.promises.rm(d, { recursive: true, force: true });
   }
   chk('假 HOME / 假 claude / scratch 目录已清理',
