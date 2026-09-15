@@ -77,7 +77,16 @@ describe('pickLiveSession', () => {
   });
 
   it('★ 同 sessionId 的多个候选（实测的孤儿场景）取谁都是同一条', () => {
-    const got = pickLiveSession([r(287756, 'same', 1789279289648), r(3776947, 'same', 1789433265980)]);
+    const pair = [r(287756, 'same', 1789279289648), r(3776947, 'same', 1789433265980)];
+    const got = pickLiveSession(pair);
     assert.strictEqual(got?.sessionId, 'same');
+    // ★ 只断 sessionId 是**非判别性**的：两个候选的 sessionId 都是 'same'，
+    //   任何「随便取一个」的实现都能过。补上只有 tie-break 正确才成立的
+    //   断言 —— 两个 pid 的 startedAt 相差约 43 小时，取的是更晚的那个；
+    //   并且**两种输入顺序都断**，这样「取第一个」与「取最后一个」的实现
+    //   都会被挡下（前者在下面的正向、后者在反向）。
+    assert.strictEqual(got?.pid, 3776947);
+    assert.strictEqual(got?.startedAt, 1789433265980);
+    assert.strictEqual(pickLiveSession([...pair].reverse())?.pid, 3776947);
   });
 });

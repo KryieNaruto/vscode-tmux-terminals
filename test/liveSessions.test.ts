@@ -90,6 +90,17 @@ describe('liveSessionIn —— 从快照解析某个 pane 下「最后用过的�
     assert.strictEqual(liveSessionIn(s, 100)?.sessionId, '新');
   });
 
+  it('★ 注册表表顺序与 startedAt 相反时仍取最新（挡住「取最后一个候选」）', () => {
+    // 上面那条里 pid 201 既是最新、又恰好排在表尾 —— 「取最后一个候选」的
+    // 实现照样能过。这条把两者掰开：表里 201 在前、200 在后，而 startedAt
+    // 是 201 更旧、200 更新。只有真按 startedAt 挑才答得出「新」。
+    const s = snap([[100, 1], [200, 100], [201, 100]], [[201, '旧', 100], [200, '新', 200]]);
+    assert.strictEqual(liveSessionIn(s, 100)?.sessionId, '新');
+    // 反向再断一次：输入顺序怎么摆，答案都该是 200。
+    const flipped = snap([[100, 1], [201, 100], [200, 100]], [[200, '新', 200], [201, '旧', 100]]);
+    assert.strictEqual(liveSessionIn(flipped, 100)?.sessionId, '新');
+  });
+
   it('pane 无后代 → undefined', () => {
     assert.strictEqual(liveSessionIn(snap([[100, 1]], [[200, 'sess', 10]]), 100), undefined);
   });
