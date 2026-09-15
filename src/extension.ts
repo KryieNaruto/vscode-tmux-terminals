@@ -109,9 +109,15 @@ export function activate(context: vscode.ExtensionContext): void {
     if (activityInFlight) return;
     activityInFlight = true;
     try {
+      // 闸门必须来自**权威的 tmux 查询**，不能用 provider.isAlive：后者由
+      // 10s 的存活轮询填充，而 poll() 有 inFlight 守卫 —— 激活时两个
+      // restart* 并发启动，pollActivity 刚跑时第一次 listSessions 还没回来，
+      // 于是第一轮 aliveIds 恒为空、一个条目都不采（实测症状）。
+      const sessions = new Set(await tmux.listSessions());
+      provider.setAlive(sessions); // 顺带把树的存活标记推到最新（setAlive 只在变化时 fire）
       const entries = await store.load();
       const aliveIds = entries
-        .filter((e) => provider.isAlive(sessionNameFor(e.id)))
+        .filter((e) => sessions.has(sessionNameFor(e.id)))
         .map((e) => e.id);
       await tracker.poll(aliveIds);
     } finally {
@@ -128,11 +134,38 @@ export function activate(context: vscode.ExtensionContext): void {
     void pollActivity();
   };
 
+  // ---- 会话身份：reconcile 的触发点（不引入定时器，见 spec §4.3）----
+  // 五个触发点：激活（本文件的末尾）、⟳ 刷新（下面的 refresh 命令）、
+  // 点击条目（TerminalManager.openEntry）、切 profile
+  // （TerminalManager.restartClaude）、展开树 / 面板变为可见（下面的订阅）。
+  // 观测的驱动者只有这一处：provider 不持有 reconciler。
+  let reconcileInFlight: Promise<boolean> | undefined;
+  const reconcileNow = (): Promise<boolean> => {
+    if (reconcileInFlight === undefined) {
+      reconcileInFlight = (async () => {
+        try {
+          return await manager.reconcileAll(await store.load());
+        } finally {
+          reconcileInFlight = undefined; // 本轮结束才允许下一轮
+        }
+      })();
+    }
+    return reconcileInFlight;
+  };
+
   context.subscriptions.push(
     view.onDidChangeVisibility(() => {
       restartPolling();
       restartActivityPolling();
+      // 面板变为可见 = reconcile 的触发点之一。onDidExpandElement 单独用
+      // 不够：它的语义是「**由用户**展开时」，而 FolderTreeItem 默认就是
+      // Expanded，默认展开的文件夹节点不会发那个事件 —— 这里兜底。
+      void reconcileNow();
     }),
+    // 用户展开节点（折叠后再展开 / 展开一个默认折叠的文件夹）= 触发点之一。
+    // 刻意挂在事件上而不是 getChildren：900ms 的活动轮询会让根 getChildren
+    // 每秒跑一次，挂在那里等于引入一个隐式定时器。
+    view.onDidExpandElement(() => void reconcileNow()),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('tmuxTerminals')) restartPolling();
     }),
@@ -144,6 +177,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   restartPolling();
   restartActivityPolling();
+  void reconcileNow(); // 触发点之一：扩展激活
 
   // ---- 命令注册 ----
   const item = (arg: unknown): EntryTreeItem | TaskTreeItem | undefined =>
@@ -238,6 +272,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   reg('tmuxTerminals.refresh', async () => {
+    await reconcileNow(); // 触发点之一：用户按 ⟳「只重查存活状态」
     await poll();
     provider.refresh();
   });
