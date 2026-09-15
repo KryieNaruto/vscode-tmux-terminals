@@ -4,6 +4,7 @@ import {
   isShellReady,
   paneTarget,
   parseAttachedCount,
+  parsePid,
   parseSessionList,
   sessionTarget,
 } from './core/tmux';
@@ -57,6 +58,25 @@ export class TmuxClient {
         'display-message', '-p', '-t', paneTarget(name), '#{session_attached}',
       ]);
       return parseAttachedCount(stdout);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 取 pane 的 pid（外层 shell）。读不出返回 null —— 与 attachedClients
+   * 同一套「未知 ≠ 0」约定。
+   *
+   * 这是「这个终端此刻在用哪条 claude 会话」这条链的起点：pane_pid →
+   * 后代 claude 进程 → `~/.claude/sessions/<pid>.json` → sessionId。
+   * 目标同样必须走 paneTarget（`=名字:`），漏冒号时 tmux 是 exit 0 + 空输出。
+   */
+  async panePid(name: string): Promise<number | null> {
+    try {
+      const { stdout } = await run(this.tmuxPath, [
+        'display-message', '-p', '-t', paneTarget(name), '#{pane_pid}',
+      ]);
+      return parsePid(stdout);
     } catch {
       return null;
     }
