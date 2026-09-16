@@ -2670,6 +2670,107 @@ async function projectSnapshot() {
     await fs.promises.rm(COLOR_DIR, { recursive: true, force: true });
   }
 
+  console.log('\n=== 31. 批量面板：按文件夹分组 + 一级全选 ===');
+  {
+    const { BatchTreeProvider, BatchFolderItem, BatchTreeItem } =
+      require(path.join(ROOT, 'out/src/batchTree.js'));
+
+    const BATCH_A = '/tmp/tmuxterm-e2e-batch-a';
+    const BATCH_B = '/tmp/tmuxterm-e2e-batch-b';
+    const batchStore = {
+      entries: [
+        mk('b-a1', 'A1', BATCH_A),
+        mk('b-a2', 'A2', BATCH_A),
+        mk('b-a3', 'A3', BATCH_A),
+        mk('b-b1', 'B1', BATCH_B),
+      ],
+      async load() { return this.entries.map((e) => ({ ...e })); },
+    };
+    const bp = new BatchTreeProvider(batchStore);
+
+    /** 重新渲染一级后取回某个文件夹节点（三态图标与命令参数都在它身上）。 */
+    const folder = async (cwd) =>
+      (await bp.getChildren(undefined)).find((n) => n instanceof BatchFolderItem && n.cwd === cwd);
+    const ids = () => [...bp.selectedIds()].sort().join(',');
+    const iconOf = (n) => n.iconPath && n.iconPath.id;
+
+    const roots = await bp.getChildren(undefined);
+    const fA = roots.find((n) => n.cwd === BATCH_A);
+    const fB = roots.find((n) => n.cwd === BATCH_B);
+
+    chk('31a ★ 一级 = batchFolder，label 是完整 cwd，id 是确定性纯函数 folder:<cwd>',
+      fA instanceof BatchFolderItem && fB instanceof BatchFolderItem &&
+      fA.contextValue === 'batchFolder' && fA.label === BATCH_A &&
+      fA.id === `folder:${BATCH_A}` && fA.collapsibleState === 2,
+      `${fA.contextValue} / ${fA.label} / ${fA.id} / ${fA.collapsibleState}`);
+    chk('31b ★ 一级的 command = batchToggleFolder，参数是渲染时算好的该组全部子 id',
+      fA.command.command === 'tmuxTerminals.batchToggleFolder' &&
+      Array.isArray(fA.command.arguments[0]) &&
+      fA.command.arguments[0].join(',') === 'b-a1,b-a2,b-a3',
+      JSON.stringify(fA.command));
+    chk('31c 组的选中态为空 → 一级图标是空心圈（三态的 none）',
+      iconOf(fA) === 'circle-large-outline' && iconOf(fB) === 'circle-large-outline',
+      `${iconOf(fA)} / ${iconOf(fB)}`);
+
+    const aChildren = await bp.getChildren(fA);
+    chk('31d ★ 二级仍是 batchItem（不带三级），点击 = batchToggle；描述换成 profile',
+      aChildren.length === 3 &&
+      aChildren.every((c) => c instanceof BatchTreeItem && c.contextValue === 'batchItem' &&
+        c.command.command === 'tmuxTerminals.batchToggle') &&
+      aChildren[0].description === 'ccr',
+      JSON.stringify(aChildren.map((c) => [c.contextValue, c.description])));
+
+    // ---- 31e / 31f. 点一级：全选 ↔ 全不选 ----
+    bp.toggleFolder(fA.command.arguments[0]);
+    const fAAll = await folder(BATCH_A);
+    chk('31e ★ 点一级 → 该组三条全选中，一级图标变实心勾',
+      iconOf(fAAll) === 'check' && ids() === 'b-a1,b-a2,b-a3',
+      `${iconOf(fAAll)} / ${ids()}`);
+    bp.toggleFolder(fAAll.command.arguments[0]);
+    const fANone = await folder(BATCH_A);
+    chk('31f ★ 再点一级 → 全不选（不是又一次全选）',
+      iconOf(fANone) === 'circle-large-outline' && ids() === '',
+      `${iconOf(fANone)} / ${ids()}`);
+
+    // ---- 31g. 部分选中 → 点一级 → **补齐全选**（最容易写成「全不选」的一条）----
+    bp.toggle('b-a2');
+    const fAPartial = await folder(BATCH_A);
+    chk('31g0 组内只选中一条 → 一级图标是 partial（dash）',
+      iconOf(fAPartial) === 'dash', String(iconOf(fAPartial)));
+    bp.toggleFolder(fAPartial.command.arguments[0]);
+    const fAFull = await folder(BATCH_A);
+    chk('31g ★ 部分选中时点一级 → 补齐成全选（组内三条全在，而不是被清空）',
+      iconOf(fAFull) === 'check' && ids() === 'b-a1,b-a2,b-a3',
+      `${iconOf(fAFull)} / ${ids()}`);
+
+    // ---- 31h. 组外条目不受影响 ----
+    bp.toggle('b-b1');                                  // 此刻 A 三条 + B 一条
+    bp.toggleFolder(fAFull.command.arguments[0]);        // A 是全选 → 这次只该清掉 A
+    chk('31h ★ 整组切换只动组内 id：组外那条原样保留',
+      ids() === 'b-b1', ids());
+
+    // ---- 31i. prune：条目被删除后从选中集合剔除（既有行为不许回归）----
+    bp.toggleFolder((await folder(BATCH_A)).command.arguments[0]);   // A 补齐全选
+    const beforePrune = ids();
+    batchStore.entries = batchStore.entries.filter(
+      (e) => e.id !== 'b-a2' && e.id !== 'b-b1',
+    );
+    const rootsAfter = await bp.getChildren(undefined);
+    chk('31i ★ 条目被删除后从选中集合剔除（prune 不许回归）',
+      beforePrune === 'b-a1,b-a2,b-a3,b-b1' && ids() === 'b-a1,b-a3',
+      `prune 前=${beforePrune} 后=${ids()}`);
+    chk('31j 条目删空的分组整个从面板消失（不留下拉不开的空组）',
+      rootsAfter.length === 1 && rootsAfter[0].cwd === BATCH_A,
+      JSON.stringify(rootsAfter.map((n) => n.cwd)));
+    chk('31k ★ entriesFor 仍按 id 取回完整条目（三个批量命令的输入契约不变）',
+      (() => {
+        const got = bp.entriesFor(bp.selectedIds());
+        return got.length === 2 && got.every((e) => Array.isArray(e.sessions)) &&
+          got.map((e) => e.id).sort().join(',') === 'b-a1,b-a3';
+      })(),
+      JSON.stringify(bp.entriesFor(bp.selectedIds()).map((e) => e.id)));
+  }
+
   console.log('\n=== 15. 清理 + 用户环境未被触碰 ===');
   await detachRealClient();
   await killAll(ALL);

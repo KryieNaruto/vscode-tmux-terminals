@@ -440,6 +440,16 @@ export function activate(context: vscode.ExtensionContext): void {
     if (typeof id === 'string') batchProvider.toggle(id);
   });
 
+  // 一级（`contextValue === 'batchFolder'`）的标题点击：一次切一整组。参数是
+  // **渲染时算好的子 id 数组**，不是 cwd —— 让命令自己去 load 会开出一个时间窗：
+  // 用户点了「全选」，补进来的却是这一瞬间刚被别处删掉的条目（SPEC §9.2）。
+  // 因此 `batchFolder` 这一级不需要（也不该）有菜单项：它唯一的动作就是点击。
+  reg('tmuxTerminals.batchToggleFolder', (ids: unknown) => {
+    if (Array.isArray(ids) && ids.every((v) => typeof v === 'string')) {
+      batchProvider.toggleFolder(ids as string[]);
+    }
+  });
+
   reg('tmuxTerminals.batchClear', () => batchProvider.clear());
 
   reg('tmuxTerminals.batchSetDirect', async () => {
