@@ -100,12 +100,39 @@ export function activate(context: vscode.ExtensionContext): void {
   // 已有 .bak 不覆盖 —— 第一次的备份才是原始数据。备份失败只静默：读文件
   // 已成功，这里只兜 .bak 写不进去的情况，绝不让一次备份失败阻断扩展启动
   // 或抛出未处理的 rejection。
+  // 提示里报**实际的 basename**，不写死 `terminals.json`：`storagePath` 是可
+  // 配置的（见 storageFile()），配了路径时写死就是在指着一个不存在的地方让
+  // 用户去找备份。
   void store
     .migrateAndBackup()
     .then((did) => {
       if (did) {
         void vscode.window.showInformationMessage(
-          '终端清单已升级到新格式，原文件已备份为 terminals.json.bak。',
+          `终端清单已升级到新格式，原文件已备份为 ${path.basename(storageFile())}.bak。`,
+        );
+      }
+    })
+    .catch(() => {
+      // 忽略：备份只是防御手段，失败不影响正常使用。
+    });
+
+  // v2 形态的迁移（多会话模型）同理，但**备份名必须带版本号**。理由在
+  // store.ts 那个入口的注释里说死了：不带版本号的话，这一处会撞上 v1 那次
+  // 留下的「.bak 已存在 → 不覆盖」判断而被静默跳过 —— 结果是更晚、更接近
+  // 现状的那份状态反而没被保住。两个入口因此并列、互不覆盖：v1 文件只出
+  // `.bak`，v2 文件只出 `.v2.bak`。
+  //
+  // **少了这一处调用，`.v2.bak` 永远不会生成，而且是纯静默的**：备份函数
+  // 自己不报错，迁移也照常（load() 在内存里升到 v3，条目与绑定都在），只是
+  // 清单会在用户第一次真实改动时被直接改写成 v3 —— 那份「升级前的原文」
+  // 就此永远拿不到，而它正是引入带版本号备份的全部意义。
+  // 失败同样只静默，理由与上面一处相同。
+  void store
+    .migrateAndBackupV2()
+    .then((did) => {
+      if (did) {
+        void vscode.window.showInformationMessage(
+          `终端清单已升级到新格式，原文件已备份为 ${path.basename(storageFile())}.v2.bak。`,
         );
       }
     })
