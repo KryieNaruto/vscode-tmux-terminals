@@ -593,6 +593,68 @@ docs: README 与冒烟清单跟随多会话模型
 
 ---
 
+## Task 6b — 补接线：`migrateAndBackupV2()` 必须真的被 `activate()` 调用
+
+**Task 3 的派发漏了这一条**（SPEC §5.4 明写「`extension.ts` 两处都调，各自弹一条
+提示」，而 Task 3 的步骤/Expected 都没提它）。T6 写文档时按 SPEC 写了
+「升级会生成 `terminals.json.v2.bak`」，于是把实现缺口暴露了出来。
+
+**现状**：`grep -rn "migrateAndBackupV2" src/` → **只有定义，没有任何调用点**；
+它只被 `test/core/store.test.ts` 与 `test/e2e-harness.js` 直接调用。
+`extension.ts:104` 只调了 v1 的 `migrateAndBackup()`。
+
+**后果（不是「数据丢了」那么重，但确实是安全网没打开）**：真机从 0.1.x 升上来时
+迁移本身正常（`load()` 在内存里升到 v3，条目与绑定都在），但**不会生成
+`<file>.v2.bak`**，而清单文件会在用户第一次真实改动时被直接改写成 v3 ——
+也就是说**用户永远拿不到那份「升级前的原文」备份**。SPEC §5.4 引入
+`.v2.bak` 的全部意义就是这个备份，没接线等于这条设计没落地。
+
+### 文件
+- `src/extension.ts`（加一处调用 + 一条提示）
+- `test/manifest.test.ts`（加一条**接线**断言，见下）
+
+### 步骤
+
+1. `extension.ts` 里紧跟现有那次 `migrateAndBackup()` 之后，同样地调一次
+   `store.migrateAndBackupV2()` 并弹一条提示（沿用现有链式写法与「失败只静默」
+   的处理：读文件已成功，备份写不进去不该阻断扩展启动或抛出未处理的 rejection）。
+   提示里的备份文件名**要用实际的 basename**（`storagePath` 可配置，写死
+   `terminals.json.v2.bak` 在配了路径时就是假话）；顺手把 v1 那条也改成 basename
+   同款（**可选**，但两处风格应一致）。
+2. **在 `test/manifest.test.ts` 里加一条接线断言**：`EntryStore` 上**每一个**
+   迁移入口（`migrateAndBackup`、`migrateAndBackupV2`）都必须能在 `extension.ts`
+   里找到调用点。
+
+   > 这条断言**是静态的，但正合该文件的本分**：`manifest.test.ts` 现有用例里
+   > 已经有一条同型的「这些配置项已声明但从未被读取」（grep `EXTENSION_SRC`
+   > 里的 `.get<...>('key')`）。**「一个防御性设施写好了却没人调用」这类 bug
+   > 单元测试天然看不见**（方法本身被测得很绿），只有接线层的断言能抓住 ——
+   > 本次这个缺口就是活证据。
+
+### Expected
+- `grep -rn "migrateAndBackupV2" src/` → **有 `extension.ts` 的调用点**（不再是
+  只有定义）。
+- `npm test` 全绿、用例数**只增不减**；`npm run e2e` 全绿、断言数不减。
+- **变异确认**：把 `extension.ts` 里那行调用删掉 → 新增的接线断言必须**变红**。
+  贴出证据后回退。
+
+### 提交
+
+```
+fix: 接线 v2 迁移备份（extension.ts 从没调过 migrateAndBackupV2）
+
+SPEC §5.4 要求两处迁移入口都由 activate() 调用，实现只调了 v1 那个 ——
+v2 入口只被测试直接调过。后果是升级时不会生成 <file>.v2.bak：迁移本身
+正常（load 在内存里升到 v3，条目与绑定都在），但用户拿不到那份「升级前
+的原文」备份，而清单文件会在首次改写时直接变成 v3。
+
+顺带在 manifest.test.ts 加一条接线断言：EntryStore 的每个迁移入口都必须在
+extension.ts 里有调用点。「防御性设施写好了没人调用」是单元测试天然看不见
+的一类 bug，该文件里已有一条同型的配置项断言。
+```
+
+---
+
 ## Task 7 — 独立验证 + 发布 v0.2.0
 
 **这一步由主线自己做，不派 executor。** 先派 verifier 做独立核验，
