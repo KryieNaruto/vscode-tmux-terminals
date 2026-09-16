@@ -358,6 +358,12 @@ const FIXTURE_FG = path.join(BIN_DIR, 'claude-fixture-fg');
 const SOLE_CWD = '/tmp/tmuxterm-e2e-sole';
 /** 兜底 D「候选被兄弟槽占用」用例的专用 cwd（里面只放一条、且已被绑走的对话）。 */
 const SIBLING_CWD = '/tmp/tmuxterm-e2e-sibling';
+/**
+ * 6g（归属判据按槽摊平）的专用 cwd。与 SIBLING_CWD 分开是必需的：19h 的
+ * 前提是「该 cwd 下唯一那条被兄弟槽绑着、无主的候选一个都没有」，往它里面
+ * 再写一条就会把那个用例变成另一件事（同 19h 注释里对 SOLE_CWD 的顾虑）。
+ */
+const SIB_SLOT_CWD = '/tmp/tmuxterm-e2e-sibslot';
 
 /**
  * 准备两个假 claude（都用**绝对路径**调用：不受 PATH 桩影响，名字以 claude
@@ -984,7 +990,7 @@ async function projectSnapshot() {
     resetCalls();
     quickPickAnswer = pickShared;
     modalAnswer = undefined;
-    await mgr.bindConversationInteractive(fresh(ID_SHARE2));
+    await mgr.bindConversationInteractive(fresh(ID_SHARE2), fresh(ID_SHARE2).sessions[0]);
     await sleep(400);
     chk('★ 取消确认后绑定未被改动', bound(ID_SHARE2) === undefined,
       `实际 ${JSON.stringify(bound(ID_SHARE2))}`);
@@ -994,7 +1000,7 @@ async function projectSnapshot() {
     // 6c-2：确认 → 绑定生效
     resetCalls();
     modalAnswer = '仍然接这条';
-    await mgr.bindConversationInteractive(fresh(ID_SHARE2));
+    await mgr.bindConversationInteractive(fresh(ID_SHARE2), fresh(ID_SHARE2).sessions[0]);
     await sleep(400);
     modalAnswer = undefined;
     quickPickAnswer = undefined;
@@ -1099,6 +1105,55 @@ async function projectSnapshot() {
       `pick=${calls.quickPicks.length} modal=${modalCalls}`);
     chk('★ 确认模态开着期间没有下一个条目的选择框并存（不会一摞对话框）',
       picksDuringModal === 1, `实际当时已有 ${picksDuringModal} 个选择框`);
+  }
+
+  console.log('\n=== 6g. 归属判据按槽摊平：兄弟槽绑着的对话同样算「已被占用」 ===');
+  {
+    // SPEC §11.17：凡是「这条对话归谁」的判据，摊平出来的视角 id 一律用**槽 id**。
+    // ownersOf 的「跳过自己」只按传进去的那个 id 生效，所以「按条目 id 摊平 +
+    // 按条目 id 跳过自己」会把同一条目下的槽**彼此全跳掉** —— 兄弟槽正在写的
+    // 那条对话在列表里看起来无主，选中也不弹确认，用户于是能把第二个槽也绑上去：
+    // 两个 claude 同写一条 .jsonl（这套机制存在的唯一理由）。不报错，只是静默失效。
+    const id = 'e2esibslot01';
+    const S1 = 'e2esibslota1';   // 兄弟槽：绑着该 cwd 下**唯一**的那条对话
+    const S2 = 'e2esibslotb1';   // 被点开的那个槽：未绑定
+    const ONLY = 'cccccccc-0021-0000-0000-000000000000';
+    ALL.push(id, S1, S2);
+    await fs.promises.mkdir(SIB_SLOT_CWD, { recursive: true });
+    await writeConversation(ONLY, SIB_SLOT_CWD, '兄弟槽正在写的那条', '-tmp-tmuxterm-e2e-sibslot');
+    store.entries.push({
+      id, name: 'SIBSLOT', cwd: SIB_SLOT_CWD, profile: 'ccr', autoRestore: false,
+      sessions: [
+        { id: S1, conversationId: ONLY, order: 0 },
+        { id: S2, order: 1 },
+      ],
+    });
+    // s2 存在、前台是 bash（claude 已退出）→ 走到「没有绑定 → 挑一条 / 兜底 D」。
+    // D 在这里**必须让位**（该 cwd 下唯一那条被兄弟槽占着，一个无主的候选都没有），
+    // 于是弹选择框 —— 本用例要验的正是那个选择框里的内容与紧跟的确认框。
+    await tmux.newSession(S(S2), SIB_SLOT_CWD);
+    await sleep(500);
+
+    resetCalls();
+    quickPickAnswer = (items) => items.find((i) => i.candidate && i.candidate.id === ONLY);
+    modalAnswer = undefined;              // 用户看到确认框后**拒绝**
+    const mgr = newManager();
+    await mgr.openSession(fresh(id), fresh(id).sessions[1]);
+    await sleep(2000);
+    quickPickAnswer = undefined;
+    modalAnswer = undefined;
+
+    const items = (calls.quickPicks[0] || {}).items || [];
+    const sib = items.find((i) => i.candidate && i.candidate.id === ONLY);
+    chk('6g ★ 兄弟槽绑着的对话在列表里标出了归属（「已绑给「SIBSLOT」」）',
+      !!sib && sib.label.includes('已绑给「SIBSLOT」'), String(sib && sib.label));
+    chk('6g ★ 选中它必须二次确认（确认框点名了归属者）',
+      calls.warns.some((m) => String(m).includes('已绑给「SIBSLOT」')), JSON.stringify(calls.warns));
+    chk('6g ★ 拒绝确认后绑定未被改动（s2 仍是未绑定）',
+      fresh(id).sessions[1].conversationId === undefined,
+      String(fresh(id).sessions[1].conversationId));
+    chk('6g ★ 拒绝确认后什么都没启动（绝不与兄弟槽同写一条 .jsonl）',
+      literalsTo(S(S2)).length === 0, JSON.stringify(literalsTo(S(S2))));
   }
 
   console.log('\n=== 7. 老条目 + 用户主动选「＋ 新建一条对话」→ 开新对话并绑定 ===');
@@ -1369,7 +1424,7 @@ async function projectSnapshot() {
     tmux.detachClients = async (name) => { order.push('detachClients'); return origDetach(name); };
     tmux.killSession = async (name) => { order.push('killSession'); return origKill(name); };
 
-    modalAnswer = '杀掉';
+    modalAnswer = '关闭';
     await mgr.killSession(fresh(ID_KILL));
     modalAnswer = undefined;
 
@@ -2484,7 +2539,7 @@ async function projectSnapshot() {
   const fakeHomeBefore = fs.existsSync(HOME);
   await fs.promises.rm(HOME, { recursive: true, force: true });
   await fs.promises.rm(BIN_DIR, { recursive: true, force: true });
-  for (const d of [SCRATCH, CONV_CWD, BOUND_CWD, SOLE_CWD, SIBLING_CWD, PID_DIR]) {
+  for (const d of [SCRATCH, CONV_CWD, BOUND_CWD, SOLE_CWD, SIBLING_CWD, SIB_SLOT_CWD, PID_DIR]) {
     await fs.promises.rm(d, { recursive: true, force: true });
   }
   chk('假 HOME / 假 claude / scratch 目录已清理',
