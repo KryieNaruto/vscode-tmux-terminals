@@ -16,9 +16,9 @@ function profileColor(entry: TerminalEntry): vscode.ThemeColor {
 /**
  * tooltip 里的「对话」一行。
  *
- * 显示短 id 而不是首条消息摘要：摘要要读一个可能几 MB 的会话文件，而
- * tooltip 是同步渲染的 —— 为了一个提示去同步读盘不值得。想认内容就用
- * 「选择要接回的对话…」命令，那里有摘要。
+ * 显示短 id 而不是首条用户消息：要拿到它得读会话文件（哪怕只读头部窗口），
+ * 而 tooltip 是同步渲染的 —— 为了一个提示去同步读盘不值得。想认内容就用
+ * 「选择要接回的对话…」命令，那里显示首条用户消息的原文。
  */
 function conversationLabel(entry: TerminalEntry): string {
   const id = entry.conversationId;
@@ -253,7 +253,7 @@ export class EntryTreeProvider
    * → ''（不显示第三级）。
    *
    * **全都无从得知时返回空串** —— 不加灰色占位、不退化成
-   * `~/.claude/sessions` 的 derived slug、不用首条用户消息摘要：把「不知道」
+   * `~/.claude/sessions` 的 derived slug、不用首条用户消息：把「不知道」
    * 伪装成「知道」是误导（spec §8 不变量 6）。
    *
    * 纯读：`peek` 同步、不发 IO、不触发观测（观测统一由 extension.ts 驱动）。

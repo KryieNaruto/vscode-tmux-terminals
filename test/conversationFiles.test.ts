@@ -6,10 +6,9 @@ import {
   findConversationFile,
   findConversations,
   listConversations,
-  listConversationsForCwd,
   readTail,
 } from '../src/conversationFiles';
-import { parseAiTitle } from '../src/core/conversation';
+import { candidatesForCwd, parseAiTitle } from '../src/core/conversation';
 
 /**
  * 枚举 `~/.claude/projects/**` 下可接回的对话。
@@ -44,7 +43,7 @@ describe('listConversations', () => {
     for (const h of homes) await fs.rm(h, { recursive: true, force: true });
   });
 
-  it('枚举出 id / cwd / 摘要 / 体积', async () => {
+  it('枚举出 id / cwd / 首条消息 / 体积', async () => {
     const home = await mk({
       [`-ssd-foo/${UUID}.jsonl`]: [
         line({ type: 'mode', sessionId: UUID }),
@@ -56,7 +55,7 @@ describe('listConversations', () => {
     assert.strictEqual(list.length, 1);
     assert.strictEqual(list[0].id, UUID);
     assert.strictEqual(list[0].cwd, '/ssd/foo');
-    assert.strictEqual(list[0].summary, '把那个 bug 修了');
+    assert.strictEqual(list[0].firstMessage, '把那个 bug 修了');
     assert.ok(list[0].bytes > 0);
     assert.ok(list[0].mtimeMs > 0);
   });
@@ -94,7 +93,7 @@ describe('listConversations', () => {
     assert.deepStrictEqual(await listConversations(home), []);
   });
 
-  it('★ 只读文件头部：摘要取不到也不报错，cwd 仍要拿到（文件动辄几 MB）', async () => {
+  it('★ 只读文件头部：首条消息取不到也不报错，cwd 仍要拿到（文件动辄几 MB）', async () => {
     const padding = Array.from({ length: 2000 }, (_, i) =>
       line({ type: 'attachment', cwd: '/a/b', attachment: { i, pad: 'x'.repeat(200) } }));
     const home = await mk({
@@ -103,11 +102,11 @@ describe('listConversations', () => {
     const list = await listConversations(home);
     assert.strictEqual(list.length, 1);
     assert.strictEqual(list[0].cwd, '/a/b', 'cwd 在文件开头，必须被读到');
-    assert.strictEqual(list[0].summary, '', '首条用户消息超出头部读取上限时摘要为空，但不得报错');
+    assert.strictEqual(list[0].firstMessage, '', '首条用户消息超出头部读取上限时它为空，但不得报错');
   });
 });
 
-describe('listConversationsForCwd —— 按 cwd 过滤后再补最后一问一答', () => {
+describe('candidatesForCwd + listConversations —— 按 cwd 过滤（走真实文件系统）', () => {
   const homes: string[] = [];
   const mk = async (files: Record<string, string>) => {
     const h = await makeHome(files);
@@ -118,30 +117,23 @@ describe('listConversationsForCwd —— 按 cwd 过滤后再补最后一问一�
     for (const h of homes) await fs.rm(h, { recursive: true, force: true });
   });
 
-  const assistantLine = (text: string, cwd: string) =>
-    line({ type: 'assistant', isSidechain: false, cwd, message: { role: 'assistant', content: [{ type: 'text', text }] } });
-
-  it('只返回该 cwd 的候选，并带上最后的问答', async () => {
+  it('只返回该 cwd 的候选，并带上首条消息原文', async () => {
     const home = await mk({
       [`-ssd-foo/${UUID}.jsonl`]: [
         line({ type: 'attachment', cwd: '/ssd/foo' }),
         userLine('首条消息', '/ssd/foo'),
-        assistantLine('最后一条回答', '/ssd/foo'),
-        userLine('最后一条问题', '/ssd/foo'),
       ].join('\n'),
       ['-other/other.jsonl']: [
         line({ type: 'attachment', cwd: '/other' }),
         userLine('别人的对话', '/other'),
       ].join('\n'),
     });
-    const list = await listConversationsForCwd(home, '/ssd/foo');
+    const list = candidatesForCwd(await listConversations(home), '/ssd/foo');
     assert.deepStrictEqual(list.map((c) => c.id), [UUID]);
-    assert.strictEqual(list[0].summary, '首条消息');
-    assert.strictEqual(list[0].lastQuestion, '最后一条问题');
-    assert.strictEqual(list[0].lastAnswer, '最后一条回答');
+    assert.strictEqual(list[0].firstMessage, '首条消息');
   });
 
-  it('★ 首条是斜杠命令的合成包裹消息 → 摘要取到后面的真实提问', async () => {
+  it('★ 首条是斜杠命令的合成包裹消息 → 取到后面的真实提问', async () => {
     const home = await mk({
       [`-ssd-foo/${UUID}.jsonl`]: [
         line({ type: 'attachment', cwd: '/ssd/foo' }),
@@ -152,43 +144,20 @@ describe('listConversationsForCwd —— 按 cwd 过滤后再补最后一问一�
         userLine('把那个 bug 修了', '/ssd/foo'),
       ].join('\n'),
     });
-    const list = await listConversationsForCwd(home, '/ssd/foo');
-    assert.strictEqual(list[0].summary, '把那个 bug 修了');
-    assert.strictEqual(list[0].lastQuestion, '把那个 bug 修了');
+    const list = candidatesForCwd(await listConversations(home), '/ssd/foo');
+    assert.strictEqual(list[0].firstMessage, '把那个 bug 修了');
   });
 
-  it('★ 全是合成消息 → 摘要为空串，候选**不**被丢掉（列表是找回对话的唯一入口）', async () => {
+  it('★ 全是合成消息 → 首条消息为空串，候选**不**被丢掉（列表是找回对话的唯一入口）', async () => {
     const home = await mk({
       [`-ssd-foo/${UUID}.jsonl`]: [
         line({ type: 'attachment', cwd: '/ssd/foo' }),
         userLine('<command-name>/clear</command-name>', '/ssd/foo'),
       ].join('\n'),
     });
-    const list = await listConversationsForCwd(home, '/ssd/foo');
+    const list = candidatesForCwd(await listConversations(home), '/ssd/foo');
     assert.strictEqual(list.length, 1);
-    assert.strictEqual(list[0].summary, '');
-    assert.strictEqual(list[0].lastQuestion, undefined);
-    assert.strictEqual(list[0].lastAnswer, undefined);
-  });
-
-  it('★ 尾部有一行不是 JSON → 坏行被跳过，仍能从更早的行取到问答，候选照常返回', async () => {
-    const home = await mk({
-      [`-ssd-foo/${UUID}.jsonl`]: [
-        line({ type: 'attachment', cwd: '/ssd/foo' }),
-        userLine('hi', '/ssd/foo'),
-        '>>> 不是 json 的一行 <<<',
-      ].join('\n'),
-    });
-    const list = await listConversationsForCwd(home, '/ssd/foo');
-    assert.strictEqual(list.length, 1);
-    // 坏行一律跳过、取不到就不给那个字段（与 parseConversationHead 同一套容错
-    // 契约，见 parseConversationTail 的 JSDoc）。末行解析不出只是它自己不贡献
-    // 内容，前面那行 user 提问照取不误 —— 「末行坏 ⇒ 整段作废」不是契约，而且
-    // 现实里被截断的只有**窗口开头**那行（尾部窗口从某条记录中间切进去），
-    // 末行一直写到 EOF、必然完整。
-    assert.strictEqual(list[0].lastQuestion, 'hi');
-    // 夹具里本来就没有 assistant 消息 → 回答取不到
-    assert.strictEqual(list[0].lastAnswer, undefined);
+    assert.strictEqual(list[0].firstMessage, '');
   });
 
   it('按 mtime 倒序（新的在前）—— 与 candidatesForCwd 同一套顺序', async () => {
@@ -200,18 +169,18 @@ describe('listConversationsForCwd —— 按 cwd 过滤后再补最后一问一�
     await fs.utimes(path.join(home, '.claude', 'projects', '-ssd-foo', 'old.jsonl'), past, past);
 
     assert.deepStrictEqual(
-      (await listConversationsForCwd(home, '/ssd/foo')).map((c) => c.id),
+      candidatesForCwd(await listConversations(home), '/ssd/foo').map((c) => c.id),
       ['new', 'old'],
     );
   });
 
   it('该 cwd 下没有候选 / projects 目录不存在 → 空数组，不抛', async () => {
     const home = await mk({ ['-other/x.jsonl']: line({ type: 'attachment', cwd: '/other' }) });
-    assert.deepStrictEqual(await listConversationsForCwd(home, '/ssd/foo'), []);
+    assert.deepStrictEqual(candidatesForCwd(await listConversations(home), '/ssd/foo'), []);
 
     const empty = await fs.mkdtemp(path.join(os.tmpdir(), 'tmuxterm-conv-empty-'));
     homes.push(empty);
-    assert.deepStrictEqual(await listConversationsForCwd(empty, '/ssd/foo'), []);
+    assert.deepStrictEqual(candidatesForCwd(await listConversations(empty), '/ssd/foo'), []);
   });
 });
 

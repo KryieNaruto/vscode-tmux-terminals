@@ -5,14 +5,11 @@ import {
   candidatesForCwd,
   formatBytes,
   formatCandidate,
-  formatCandidateDetail,
-  formatCandidateTooltip,
   formatCandidateWithOwner,
   isSyntheticUserText,
   ownersOf,
   parseAiTitle,
   parseConversationHead,
-  parseConversationTail,
 } from '../../src/core/conversation';
 
 /** 造一行 .jsonl。真实文件里 cwd 出现在大多数行上（mode/snapshot 行没有）。 */
@@ -29,7 +26,7 @@ const c = (patch: Partial<ConversationCandidate> = {}): ConversationCandidate =>
   cwd: '/a/b',
   mtimeMs: 1_700_000_000_000,
   bytes: 2048,
-  summary: '改一下 bug',
+  firstMessage: '改一下 bug',
   ...patch,
 });
 
@@ -48,15 +45,6 @@ const SLASH_CLEAR = [
 /** 命令的输出回显。 */
 const STDOUT_ECHO = '<local-command-stdout>Conversation cleared</local-command-stdout>';
 
-/** assistant 行：content 是块数组。 */
-const ASSISTANT_LINE = (blocks: object[], extra: object = {}) =>
-  line({
-    type: 'assistant', isSidechain: false, cwd: '/a/b',
-    message: { role: 'assistant', content: blocks }, ...extra,
-  });
-
-const TEXT_BLOCK = (text: string) => ({ type: 'text', text });
-
 describe('parseConversationHead —— 从 .jsonl 头部提取 cwd 与首条用户消息', () => {
   it('跳过 mode / snapshot / attachment 之类的非用户行', () => {
     const text = [
@@ -67,7 +55,7 @@ describe('parseConversationHead —— 从 .jsonl 头部提取 cwd 与首条用�
     ].join('\n');
     assert.deepStrictEqual(parseConversationHead(text), {
       cwd: '/a/b',
-      summary: '帮我改一下 bug',
+      firstMessage: '帮我改一下 bug',
     });
   });
 
@@ -85,7 +73,7 @@ describe('parseConversationHead —— 从 .jsonl 头部提取 cwd 与首条用�
         message: { role: 'user', content: [{ type: 'text', text: '分块消息' }] },
       }),
     ].join('\n');
-    assert.strictEqual(parseConversationHead(text).summary, '分块消息');
+    assert.strictEqual(parseConversationHead(text).firstMessage, '分块消息');
   });
 
   it('忽略 isSidechain 的子代理消息（不是用户敲的）', () => {
@@ -94,7 +82,7 @@ describe('parseConversationHead —— 从 .jsonl 头部提取 cwd 与首条用�
       USER_LINE('子代理噪音', { isSidechain: true }),
       USER_LINE('真正由用户敲的'),
     ].join('\n');
-    assert.strictEqual(parseConversationHead(text).summary, '真正由用户敲的');
+    assert.strictEqual(parseConversationHead(text).firstMessage, '真正由用户敲的');
   });
 
   it('忽略只有 tool_result 的 user 行（那是工具回执，不是用户消息）', () => {
@@ -106,7 +94,7 @@ describe('parseConversationHead —— 从 .jsonl 头部提取 cwd 与首条用�
       }),
       USER_LINE('用户说的话'),
     ].join('\n');
-    assert.strictEqual(parseConversationHead(text).summary, '用户说的话');
+    assert.strictEqual(parseConversationHead(text).firstMessage, '用户说的话');
   });
 
   it('末行被截断（只读了文件头部）不抛错，已解析出的部分保留', () => {
@@ -114,14 +102,35 @@ describe('parseConversationHead —— 从 .jsonl 头部提取 cwd 与首条用�
     assert.deepStrictEqual(parseConversationHead(text), { cwd: '/a/b' });
   });
 
-  it('摘要压平换行并截断，避免 QuickPick 里多行错位', () => {
+  it('压平换行（含换行）—— QuickPick 的 label 是 pre + overflow:hidden，不压平就只剩第一行', () => {
     const text = [line({ type: 'attachment', cwd: '/a/b' }), USER_LINE('第一行\n\n第二行   第三行')].join('\n');
-    assert.strictEqual(parseConversationHead(text).summary, '第一行 第二行 第三行');
+    assert.strictEqual(parseConversationHead(text).firstMessage, '第一行 第二行 第三行');
+  });
 
-    const long = 'x'.repeat(500);
-    const s = parseConversationHead([line({ type: 'attachment', cwd: '/a/b' }), USER_LINE(long)].join('\n')).summary;
-    assert.ok(s !== undefined && s.length <= 61, `实际长度 ${s?.length}`);
-    assert.ok(s !== undefined && s.endsWith('…'));
+  it('★ 常规长度的原文逐字保留、不被截断（本轮的核心行为）', () => {
+    // 旧版这里压到 60 字。用户要的是**他自己敲的那句话**：只压平空白，
+    // 不改写、不截短 —— 300 字（FIRST_MESSAGE_MAX）只是防「粘贴几万字」的
+    // 兜底，正常永远轮不到它来截断。
+    const msg = '把 vscode-tmux-terminals 里选择框的第二行去掉，只留首条用户消息的原文，不要截短，也不要改写';
+    const text = [line({ type: 'attachment', cwd: '/a/b' }), USER_LINE(msg)].join('\n');
+    const got = parseConversationHead(text).firstMessage;
+    assert.strictEqual(got, msg);
+    assert.ok(got !== undefined && !got.endsWith('…'), '常规长度不该出现省略号');
+  });
+
+  it('超过兜底上限（300 字）才截断成 `…`；恰好 300 字不截', () => {
+    const headOf = (n: number) =>
+      parseConversationHead(
+        [line({ type: 'attachment', cwd: '/a/b' }), USER_LINE('x'.repeat(n))].join('\n'),
+      ).firstMessage;
+
+    const exact = headOf(300);
+    assert.strictEqual(exact?.length, 300, '恰好等于上限时不截断');
+    assert.ok(exact !== undefined && !exact.endsWith('…'));
+
+    const over = headOf(500);
+    assert.ok(over !== undefined && over.length <= 301, `实际长度 ${over?.length}`);
+    assert.ok(over !== undefined && over.endsWith('…'));
   });
 
   it('什么都解析不出来时返回空对象（绝不编造）', () => {
@@ -169,7 +178,7 @@ describe('parseConversationHead —— 跳过斜杠命令的合成包裹消息',
     ].join('\n');
     assert.deepStrictEqual(parseConversationHead(text), {
       cwd: '/a/b',
-      summary: '帮我把这个 bug 修了',
+      firstMessage: '帮我把这个 bug 修了',
     });
   });
 
@@ -180,154 +189,29 @@ describe('parseConversationHead —— 跳过斜杠命令的合成包裹消息',
       USER_LINE(STDOUT_ECHO),
       USER_LINE('接着聊 Krita 编译'),
     ].join('\n');
-    assert.strictEqual(parseConversationHead(text).summary, '接着聊 Krita 编译');
+    assert.strictEqual(parseConversationHead(text).firstMessage, '接着聊 Krita 编译');
   });
 
-  it('用户在提问里引用 <command-name> → 正常当作摘要（不误杀）', () => {
+  it('用户在提问里引用 <command-name> → 正常当作首条消息（不误杀）', () => {
     const text = [
       line({ type: 'attachment', cwd: '/a/b' }),
       USER_LINE('为什么 <command-name>/clear</command-name> 会清掉上下文？'),
     ].join('\n');
     assert.strictEqual(
-      parseConversationHead(text).summary,
+      parseConversationHead(text).firstMessage,
       '为什么 <command-name>/clear</command-name> 会清掉上下文？',
     );
   });
 
-  it('全是合成消息、压根没有真实提问 → 不给 summary（调用方据此回退「（无摘要）」）', () => {
+  it('全是合成消息、压根没有真实提问 → 不给 firstMessage（调用方据此回退「（无首条消息）」）', () => {
     const text = [
       line({ type: 'attachment', cwd: '/a/b' }),
       USER_LINE(CAVEAT),
       USER_LINE(SLASH_CLEAR),
     ].join('\n');
     assert.deepStrictEqual(parseConversationHead(text), { cwd: '/a/b' });
-    // 落进列表时就是空串 —— formatCandidate 回退成「（无摘要）」
-    assert.ok(formatCandidate(c({ summary: '' })).includes('（无摘要）'));
-  });
-});
-
-describe('parseConversationTail —— 从 transcript 尾部取最后一问一答', () => {
-  it('取**最后**一问一答（不是第一对）', () => {
-    const text = [
-      USER_LINE('第一个问题'),
-      ASSISTANT_LINE([TEXT_BLOCK('第一个回答')]),
-      USER_LINE('最后一个问题'),
-      ASSISTANT_LINE([TEXT_BLOCK('最后一个回答')]),
-    ].join('\n');
-    assert.deepStrictEqual(parseConversationTail(text), {
-      question: '最后一个问题',
-      answer: '最后一个回答',
-    });
-  });
-
-  it('★ 尾部窗口起点被截断的半行能安全跳过', () => {
-    const text = [
-      '{"type":"assistant","message":{"content":[{"type":"te', // 窗口起点落在记录中间
-      USER_LINE('最后一问'),
-      ASSISTANT_LINE([TEXT_BLOCK('最后一答')]),
-    ].join('\n');
-    assert.deepStrictEqual(parseConversationTail(text), { question: '最后一问', answer: '最后一答' });
-  });
-
-  it('只有问没有答 → 只给 question，不编造回答', () => {
-    const text = [USER_LINE('刚问的还没回答'), ASSISTANT_LINE([{ type: 'tool_use', name: 'Bash' }])].join('\n');
-    assert.deepStrictEqual(parseConversationTail(text), { question: '刚问的还没回答' });
-  });
-
-  it('★ 助手消息里混着 tool_use 时取最后一个非空 text 块', () => {
-    const text = [
-      USER_LINE('q'),
-      ASSISTANT_LINE([TEXT_BLOCK('先说的一句'), { type: 'tool_use', name: 'Bash' }, TEXT_BLOCK('真正说出口的话')]),
-    ].join('\n');
-    assert.strictEqual(parseConversationTail(text).answer, '真正说出口的话');
-
-    // 末尾的 text 块是空白 → 不算回答，继续往前找
-    const text2 = [
-      USER_LINE('q'),
-      ASSISTANT_LINE([TEXT_BLOCK('先说的一句'), { type: 'tool_use', name: 'Bash' }, TEXT_BLOCK('   ')]),
-    ].join('\n');
-    assert.strictEqual(parseConversationTail(text2).answer, '先说的一句');
-  });
-
-  it('★ 尾部最后一问是合成消息 → 往前找到真实提问', () => {
-    const text = [
-      USER_LINE('真正的提问'),
-      ASSISTANT_LINE([TEXT_BLOCK('回答')]),
-      USER_LINE(CAVEAT),
-      USER_LINE(SLASH_CLEAR),
-      USER_LINE(STDOUT_ECHO),
-    ].join('\n');
-    assert.deepStrictEqual(parseConversationTail(text), { question: '真正的提问', answer: '回答' });
-  });
-
-  it('tool_result 回执不会被当成提问（firstText 只认 text 块）', () => {
-    const text = [
-      USER_LINE('真提问'),
-      line({
-        type: 'user', userType: 'external', isSidechain: false,
-        message: { role: 'user', content: [{ type: 'tool_result', content: 'x' }] },
-      }),
-    ].join('\n');
-    assert.deepStrictEqual(parseConversationTail(text), { question: '真提问' });
-  });
-
-  it('忽略 isSidechain 的子代理产出（那不是这个终端在聊的内容）', () => {
-    const text = [
-      USER_LINE('真提问'),
-      ASSISTANT_LINE([TEXT_BLOCK('子代理写的')], { isSidechain: true }),
-      USER_LINE('子代理收到的指示', { isSidechain: true }),
-    ].join('\n');
-    assert.deepStrictEqual(parseConversationTail(text), { question: '真提问' });
-  });
-
-  it('压平空白：多行问题折成一行，detail 才不会错位', () => {
-    const text = [USER_LINE('第一行\n\n第二行   第三行'), ASSISTANT_LINE([TEXT_BLOCK('答')])].join('\n');
-    assert.strictEqual(parseConversationTail(text).question, '第一行 第二行 第三行');
-  });
-
-  it('问题与回答各自按自己的上限截断（回答的上限更宽松）', () => {
-    const text = [USER_LINE('x'.repeat(500)), ASSISTANT_LINE([TEXT_BLOCK('y'.repeat(500))])].join('\n');
-    const t = parseConversationTail(text);
-    assert.ok(t.question !== undefined && t.question.length <= 81, `问题实际长度 ${t.question?.length}`);
-    assert.ok(t.question?.endsWith('…'));
-    assert.ok(t.answer !== undefined && t.answer.length <= 201, `回答实际长度 ${t.answer?.length}`);
-    assert.ok(t.answer?.endsWith('…'));
-  });
-
-  it('什么都解析不出来 → 空对象（绝不编造）', () => {
-    assert.deepStrictEqual(parseConversationTail(''), {});
-    assert.deepStrictEqual(parseConversationTail('不是 json\n{也,不是}'), {});
-    assert.deepStrictEqual(parseConversationTail(line({ type: 'mode', sessionId: 'x' })), {});
-  });
-});
-
-describe('formatCandidateDetail / formatCandidateTooltip —— 最后一问一答的渲染', () => {
-  it('没有问答时两个都返回 undefined（列表少一行，而不是显示一行空的）', () => {
-    assert.strictEqual(formatCandidateDetail(c()), undefined);
-    assert.strictEqual(formatCandidateTooltip(c()), undefined);
-  });
-
-  it('detail 只放问题 —— 一行小字塞进回答只会两头都看不全', () => {
-    assert.strictEqual(
-      formatCandidateDetail(c({ lastQuestion: '那个 bug 修好了吗', lastAnswer: '修好了' })),
-      '最后问：那个 bug 修好了吗',
-    );
-  });
-
-  it('tooltip 是 markdown 源：问答之间留空行（单个换行会被折叠）', () => {
-    assert.strictEqual(
-      formatCandidateTooltip(c({ lastQuestion: '那个 bug 修好了吗', lastAnswer: '修好了' })),
-      '最后的问题：那个 bug 修好了吗\n\n最后的回答：修好了',
-    );
-  });
-
-  it('只有问题没有回答时 tooltip 只给问题', () => {
-    assert.strictEqual(formatCandidateTooltip(c({ lastQuestion: '刚问的' })), '最后的问题：刚问的');
-  });
-
-  it('空串按「没有」处理（不显示「最后问：」这样的空壳）', () => {
-    assert.strictEqual(formatCandidateDetail(c({ lastQuestion: '' })), undefined);
-    assert.strictEqual(formatCandidateTooltip(c({ lastQuestion: '', lastAnswer: '' })), undefined);
+    // 落进列表时就是空串 —— formatCandidate 回退成「（无首条消息）」
+    assert.ok(formatCandidate(c({ firstMessage: '' })).includes('（无首条消息）'));
   });
 });
 
@@ -376,14 +260,14 @@ describe('formatBytes / formatCandidate —— QuickPick 显示', () => {
     assert.strictEqual(formatBytes(20480), '20 KB');
     assert.strictEqual(formatBytes(1048576), '1.0 MB');
   });
-  it('候选行含时间、摘要、体积', () => {
-    const s = formatCandidate(c({ summary: '改一下 bug', bytes: 2048 }));
+  it('候选行含时间、首条消息原文、体积', () => {
+    const s = formatCandidate(c({ firstMessage: '改一下 bug', bytes: 2048 }));
     assert.ok(s.includes('改一下 bug'), s);
     assert.ok(s.includes('2.0 KB'), s);
     assert.ok(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(s), s);
   });
-  it('没有摘要时明说，不显示空档', () => {
-    assert.ok(formatCandidate(c({ summary: '' })).includes('（无摘要）'));
+  it('没有首条消息时明说，不显示空档', () => {
+    assert.ok(formatCandidate(c({ firstMessage: '' })).includes('（无首条消息）'));
   });
 });
 
