@@ -356,6 +356,8 @@ const FIXTURE_BG = path.join(BIN_DIR, 'claude-fixture-bg');
 const FIXTURE_FG = path.join(BIN_DIR, 'claude-fixture-fg');
 /** 兜底 D 的专用 cwd（那里只放一个条目）。 */
 const SOLE_CWD = '/tmp/tmuxterm-e2e-sole';
+/** 兜底 D「候选被兄弟槽占用」用例的专用 cwd（里面只放一条、且已被绑走的对话）。 */
+const SIBLING_CWD = '/tmp/tmuxterm-e2e-sibling';
 
 /**
  * 准备两个假 claude（都用**绝对路径**调用：不受 PATH 桩影响，名字以 claude
@@ -1799,6 +1801,133 @@ async function projectSnapshot() {
         typeof copy.sessions[0].conversationId === 'string' && copy.sessions[0].conversationId !== observed,
         String(copy.sessions[0].conversationId));
     }
+
+    // ---- 19h. 兜底 D 反面之二：唯一候选被**同一条目的另一个槽**绑着 → 不得启用 D ----
+    // 这是 SPEC §11.16 里那条可达的损坏路径，也是本节的核心回归：判据 (a)
+    // （该 cwd 下只有这一个条目）在这里**成立**，光靠 (a) 拦不住 —— 竞争者出自
+    // 同一个条目。D 若照旧取 mtime 最新的候选，点开的 s1 就会和兄弟槽 s2 一起
+    // --resume 同一条 .jsonl（两个 claude 同写一份，数据损坏级）。
+    {
+      const id = 'e2eidentity9';
+      const S1 = 'e2eslotfree1';   // 老槽：未绑定 —— 本节要点开的就是它
+      const S2 = 'e2eslotheld1';   // 兄弟槽：绑着该 cwd 下**唯一**的那条对话
+      ALL.push(id, S1, S2);
+      // **专用 cwd**：里面只放一条对话，且它被兄弟槽绑着 —— 这样「无主的候选」
+      // 一个都没有，D 必须让位给选择框。若共用 SOLE_CWD（19e/19i 在那儿写过
+      // 无主的对话），D 会退而接回那条**无主**的 —— 那是 19i 的语义，本节就会
+      // 因为一个无关的原因变绿，等于什么都没测到。
+      await fs.promises.mkdir(SIBLING_CWD, { recursive: true });
+      const only = 'cccccccc-0011-0000-0000-000000000000';
+      await writeConversation(only, SIBLING_CWD, '兄弟槽正在写的那条', '-tmp-tmuxterm-e2e-sibling');
+
+      const local = {
+        entries: [{
+          id, name: 'SIBLING', cwd: SIBLING_CWD, profile: 'ccr', autoRestore: false,
+          sessions: [
+            { id: S1, order: 0 },                        // 老槽：未绑定
+            { id: S2, conversationId: only, order: 1 },   // 兄弟槽：绑着唯一那条
+          ],
+        }],
+        async load() { return this.entries.map((e) => ({ ...e })); },
+        async update(entryId, patch) {
+          const i = this.entries.findIndex((e) => e.id === entryId);
+          if (i >= 0) this.entries[i] = { ...this.entries[i], ...patch };
+        },
+        // v3 的绑定回写走槽级原语，假 store 也必须实现它。
+        async updateSession(entryId, sessionId, patch) {
+          const i = this.entries.findIndex((e) => e.id === entryId);
+          if (i < 0) return;
+          const sessions = this.entries[i].sessions || [];
+          const j = sessions.findIndex((s) => s.id === sessionId);
+          if (j < 0) return;
+          const next = sessions.slice();
+          next[j] = { ...next[j], ...patch, id: next[j].id };
+          this.entries[i] = { ...this.entries[i], sessions: next };
+        },
+      };
+      await tmux.newSession(S(S1), SIBLING_CWD);   // 只有 bash：claude 已死
+      await sleep(500);
+
+      resetCalls();
+      quickPickAnswer = undefined;              // 用户按 Esc = 什么都不启动
+      const mgr = new TerminalManager(local, tmux);
+      mgr.home = () => HOME;
+      await mgr.openSession(local.entries[0], local.entries[0].sessions[0]);
+      await sleep(2000);
+
+      chk('19h ★ 该 cwd 下只有一个条目（判据 a 成立），但唯一候选已被兄弟槽绑着 → 退回弹框',
+        calls.quickPicks.length === 1,
+        JSON.stringify(calls.quickPicks.map((q) => q.opts && q.opts.title)));
+      chk('19h ★ 绝不把 s1 接到兄弟槽正在写的那条对话上',
+        !literalsTo(S(S1)).some((t) => t.includes(only)), JSON.stringify(literalsTo(S(S1))));
+      chk('19h ★ 一条启动命令都没发（取消 = 什么都不启动）',
+        literalsTo(S(S1)).length === 0, JSON.stringify(literalsTo(S(S1))));
+      chk('19h 绑定未被改动（仍是未绑定）',
+        local.entries[0].sessions[0].conversationId === undefined,
+        String(local.entries[0].sessions[0].conversationId));
+    }
+
+    // ---- 19i. 判据 (b) 不是「有主就一律弹框」：取**第一个无主**的候选 ----
+    // 同条目下最新那条被兄弟槽绑着、而更旧的一条无主 → D 照常自动接回那条无主的。
+    // 这是 SPEC §11.16 与 §13 取舍的边界：只在**一个无主的候选都没有**时才让位给
+    // 选择框。
+    {
+      const id = 'e2eidentity10';
+      const S1 = 'e2eslotfree2';
+      const S2 = 'e2eslotheld2';
+      ALL.push(id, S1, S2);
+      const free = 'cccccccc-0013-0000-0000-000000000000';   // 无主、较旧
+      const held = 'cccccccc-0014-0000-0000-000000000000';   // 最新、被兄弟槽绑着
+      await writeConversation(free, SOLE_CWD, '无主的那条', '-tmp-tmuxterm-e2e-sole');
+      await writeConversation(held, SOLE_CWD, '最新的那条（兄弟槽绑着它）', '-tmp-tmuxterm-e2e-sole');
+      const dir = path.join(HOME, '.claude', 'projects', '-tmp-tmuxterm-e2e-sole');
+      // 比 19h 写的两条更新：最新的必须是被占着的 held，无主的 free 排第二
+      await fs.promises.utimes(path.join(dir, `${free}.jsonl`), 5_000_000, 5_000_000);
+      await fs.promises.utimes(path.join(dir, `${held}.jsonl`), 6_000_000, 6_000_000);
+
+      const local = {
+        entries: [{
+          id, name: 'SIBLING2', cwd: SOLE_CWD, profile: 'ccr', autoRestore: false,
+          sessions: [
+            { id: S1, order: 0 },
+            { id: S2, conversationId: held, order: 1 },
+          ],
+        }],
+        async load() { return this.entries.map((e) => ({ ...e })); },
+        async update(entryId, patch) {
+          const i = this.entries.findIndex((e) => e.id === entryId);
+          if (i >= 0) this.entries[i] = { ...this.entries[i], ...patch };
+        },
+        async updateSession(entryId, sessionId, patch) {
+          const i = this.entries.findIndex((e) => e.id === entryId);
+          if (i < 0) return;
+          const sessions = this.entries[i].sessions || [];
+          const j = sessions.findIndex((s) => s.id === sessionId);
+          if (j < 0) return;
+          const next = sessions.slice();
+          next[j] = { ...next[j], ...patch, id: next[j].id };
+          this.entries[i] = { ...this.entries[i], sessions: next };
+        },
+      };
+      await tmux.newSession(S(S1), SOLE_CWD);
+      await sleep(500);
+
+      resetCalls();
+      quickPickAnswer = undefined;
+      const mgr = new TerminalManager(local, tmux);
+      mgr.home = () => HOME;
+      await mgr.openSession(local.entries[0], local.entries[0].sessions[0]);
+      await sleep(2000);
+
+      chk('19i ★ 跳过已被兄弟槽占着的最新候选，接回第一个无主的',
+        literalsTo(S(S1)).some((t) => t.includes(`--resume '${free}'`)),
+        JSON.stringify(literalsTo(S(S1))));
+      chk('19i ★ 无主候选存在时仍然不问（判据 b 没有把 D 整个废掉）',
+        calls.quickPicks.length === 0, JSON.stringify(calls.quickPicks.length));
+      chk('19i 绑定落在无主的那条上（不是最新的那条）',
+        local.entries[0].sessions[0].conversationId === free,
+        String(local.entries[0].sessions[0].conversationId));
+    }
   }
 
   console.log('\n=== 20. 任务名回退链：pane title → 绑定对话的 aiTitle → 不显示三级 ===');
@@ -2079,6 +2208,14 @@ async function projectSnapshot() {
       calls.terminals.length === 0 && calls.newSessions.length === 0 && calls.literals.length === 0,
       JSON.stringify({ t: calls.terminals.length, n: calls.newSessions.length,
         l: calls.literals.length }));
+
+    // 留空的 conversationId 会让这个槽在 resolveLaunchSpec 眼里与「老条目」同形
+    // →「点开」落进未绑定路径 → 兜底 D 静默 --resume 该 cwd 下 mtime 最新的对话，
+    // 而用户要的是一条新对话（那条最新的很可能正是同一终端里另一个槽在写的）。
+    chk('24e ★ 新槽预分配了 conversationId（首次点开才会走 fresh 而不是被 D 接走）',
+      UUID_RE.test(String(added.conversationId)), String(added.conversationId));
+    chk('24f 新槽不带 liveSessionId（预分配的是「还没有 .jsonl」的 id，不是已观测值）',
+      added.liveSessionId === undefined, String(added.liveSessionId));
   }
 
   console.log('\n=== 25. 新建条目：带 1 个会话槽；一级 + 的 cwd 预填且可改（判断 B） ===');
@@ -2347,7 +2484,7 @@ async function projectSnapshot() {
   const fakeHomeBefore = fs.existsSync(HOME);
   await fs.promises.rm(HOME, { recursive: true, force: true });
   await fs.promises.rm(BIN_DIR, { recursive: true, force: true });
-  for (const d of [SCRATCH, CONV_CWD, BOUND_CWD, SOLE_CWD, PID_DIR]) {
+  for (const d of [SCRATCH, CONV_CWD, BOUND_CWD, SOLE_CWD, SIBLING_CWD, PID_DIR]) {
     await fs.promises.rm(d, { recursive: true, force: true });
   }
   chk('假 HOME / 假 claude / scratch 目录已清理',

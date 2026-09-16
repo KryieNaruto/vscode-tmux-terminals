@@ -385,7 +385,7 @@ export class TerminalManager {
       return undefined;
     }
 
-    // ---- 兜底 D（**收窄**）：mtime 启发式 ----
+    // ---- 兜底 D（**收窄 + 占用判据**）：mtime 启发式 ----
     // A 观测不到活跃会话（claude 已死）—— 那就不存在「这个终端在用哪条会话」
     // 的权威答案；此时**只有**在「该 cwd 下只有这一个条目」时才敢退回 mtime：
     //   - 单条目 → 不可能与别的条目争同一条 .jsonl，猜错也只是接回自己目录下
@@ -398,14 +398,38 @@ export class TerminalManager {
     // 是同一个目录）。按原始串判会让两个条目**各自**满足「只有我一个」，
     // 双双走 D 并接到同一条 .jsonl 上 —— 恰好击穿 D 自己要防的数据损坏。
     // 展开路径也正是真正启动时用的那个目录（cwdFor 同时喂给 newSession）。
-    const soleInCwd = (await this.store.load()).filter((e) => this.cwdFor(e) === cwd).length === 1;
+    //
+    // 判据 (a)「该 cwd 下只有这一个条目」**不够**（SPEC §11.16）：它的正当性
+    // 论证是「单条目 → 不可能有别人来争这条 .jsonl」，而**多会话让竞争者可以
+    // 出自同一个条目**。可达路径：条目 E 有一个未绑定的老槽 s1，用户点「+」
+    // 加了预分配 conversationId 的 s2 并点开（s2 正在写对话 C）—— 此时点 s1，
+    // 条目数仍是 1，(a) 成立，而候选里 mtime 最新的那条**恰恰就是 C** →
+    // s1 也 `--resume C`，两个 claude 同写一条 .jsonl（数据损坏级）。
+    // 故补判据 (b)：候选必须**无主**，且取**第一个**无主的；一个无主的都没有就
+    // **不启用 D**，退回弹框让用户自己决定 —— 与「手动改绑别人的对话要二次
+    // 确认」同一侧。两条判据挡的是不同的东西：(a) 挡多个条目争抢，(b) 挡同一个
+    // 条目内部自己跟自己抢，缺一不可。
+    //
+    // 摊平必须用**槽 id** 当视角的 id：ownersOf 的「跳过自己」只按传入的 id
+    // 生效，而 (b) 要的正是「同一个条目下的兄弟槽算占用者」。这里若照抄
+    // pickConversation 那份「按条目 id 摊平 + 按条目 id 跳过自己」的写法，会把
+    // 同一个终端的槽**彼此都跳过** —— 不报错，只是 (b) 静默失效、退回今天的行为。
+    const all = await this.store.load();
+    const soleInCwd = all.filter((e) => this.cwdFor(e) === cwd).length === 1;
     if (live === undefined && soleInCwd) {
       const candidates = candidatesForCwd(await listConversations(this.home()), cwd);
-      if (candidates.length > 0) {
+      const owners = ownersOf(
+        all.flatMap((e) =>
+          e.sessions.map((s) => ({ id: s.id, name: e.name, conversationId: s.conversationId })),
+        ),
+        slot.id,
+      );
+      const free = candidates.find((c) => !owners.has(c.id));
+      if (free !== undefined) {
         // 与「手动改绑」同一侧：**只写 conversationId，不动 liveSessionId**
         //（这是推断，不是观测，不该冒充观测值）。
-        await this.writeBinding(entry.id, slot.id, { conversationId: candidates[0].id });
-        return { kind: 'resume', conversationId: candidates[0].id };
+        await this.writeBinding(entry.id, slot.id, { conversationId: free.id });
+        return { kind: 'resume', conversationId: free.id };
       }
     }
 
@@ -1275,15 +1299,28 @@ export class TerminalManager {
    * 在某个终端下加一个会话槽（二级行上的 `+`）。
    *
    * **零弹框**：问名字、问目录在这里都没有意义（名字与目录是二级的配置，
-   * 新会话全继承）。新槽绑定为空，第一次点开它走的是
-   * `resolveLaunchSpec` 的未绑定分支。
+   * 新会话全继承）。
+   *
+   * **槽一出生就必须带一个 conversationId**（SPEC §7.4）：它与「零弹框」是
+   * 同一件事的两面，留空则会静默接到别人的对话上。留空的槽在
+   * `resolveLaunchSpec` 眼里与「本功能上线前的老条目」完全同形（都是「没有
+   * conversationId」），于是「+ 然后点开」会落进**未绑定路径 → 兜底 D**：
+   * 该 cwd 下只有一个条目时，它会静默 `--resume` 该目录下 mtime 最新的对话；
+   * 而多会话之后那条最新对话**很可能正是同一终端里另一个槽正在写的** ——
+   * 两个 claude 同写一条 `.jsonl`，数据损坏级。预分配一个「还没有对应
+   * .jsonl」的 id 则走已绑定分支的 `fresh`（裸 claude，开一条全新的），且因为
+   * liveSessionId 也是空的，连「记录似乎已被删除」那句提示都不会弹。
+   * 这与 `addEntryInteractive` 是同一条路径：两个新建入口不能一个分配、一个留空。
    *
    * **不自动打开终端**：「+」是「加一个会话位」，不是「立刻起一个 claude」，
    * 因此它没有任何副作用，也就没有「点错了要收拾」的问题。打开是紧接着点
    * 那一行的事（spec §13 的取舍：代价是新建会话变成两步）。
    */
   async addSessionInteractive(entry: TerminalEntry): Promise<void> {
-    await this.store.addSession(entry.id, { id: newId() });
+    await this.store.addSession(entry.id, {
+      id: newId(),
+      conversationId: newConversationId(),
+    });
   }
 
   async editEntryInteractive(entry: TerminalEntry): Promise<void> {
