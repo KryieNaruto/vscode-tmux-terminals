@@ -304,7 +304,9 @@ export function activate(context: vscode.ExtensionContext): void {
   // 只改绑定，不动正在跑的会话 —— 因此不 poll、只是刷新 tooltip
   reg('tmuxTerminals.bindConversation', async (arg: unknown) => {
     const it = item(arg);
-    if (it) await manager.bindConversationInteractive(it.entry);
+    // 绑定的主体是**会话槽**（v3）：命令参数此刻仍来自二级条目，取它的第一个槽
+    //（与 open 同侧；三级节点接好线后改为传那一个槽自己）。
+    if (it) await manager.bindConversationInteractive(it.entry, it.entry.sessions[0]);
     provider.refresh();
     batchProvider.refresh();
   });

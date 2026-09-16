@@ -198,7 +198,10 @@ export class TerminalManager {
   }
 
   /**
-   * 让用户为该条目挑一条对话。
+   * 让用户为该**会话槽**挑一条对话。
+   *
+   * `slot` 只用于「谁在问」：cwd 仍由条目决定，但归属判据（谁占着哪条对话）
+   * 必须按**槽**摊平 —— 见下面摊平那段的说明。
    *
    * 候选 = `~/.claude/projects` 下**文件里记录的 cwd 精确等于该条目 cwd** 的
    * 对话，按 mtime 倒序。绝不靠目录名反推归属（转义规则不可靠）。
@@ -223,6 +226,12 @@ export class TerminalManager {
    */
   private async pickConversation(
     entry: TerminalEntry,
+    /**
+     * 正在为哪个槽挑对话。**必须传**：归属判据与「跳过自己」都按它的 id 走
+     *（见下面摊平那段）—— 少了它就会退回「按条目判」，而那条路在多会话下
+     * 会静默失效。
+     */
+    slot: SessionSlot,
     title: string,
   ): Promise<{ total: number; picked?: ConversationCandidate; owner?: string; startNew: boolean }> {
     const cwd = this.cwdFor(entry);
@@ -235,21 +244,28 @@ export class TerminalManager {
       return { total: 0, startNew: false, picked: undefined };
     }
 
-    // 已被其它条目绑走的对话要标注出来：实测用户 4 条条目共用同一个 cwd，
+    // 已被别人绑走的对话要标注出来：实测用户 4 条条目共用同一个 cwd，
     // 选重了会让两条会话接进同一条对话，两边同时写同一个 .jsonl。
+    // 抢占者**不止别的条目**：同一个终端下的两个槽也能争同一条（用户手动选、
+    // 或手改清单文件都能做到），而后果一模一样。
     //
-    // v3 的绑定在**会话槽**上，而 ownersOf 只认「一条目一份绑定」的形状 ——
+    // v3 的绑定在**会话槽**上，而 ownersOf 只认「一份绑定一份视角」的形状 ——
     // 故先把清单摊平成「一条槽一份视角」再喂给它。写成直接把 entries 传进去
     // **不会报错**（conversationId 是可选字段，TerminalEntry 结构上仍满足
     // BindingView），但每个条目的 conversationId 都会读到 undefined，于是
     // 「已绑给「X」」这个标记与二次确认永远不出现 —— 静默退回选重不告警。
-    // 「跳过自己」那条规则仍按**条目** id 生效：同一个终端下的多个槽绑的是
-    // 不同对话，它们之间不存在「争同一条」。
+    //
+    // 摊平与「跳过自己」**都按槽 id**，一处按条目 id 都不行：ownersOf 的
+    // 「跳过自己」只按传进去的那个 id 生效。若照「按条目 id 摊平 + 按条目 id
+    // 跳过自己」写，同一个终端的槽会**彼此全被跳过** —— 不报错，只是兄弟槽
+    // 正在写的对话在列表里看起来无主、选中也不弹确认，用户于是能把第二个槽
+    // 绑上去：两个 claude 同写一条 .jsonl。`name` 仍是**终端名** ——
+    // 「已绑给「X」」要显示的是哪个终端占着它。
     const owners = ownersOf(
       (await this.store.load()).flatMap((e) =>
-        e.sessions.map((s) => ({ id: e.id, name: e.name, conversationId: s.conversationId })),
+        e.sessions.map((s) => ({ id: s.id, name: e.name, conversationId: s.conversationId })),
       ),
-      entry.id,
+      slot.id,
     );
 
     // 末尾固定跟一项「＋ 新建一条对话」：新对话只能由用户主动选出来。
@@ -411,9 +427,10 @@ export class TerminalManager {
     // 条目内部自己跟自己抢，缺一不可。
     //
     // 摊平必须用**槽 id** 当视角的 id：ownersOf 的「跳过自己」只按传入的 id
-    // 生效，而 (b) 要的正是「同一个条目下的兄弟槽算占用者」。这里若照抄
-    // pickConversation 那份「按条目 id 摊平 + 按条目 id 跳过自己」的写法，会把
-    // 同一个终端的槽**彼此都跳过** —— 不报错，只是 (b) 静默失效、退回今天的行为。
+    // 生效，而 (b) 要的正是「同一个条目下的兄弟槽算占用者」。若改成按条目 id
+    // 摊平 + 按条目 id 跳过自己，会把同一个终端的槽**彼此都跳过** —— 不报错，
+    // 只是 (b) 静默失效、退回今天的行为。（同一族，还有 pickConversation 的
+    // 归属标记那处，见 SPEC §11.17。）
     const all = await this.store.load();
     const soleInCwd = all.filter((e) => this.cwdFor(e) === cwd).length === 1;
     if (live === undefined && soleInCwd) {
@@ -443,7 +460,7 @@ export class TerminalManager {
       // restoreAll 会并行恢复它们 —— 只说终端名，用户看到两个一模一样的
       // 选择框时分不清正在给哪一个选（实测恢复 8 条时就会连弹）。
       const { total, picked, owner, startNew } = await this.pickConversation(
-        entry, `「${entry.name}」的${this.slotLabel(entry, slot)}接回哪条对话？`,
+        entry, slot, `「${entry.name}」的${this.slotLabel(entry, slot)}接回哪条对话？`,
       );
       if (total === 0) {
         const conversationId = newConversationId();
@@ -479,23 +496,31 @@ export class TerminalManager {
   }
 
   /**
-   * 显式命令：为**该条目的第一个会话槽**选择要接回的对话（随时可重新绑定）。
+   * 显式命令：为**指定的会话槽**选择要接回的对话（随时可重新绑定）。
    *
    * 只影响**下一次在这个槽里启动 claude**。会话还活着时那条对话本来就是
    * 对的，不必也不该去打断正在跑的 claude。
    */
-  async bindConversationInteractive(entry: TerminalEntry): Promise<void> {
-    // 绑定是**会话级**的（v3），而本命令此刻仍从二级条目触发 —— 落在第一个槽上。
+  async bindConversationInteractive(
+    entry: TerminalEntry,
+    /**
+     * 作用在哪个槽上。**由调用方给出**，绝不在这里猜「第一个」：绑定是槽级的
+     *（v3），而判归属、写绑定都要知道是哪一条槽 —— 猜错了就会在兄弟槽争同一条
+     * 对话时失去「已绑给「X」」标记与二次确认（见 pickConversation）。
+     */
+    slot: SessionSlot | undefined,
+  ): Promise<void> {
+    // 命令当前仍挂在二级条目上（`extension.ts` 传第一个槽），三级节点接好线之后
+    // 改为传那一个槽自己。
     // 空槽的条目**什么都不做**：没有槽就没有 id，写不回任何地方；现场编一个槽
     // 等于凭空造一个会话。迁移保证老条目都有槽，所以这条守卫只在手改坏了文件时
-    // 命中。
-    const slot = entry.sessions[0];
+    // 命中。类型上 `sessions[0]` 声称非空，故只能用 `undefined` 显式表达。
     if (slot === undefined) return;
     // 与 resolveLaunchSpec 同侧：读 owners → 选择框 → 确认 → 写绑定 全在一个
     // op 内，避免与并发的恢复流程互相看不到对方的绑定。
     await this.enqueuePick(async (): Promise<void> => {
       const { total, picked, owner, startNew } = await this.pickConversation(
-        entry, `为「${entry.name}」选择要接回的对话`,
+        entry, slot, `为「${entry.name}」选择要接回的对话`,
       );
 
       if (picked !== undefined) {
@@ -1471,9 +1496,9 @@ export class TerminalManager {
       `关闭「${entry.name}」下的全部 ${entry.sessions.length} 个会话？` +
       `其中正在运行的进程会一并终止，对应终端也会关闭。条目与会话槽保留。`,
       { modal: true },
-      '杀掉',
+      '关闭',
     );
-    if (pick !== '杀掉') return;
+    if (pick !== '关闭') return;
 
     for (const slot of entry.sessions) {
       await this.killSlot(sessionNameFor(slot.id));
