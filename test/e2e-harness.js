@@ -34,9 +34,67 @@ const Module = require('module');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { execFile } = require('child_process');
+const { execFile, execFileSync } = require('child_process');
 const { promisify } = require('util');
 const run = promisify(execFile);
+
+/**
+ * 进程级夹具兜底清扫 —— **任何提前退出都不许往用户的 tmux server 里丢垃圾**。
+ *
+ * **为什么需要它（实测踩过两次）**：夹具会话原本只在内联的**最后一节**
+ * （第 15 节「清理 + 用户环境未被触碰」）里销毁，之后才 `process.exit`。
+ * 于是**任何没跑到最后一节的退出**都会把全部夹具留在用户的 server 上：
+ * 被 SIGTERM/SIGINT 杀掉、工具超时、未捕获异常、崩溃 —— 实测一次漏 19 个
+ * （`tmuxterm-e2e{alive001,dead0001,fresh001,…,stale03}`）。
+ * 而这个 harness 跑在**用户真实的 tmux server** 上，那里还挂着用户自己的
+ * 终端（同为 `tmuxterm-` 前缀），垃圾会话既碍事又危险。
+ *
+ * **为什么必须同步**：`process.on('exit')` 里做不了异步 IO（`execFile` 是异步
+ * 的，回调永远排不上），只有 `execFileSync` 能把清扫真正做完再退出。
+ *
+ * **判据必须同时满足两条**，缺一不可 —— 只按前缀扫会**误杀用户正在用的终端**：
+ *   1. 名字以 `tmuxterm-e2e` 开头（本 harness 的夹具前缀）；**且**
+ *   2. 名字**不是** `tmuxterm-<12 位十六进制>` 的条目 id 形态。
+ * 第 2 条是必要的：条目 id 是 `randomBytes(6).toString('hex')`，**理论上存在
+ * 以 `e2e` 开头的 id**（如 `tmuxterm-e2e1234567890`）—— 那种名字既满足第 1 条，
+ * 又是用户真实会话，只按前缀扫就会把它杀掉。而 harness 的夹具名都形如
+ * `e2e<单词><数字>`（`e2ealive001`、`e2enew0001`…），**含非十六进制字母、
+ * 长度也不等于 12**，因此不会被第 2 条豁免掉。两条合起来：夹具全清、用户的全留。
+ */
+const FIXTURE_PREFIX = 'tmuxterm-e2e';
+const ENTRY_ID_SHAPE = /^tmuxterm-[0-9a-f]{12}$/;
+let swept = false;
+function sweepFixtures() {
+  if (swept) return; // 只扫一次：exit 与信号可能先后都到
+  swept = true;
+  let out;
+  try {
+    out = execFileSync('tmux', ['ls', '-F', '#{session_name}'], { encoding: 'utf8' });
+  } catch {
+    return; // tmux 不可用 / 没有 server → 没有可清的东西
+  }
+  for (const raw of out.split('\n')) {
+    const name = raw.trim();
+    if (!name.startsWith(FIXTURE_PREFIX)) continue;
+    // 用户真实会话的形态（条目 id 派生）—— 一个都不许碰
+    if (ENTRY_ID_SHAPE.test(name)) continue;
+    try {
+      // `=` 前缀强制精确匹配：tmux 的 `-t` 默认做前缀匹配，
+      // 不带 `=` 的话 `tmuxterm-e2enew0001` 会命中 `tmuxterm-e2enew0001x`
+      // 之类的会话（本仓库 core/tmux.ts 顶部记着同一条实测教训）。
+      execFileSync('tmux', ['kill-session', '-t', `=${name}`]);
+    } catch {
+      // 单个失败不影响其余；也绝不让退出流程抛错
+    }
+  }
+}
+process.on('exit', () => sweepFixtures());
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => {
+    sweepFixtures();
+    process.exit(1);
+  });
+}
 
 // ---- 1. 注入 vscode stub ----
 const calls = {
