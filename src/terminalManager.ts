@@ -18,12 +18,14 @@ import {
   NEW_CONVERSATION_LABEL,
   belongsToCwd,
   candidatesForCwd,
+  formatCandidateDetail,
+  formatCandidateTooltip,
   formatCandidateWithOwner,
   ownersOf,
 } from './core/conversation';
 import { isClaudeCommand, resumeFailed } from './core/claude';
 import { readProfileConfig } from './claudeConfig';
-import { findConversations, listConversations } from './conversationFiles';
+import { findConversations, listConversations, listConversationsForCwd } from './conversationFiles';
 import { LivenessSnapshot, liveSessionIn, readLiveness } from './liveSessions';
 import { reconcileBinding } from './core/reconcile';
 import { EntryStore, newConversationId, newId } from './core/store';
@@ -38,6 +40,17 @@ const SHELL_READY_TIMEOUT_MS = 3000;
  */
 const RESUME_CHECK_TIMEOUT_MS = 2500;
 const RESUME_CHECK_INTERVAL_MS = 250;
+
+/**
+ * 选择框里的一项：QuickPick 的显示字段 + 我们自己的负载。
+ *
+ * 显式声明而不是让 TS 从数组字面量推断：末尾那项「＋ 新建一条对话」没有
+ * candidate/owner，推断出的是个联合类型，取 pick.owner 会报「该属性不存在」。
+ */
+interface ConversationPickItem extends vscode.QuickPickItem {
+  candidate?: ConversationCandidate;
+  owner?: string;
+}
 
 export class TerminalManager {
   /**
@@ -76,7 +89,16 @@ export class TerminalManager {
      * 用最小接口而不是具体类型，与 tree.ts 的 store/activity 同一处理方式。
      * 省略 = 不预热（既有调用方不受影响）。
      */
-    private readonly titles?: { prewarm(conversationId: string | undefined, cwd: string): void },
+    private readonly titles?: {
+      prewarm(conversationId: string | undefined, cwd: string): void;
+      /**
+       * 轮询节拍上的低频重试（可选，见 retryTitles）。prewarm 只在 reconcile
+       * 时被调，而 /new 之后的**新**对话要过几个来回才生成 aiTitle ——
+       * 第一次读不到之后就再没有触发点重读了，第三级会永久消失。
+       * 省略（或实现没提供）= 不重试，退化成改动前的行为。
+       */
+      retryMissing?(sources: readonly { conversationId?: string; cwd: string }[]): void;
+    },
   ) {
     vscode.window.onDidCloseTerminal((t) => {
       this.busy.delete(t);
@@ -168,6 +190,10 @@ export class TerminalManager {
    * 列表**末尾固定跟一项「＋ 新建一条对话」**：新对话只能由用户主动选出来，
    * 绝不由「取消」隐式产生（见 resolveLaunchSpec）。
    *
+   * 每项还带**最后一问一答**：一行常显的问题（detail）+ 悬停浮层的问答
+   * （tooltip）。实测用户有十几条同 cwd 的对话，光靠「首条消息摘要 + 时间」
+   * 认不出「上次在聊的那个」—— 最后聊的内容才最接近记忆。
+   *
    * **调用方必须已经处在 `pickChain` 的一个 op 内**（本方法自己不再入队）。
    * 读 owners 必须与写绑定处在同一个 op 里，否则两个共用 cwd 的老条目会
    * 各自读到「还没人绑」的快照，双双接到同一条对话上。
@@ -177,7 +203,10 @@ export class TerminalManager {
     title: string,
   ): Promise<{ total: number; picked?: ConversationCandidate; owner?: string; startNew: boolean }> {
     const cwd = this.cwdFor(entry);
-    const candidates = candidatesForCwd(await listConversations(this.home()), cwd);
+    // 用 listConversationsForCwd 而不是「listConversations + candidatesForCwd」：
+    // 前者在**按 cwd 过滤之后**才去读尾部补最后一问一答，后者会先枚举全部
+    // 292 个文件，多读的那些尾部全是白读。
+    const candidates = await listConversationsForCwd(this.home(), cwd);
     if (candidates.length === 0) {
       // 没有任何可接回的 → 没有列表可弹，调用方直接开一条新的
       return { total: 0, startNew: false, picked: undefined };
@@ -187,20 +216,31 @@ export class TerminalManager {
     // 选重了会让两条会话接进同一条对话，两边同时写同一个 .jsonl。
     const owners = ownersOf(await this.store.load(), entry.id);
 
-    // 末尾固定跟一项「＋ 新建一条对话」：新对话只能由用户主动选出来
-    const newItem = { label: NEW_CONVERSATION_LABEL, candidate: undefined };
-    const convoItems = candidates.map((c) => {
+    // 末尾固定跟一项「＋ 新建一条对话」：新对话只能由用户主动选出来。
+    // 它**不参与** detail/tooltip 那套渲染 —— 它没有 conversationId，也不该
+    // 长得像一条历史对话。
+    const newItem: ConversationPickItem = { label: NEW_CONVERSATION_LABEL };
+    const convoItems: ConversationPickItem[] = candidates.map((c) => {
       const owner = owners.get(c.id);
+      const detail = formatCandidateDetail(c);
+      const tooltip = formatCandidateTooltip(c);
       return {
         label: formatCandidateWithOwner(c, owner),
         candidate: c,
         ...(owner !== undefined ? { owner } : {}),
+        // 取不到问答就不给这两个字段：QuickPick 少一行，而不是显示一行空的
+        ...(detail !== undefined ? { detail } : {}),
+        // tooltip 用 MarkdownString：问答之间要分段，纯字符串会糊成一行
+        ...(tooltip !== undefined ? { tooltip: new vscode.MarkdownString(tooltip) } : {}),
       };
     });
-    const pick = await vscode.window.showQuickPick([...convoItems, newItem], {
-      title,
-      placeHolder: `${cwd} 下有 ${candidates.length} 条可接回的对话`,
-    });
+    const pick = await vscode.window.showQuickPick<ConversationPickItem>(
+      [...convoItems, newItem],
+      {
+        title,
+        placeHolder: `${cwd} 下有 ${candidates.length} 条可接回的对话`,
+      },
+    );
     return {
       total: candidates.length,
       startNew: pick === newItem,
@@ -241,9 +281,10 @@ export class TerminalManager {
    *
    * 顺序即优先级：
    *
-   *  1. 已绑定 → 该用 `--resume` 还是 `--session-id`，取决于那条对话**是否
-   *     已经存在**（`--session-id` 建出来 vs `--resume` 接回）。用 `+` 新建的
-   *     条目一出生就带 id，但那条对话还没被创建过，必须走前者。
+   *  1. 已绑定 → 那条对话**是否已经存在**决定走哪一支：还不存在（首启，或
+   *     记录被外部删了）→ `fresh`，即裸 `claude`、**不带任何会话标识**；
+   *     存在且在本条目 cwd 下 → `--resume` 接回。用 `+` 新建的条目一出生就
+   *     带 id，但那条对话还没被创建过，走的正是前者。
    *     对话存在、却不在本条目的 cwd 下 → `--resume` 按 cwd 作用域必然失败，
    *     而**绝不替用户另开一条**，故返回 undefined 并说明原委。
    *  2. 未绑定（只可能是本功能上线前的老条目）+ 该 cwd 下有候选 → 问用户挑
@@ -266,16 +307,29 @@ export class TerminalManager {
     if (bound !== undefined && bound.length > 0) {
       const cwds = await findConversations(this.home(), bound);
       if (cwds.length === 0) {
-        // 还没被创建过 → 把它建出来。两种来源都走这里：
-        //  - 用 `+`/复制新建的条目第一次启动（正常）；
-        //  - 那条 .jsonl 被**外部删掉**了（手动 rm、清理工具）。
-        // 两者在数据上不可区分，但**必须出声**：后者如果静默，用户只会觉得
-        // 「我的对话又没了」。文案对两种情况都要成立。
-        void vscode.window.showInformationMessage(
-          `「${entry.name}」绑定的对话还没有记录，本次新开一条（绑定保持不变）。` +
-          `首次启动时这属正常；若这条对话本应存在，说明它的记录已被删除。`,
-        );
-        return { kind: 'new', conversationId: bound };
+        // 那条 .jsonl 不存在。两种来源在「文件」这一层不可区分，用
+        // entry.liveSessionId（上一次**已确认观测到**的活跃会话）分开：
+        //  - undefined = 从未观测到它跑起来过 → 「+」/复制新建的条目
+        //    **首次启动**，完全正常，**一声不吭**（旧代码在这里弹提示，
+        //    正是用户抱怨的那条：条目一出生就带个没人认识的会话 id）；
+        //  - 有值 = 曾经跑起来过、对话本该存在 → 那条 .jsonl 被**外部删掉**了
+        //    （手动 rm、清理工具）。这时沉默才是坏事：用户只会觉得「我的
+        //    对话又没了」，必须出声。
+        // 这是个**启发式**：理论上「条目跑起来过、对话文件却从未落盘」会被
+        // 误判成后者，多弹一条提示 —— 那属于更罕见的组合，代价可接受；
+        // 反过来漏报，才是真的让用户丢掉唯一线索。
+        //
+        // 两支都返回 `fresh`（裸 claude，不带任何会话标识）：没有可顶掉的
+        // 对话，当场开一条新的即可，绑定会由 reconcile 观测到那条新会话后
+        // 自动回写（见 core/reconcile.ts 第三分支）。文案里**不能**再写
+        // 「绑定保持不变」—— 绑定马上就会被改写到新对话上。
+        if (entry.liveSessionId !== undefined) {
+          void vscode.window.showInformationMessage(
+            `「${entry.name}」绑定的对话记录似乎已被删除，本次新开一条，` +
+            `绑定会跟着这条新对话走。若这条对话本应存在，请检查它的记录是否被外部清理。`,
+          );
+        }
+        return { kind: 'fresh' };
       }
       if (cwds.some((c) => belongsToCwd(c, cwd))) {
         return { kind: 'resume', conversationId: bound };
@@ -462,6 +516,27 @@ export class TerminalManager {
       }
     }
     return wrote;
+  }
+
+  /**
+   * 轮询节拍上的低频重试：把**当前所有条目**的绑定对话交给标题缓存，由缓存
+   * 对「已绑定但还没缓存到标题」的那些按冷却重新发起预取。
+   *
+   * 与 reconcileAll / reconcileOne 里那两次 prewarm 是**互补**关系，不是替代：
+   * 那两处覆盖「用户动作 → 当场观测一次」，这里覆盖「期间没有任何用户动作，
+   * 但标题是**后来才生成**的」—— /new 之后的新对话正是后者。
+   *
+   * **为什么转换放在 manager 而不是 extension.ts**：cwd 要经 `cwdFor` 展开
+   * `~`（与上面两处 prewarm 同源，写错就定位不到 transcript），条目 →
+   * 「绑定 + cwd」的形状转换也只该有一处。
+   *
+   * 不查缓存、不做去重，全交给缓存内部（成本只是每拍几次 Map 查询）。
+   * `titles` 省略或实现没提供 retryMissing 时是 no-op。
+   */
+  retryTitles(entries: readonly TerminalEntry[]): void {
+    this.titles?.retryMissing?.(
+      entries.map((e) => ({ conversationId: e.conversationId, cwd: this.cwdFor(e) })),
+    );
   }
 
   /**
@@ -658,6 +733,9 @@ export class TerminalManager {
     await this.tmux.sendLiteral(session, conversationCommand(current, spec));
     await this.tmux.sendEnter(session);
 
+    // 只有 `resume` 需要盯 pane：它是**唯一**可能因「对话不在这个目录下」
+    // 而失败的一支（claude 会打印 `No conversation found` 就退出）。`new` /
+    // `fresh` 都是当场开一条新对话，没有「接不上」这回事。
     if (spec.kind === 'resume') await this.warnIfResumeFailed(session, current);
   }
 
@@ -989,7 +1067,10 @@ export class TerminalManager {
 
     // 一出生就分配 conversationId：这样「无 conversationId」此后**只**表示
     // 「本功能上线前的老条目」，新建的条目永远不会被弹选择框。
-    // 首次启动用 `--session-id <它>` 把这条对话建出来（见 resolveLaunchSpec）。
+    // 注意这个 id 此刻**还没有对应任何对话** —— 首次启动走的是 `fresh`
+    // （裸 claude，一个会话参数都不带），这条 id 只是占住「已绑定、别弹
+    // 选择框」的位；真正在用的那条对话由 reconcile 观测到之后回写
+    // （见 resolveLaunchSpec 与 core/reconcile.ts）。
     await this.store.append({
       id: newId(), name, cwd, profile: 'ccr', autoRestore,
       conversationId: newConversationId(),

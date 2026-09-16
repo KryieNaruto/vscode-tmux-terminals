@@ -54,7 +54,9 @@ export function activate(context: vscode.ExtensionContext): void {
     treeDataProvider: provider,
     dragAndDropController: provider,
   });
-  context.subscriptions.push(view);
+  // provider 一并进订阅表：它订阅了标题缓存（标题异步落地 → fire 刷新树），
+  // 要在 dispose 时解除。VS Code 只管视图的生命期，不会替我们调 provider。
+  context.subscriptions.push(view, provider);
 
   const batchProvider = new BatchTreeProvider(store);
   const batchView = vscode.window.createTreeView('tmuxTerminals.batch', {
@@ -87,6 +89,13 @@ export function activate(context: vscode.ExtensionContext): void {
     inFlight = true;
     try {
       provider.setAlive(new Set(await tmux.listSessions()));
+      // 任务名缓存的低频重试就挂在这一拍上。
+      // **刻意不挂 900ms 的活动采样**：那一拍只关心 pane 前台状态，而这里
+      // 每次都要 tail-read 一个可能上 MB 的 transcript，跟着 900ms 跑是灾难。
+      // 挂在 poll 上也意味着它天然受同一个 `view.visible` 开关约束：面板
+      // 隐藏时这拍根本不跑 —— 没人看的时候不必重读。缓存内部另有
+      // RETRY_COOLDOWN_MS 冷却，所以每条的实际读盘频率远低于 10s 一次。
+      manager.retryTitles(await store.load());
     } finally {
       inFlight = false;
     }

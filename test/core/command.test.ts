@@ -45,6 +45,28 @@ describe('conversationCommand —— 条目 ↔ 对话绑定', () => {
     );
   });
 
+  it('★ fresh：首启是裸 claude，既不带 --session-id 也不带 --resume', () => {
+    const out = conversationCommand(e(), { kind: 'fresh' });
+    assert.strictEqual(out, 'claude --dangerously-skip-permissions');
+    assert.ok(!out.includes('--session-id'), `不该带 --session-id：${out}`);
+    assert.ok(!out.includes('--resume'), `不该带 --resume：${out}`);
+  });
+
+  it('fresh 与 new/resume 共用同一套 profile/model 派生（direct + 模型）', () => {
+    assert.strictEqual(
+      conversationCommand(e({ profile: 'direct', model: 'claude-sonnet-5[1m]' }), { kind: 'fresh' }),
+      `claude-direct --dangerously-skip-permissions --model 'claude-sonnet-5[1m]'`,
+    );
+  });
+
+  it('fresh 逐字节等于 commandFor（除 profile/model 外没有第二个来源）', () => {
+    // 边界：模型名需要 shell 引用时，fresh 也必须走同一条 shellQuote 路径 ——
+    // 「不加后缀」不能顺手绕开引用（那是注入面）。
+    const tricky = e({ profile: 'direct', model: "a b'c" });
+    assert.strictEqual(conversationCommand(tricky, { kind: 'fresh' }), commandFor(tricky));
+    assert.ok(conversationCommand(tricky, { kind: 'fresh' }).includes("'a b'\\''c'"));
+  });
+
   it('★ resume：有绑定就必须 --resume 接回那条对话，绝不重开一条顶替', () => {
     assert.strictEqual(
       conversationCommand(e(), { kind: 'resume', conversationId: ID }),

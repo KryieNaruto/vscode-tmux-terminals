@@ -6,7 +6,9 @@
  * TerminalManager.openEntry 对着**真 tmux** 驱动起来，从而自动验证
  * 几条最核心的不变量：
  *
- *   1. 会话不存在 → 新建，并启动与该条目**绑定**的那条对话
+ *   1. 绑定的对话**不存在** → 不传任何会话参数地新开一条（裸 claude，既不
+ *      `--session-id` 也不 `--resume`）。分两种：条目**从未跑起来过**（「+」/
+ *      复制新建的首启）一声不吭；**曾观测到跑起来过**、记录却被删了则出声提醒
  *   2. 会话已存在且 claude 还在跑 → 只接回，**绝不发送任何命令**
  *   3. 已死 / claude 已退出 → 接回**它自己那条**对话（--resume），
  *      绝不新开一条把它顶掉
@@ -176,6 +178,9 @@ const CONV_RESTART = 'aaaaaaaa-0004-0000-0000-000000000000';
 const CONV_RESTART2 = 'aaaaaaaa-0008-0000-0000-000000000000';
 const CONV_FAIL = 'aaaaaaaa-0005-0000-0000-000000000000';
 const CONV_STALE = 'aaaaaaaa-0006-0000-0000-000000000000';
+// 与 CONV_FRESH 一样**始终不被创建**，但绑定它的条目 liveSessionId 有值 ——
+// 用它区分「首启（从未跑起来过）」与「记录被外部删了（曾观测到跑起来过）」。
+const CONV_LOST = 'aaaaaaaa-0009-0000-0000-000000000000';
 const PICKED_CONV = '99999999-8888-7777-6666-555555555555';
 /** 并发用例专用：一开始没人绑，让第一个条目绑上、第二个必须看见它。 */
 const RACE_CONV = '77777777-6666-5555-4444-333333333333';
@@ -480,7 +485,8 @@ async function projectSnapshot() {
 
 (async () => {
   const ID_NEW = 'e2enew0001';         // 老条目（无绑定）+ 无候选 → --session-id 并绑定
-  const ID_FRESH = 'e2efresh001';      // 新建条目（已绑定，对话未创建）→ --session-id，且不问
+  const ID_FRESH = 'e2efresh001';      // 新建条目（已绑定，对话未创建）→ 裸 claude，且不问
+  const ID_LOST = 'e2elost0001';       // 曾观测到跑起来过 + 记录被外部删除 → 出声 + 裸 claude
   const ID_DEAD = 'e2edead0001';       // 已死 + 已绑定（对话存在）→ --resume
   const ID_ALIVE = 'e2ealive001';      // 存活 + claude 在跑 → 只 attach
   const ID_SHELL = 'e2eshell001';      // 存活 + claude 已退出 → --resume
@@ -502,7 +508,7 @@ async function projectSnapshot() {
   const ID_B = 'e2e0000ab';            // 与 ID_PREFIX 互为前缀，验证互不干扰
   const ID_PREFIX = 'e2e0000a';
   const STALE_IDS = ['e2estale01', 'e2estale02', 'e2estale03', 'e2estale04'];
-  const ALL = [ID_NEW, ID_FRESH, ID_DEAD, ID_ALIVE, ID_SHELL, ID_LEGACY, ID_LEGACY_NEW,
+  const ALL = [ID_NEW, ID_FRESH, ID_LOST, ID_DEAD, ID_ALIVE, ID_SHELL, ID_LEGACY, ID_LEGACY_NEW,
     ID_LEGACY_ESC, ID_SHARE, ID_SHARE2, ID_TOCTOU, ID_RACE_A, ID_RACE_B, ID_RACEBRANCH,
     ID_RESTART, ID_NOBIND, ID_RESUMEFAIL, ID_CONFLICT, ID_KILL, ID_REFUSE, ID_B, ID_PREFIX,
     ...STALE_IDS];
@@ -589,6 +595,9 @@ async function projectSnapshot() {
   store.entries = [
     mk(ID_NEW, 'NEW', SCRATCH),                                   // 老条目：无 conversationId
     mk(ID_FRESH, 'FRESH', BOUND_CWD, { conversationId: CONV_FRESH }),
+    // 绑定的 .jsonl 不存在 + liveSessionId 有值 = 「曾观测到跑起来过，记录却被
+    // 外部删了」。与 ID_FRESH 的唯一差别就是这个 liveSessionId。
+    mk(ID_LOST, 'LOST', BOUND_CWD, { conversationId: CONV_LOST, liveSessionId: CONV_LOST }),
     mk(ID_DEAD, 'DEAD', BOUND_CWD, { conversationId: CONV_DEAD }),
     mk(ID_ALIVE, 'ALIVE', BOUND_CWD, { conversationId: CONV_ALIVE }),
     mk(ID_SHELL, 'SHELL', BOUND_CWD, { conversationId: CONV_SHELL }),
@@ -678,7 +687,7 @@ async function projectSnapshot() {
     chk('发的 id 就是落盘的那个', (sent[0] || '').includes(bound(ID_NEW)));
   }
 
-  console.log('\n=== 2. 新建条目（已绑定、对话尚未创建）→ --session-id，且不弹选择框 ===');
+  console.log('\n=== 2. 新建条目（已绑定、对话尚未创建）→ 裸 claude，且不弹选择框、不出声 ===');
   {
     resetCalls();
     const mgr = newManager();
@@ -688,12 +697,40 @@ async function projectSnapshot() {
     chk('★ 全程没弹选择框（新建条目不该被问）', calls.quickPicks.length === 0,
       JSON.stringify(calls.quickPicks.map((q) => q.opts && q.opts.title)));
     const sent = literalsTo(S(ID_FRESH));
-    chk('★ 用 --session-id 把绑定的那条建出来（它还不存在，不能用 --resume）',
-      sent.length === 1 && sent[0].includes(`--session-id '${CONV_FRESH}'`), JSON.stringify(sent));
+    // 「+」/复制新建的条目一出生就带 id，但那条对话还没被创建过 —— 此时没有
+    // 可接回的对话，首启就是一条**裸 claude**（LaunchSpec 的 fresh）。绝不预先
+    // 钉一个用户没见过的 uuid：claude 当场开出来的那条才是真正在用的，reconcile
+    // 观测到之后会把绑定回写到它身上，不需要靠 --session-id 提前造。
+    chk('★ 裸 claude：一个会话参数都不带（既不 --session-id 也不 --resume）',
+      sent.length === 1 && !sent[0].includes('--session-id') && !sent[0].includes('--resume'),
+      JSON.stringify(sent));
     chk('绑定的 id 没有被改掉', bound(ID_FRESH) === CONV_FRESH);
-    chk('★ 出声了：提醒这条对话没有记录、本次新开一条（不再静默）',
-      calls.messages.some((m) => String(m).includes('还没有记录') && String(m).includes('新开一条')),
+    chk('★ 一声不吭：首启是正常路径，不是异常（没有任何提示）',
+      calls.messages.length === 0, JSON.stringify(calls.messages));
+  }
+
+  console.log('\n=== 2b. 绑定的记录被外部删除（曾观测到跑起来过）→ 出声，启动仍是裸 claude ===');
+  {
+    // 只覆盖「记录被外部删了要出声」这条路径：单测里有，e2e 原先完全没有。
+    resetCalls();
+    const mgr = newManager();
+    await mgr.openEntry(fresh(ID_LOST));
+    await sleep(2500);
+
+    // 与第 2 组的**唯一**差别是 entry.liveSessionId 有值（= 上一次已确认观测到
+    // 这个终端在跑哪条会话）。对话文件在「文件」这一层两件事不可区分，全靠它
+    // 分开：没有它 = 从未跑起来过（第 2 组，静默）；有它 = 那条 .jsonl 被外部
+    // 删了（手动 rm、清理工具），这时沉默会让用户以为「对话又没了」，必须出声。
+    chk('★ 出声了：提醒这条对话的记录已被删除、本次新开一条',
+      calls.messages.some((m) => String(m).includes('似乎已被删除') && String(m).includes('新开一条')),
       JSON.stringify(calls.messages));
+    const sent = literalsTo(S(ID_LOST));
+    // 没有可接回的对话 → 仍是裸 claude；绑定会由 reconcile 观测到新会话后回写。
+    chk('★ 启动命令仍是裸 claude（没有可接回的对话，也不预钉 uuid）',
+      sent.length === 1 && !sent[0].includes('--session-id') && !sent[0].includes('--resume'),
+      JSON.stringify(sent));
+    chk('不弹选择框（条目已绑定，没什么可挑）', calls.quickPicks.length === 0,
+      JSON.stringify(calls.quickPicks.map((q) => q.opts && q.opts.title)));
   }
 
   console.log('\n=== 3. 会话已死 + 已绑定（对话存在）→ --resume 接回它自己那条（核心） ===');
