@@ -4,7 +4,7 @@ import { EntryActivity } from './core/activity';
 import { groupByCwd } from './core/grouping';
 import { reorderWithinGroup } from './core/reorder';
 import { sessionNameFor } from './core/tmux';
-import { TerminalEntry } from './core/types';
+import { SessionSlot, TerminalEntry } from './core/types';
 
 /** profile 对应的徽标颜色。ccr=蓝（本地中转），direct=橙（官方直连）。 */
 function profileColor(entry: TerminalEntry): vscode.ThemeColor {
@@ -16,12 +16,21 @@ function profileColor(entry: TerminalEntry): vscode.ThemeColor {
 /**
  * tooltip 里的「对话」一行。
  *
+ * **入参是会话槽而不是条目**：绑定是会话级的属性，一个二级条目下可以有 N 个
+ * 会话、各有各的绑定，条目本身没有唯一的「当前对话」可读 —— 读条目只会得到
+ * 一个 undefined（那个字段已经从 TerminalEntry 上删掉了，是编译器把我们带到
+ * 这里来的）。
+ *
+ * 槽可以是 undefined（`sessions: []` 是 v3 的合法状态）：那种条目一行会话都
+ * 没有，如实说「没有任何会话」，不要拿条目 id 去凑一个占位说法。
+ *
  * 显示短 id 而不是首条用户消息：要拿到它得读会话文件（哪怕只读头部窗口），
  * 而 tooltip 是同步渲染的 —— 为了一个提示去同步读盘不值得。想认内容就用
  * 「选择要接回的对话…」命令，那里显示首条用户消息的原文。
  */
-function conversationLabel(entry: TerminalEntry): string {
-  const id = entry.conversationId;
+function conversationLabel(slot: SessionSlot | undefined): string {
+  if (slot === undefined) return '（该终端下没有任何会话）';
+  const id = slot.conversationId;
   if (id === undefined || id.length === 0) {
     return '（未绑定 —— 下次启动 claude 时会让你选一条）';
   }
@@ -93,7 +102,7 @@ export class EntryTreeItem extends vscode.TreeItem {
         `- profile：${entry.profile === 'direct' ? '🟠 direct（官方直连）' : '🔵 ccr（本地中转）'}`,
         `- 模型：${entry.model && entry.model.length > 0 ? `\`${entry.model}\`` : '（profile 默认）'}`,
         `- 基础命令：\`${commandFor(entry)}\``,
-        `- 对话：${conversationLabel(entry)}`,
+        `- 对话：${conversationLabel(entry.sessions[0])}`,
         `- 状态：${alive ? '🟢 会话存活，点击接回原进程' : '⚪ 无会话，点击重建并接回该对话'}`,
         `- 任务：${taskName.length > 0 ? taskName : '（无）'} · ${activityLabel(activity)}`,
         `- 参与全部恢复：${entry.autoRestore ? '是' : '否'}`,
@@ -263,9 +272,11 @@ export class EntryTreeProvider
    */
   private taskNameFor(entry: TerminalEntry): string {
     const fromPane = this.activity?.activityFor(entry.id)?.taskName ?? '';
+    // 回退源取**该条目的第一个槽**的绑定：v3 的对话绑定在槽上，条目上已经没有
+    // 这个字段了。空槽的条目没有绑定可 peek，回退源自然是空串（不编造）。
     return fromPane.length > 0
       ? fromPane
-      : this.titleFallback?.peek(entry.conversationId) ?? '';
+      : this.titleFallback?.peek(entry.sessions[0]?.conversationId) ?? '';
   }
 
   async getChildren(element?: TreeNode): Promise<TreeNode[]> {
@@ -277,14 +288,21 @@ export class EntryTreeProvider
       );
     }
     if (element instanceof FolderTreeItem) {
-      return element.entries.map(
-        (e) => new EntryTreeItem(
+      return element.entries.map((e) => {
+        // 存活判据落在**槽**上：tmux 会话名由槽 id 派生（v3），而条目 id 只在
+        // v1/v2 迁移出来的槽上与槽 id 恰好相等 —— 拿条目 id 去凑一个会话名，
+        // 会在「槽 id 与条目 id 不同」的条目上查到一个毫不相干的 tmux 会话。
+        //
+        // 空槽的条目（`sessions: []`）一律判为「无会话」：它名下确实一个会话
+        // 都没有，这正是实情，不是降级。
+        const slot = e.sessions[0];
+        return new EntryTreeItem(
           e,
-          this.alive.has(sessionNameFor(e.id)),
+          slot !== undefined && this.alive.has(sessionNameFor(slot.id)),
           this.activity?.activityFor(e.id),
-          this.taskNameFor(e), // ← 新增参数
-        ),
-      );
+          this.taskNameFor(e),
+        );
+      });
     }
     if (element instanceof EntryTreeItem) {
       const activity = this.activity?.activityFor(element.entry.id);

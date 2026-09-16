@@ -243,7 +243,8 @@ export function activate(context: vscode.ExtensionContext): void {
       // 先清"刚完成待查看"标记再真正打开：用户点开就是"看到了"，
       // 图标应该立刻恢复，不用等下一轮 tmux 轮询。
       tracker.markSeen(it.entry.id);
-      await manager.openEntry(it.entry);
+      // 打开的是**会话**（v3）：命令参数此刻仍来自二级条目，取它的第一个槽。
+      await manager.openSession(it.entry, it.entry.sessions[0]);
     }
   });
 

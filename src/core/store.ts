@@ -1,8 +1,9 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { isV1Shape, migrateEntry } from './migrate';
-import { TerminalEntry } from './types';
+import { isV1Shape, isV2Shape, migrateEntry } from './migrate';
+import { nextSessionOrder, sortSessions } from './sessions';
+import { SessionSlot, TerminalEntry } from './types';
 
 /** 生成条目 id。用 crypto 而非 Math.random，避免同一毫秒内碰撞。 */
 export function newId(): string {
@@ -116,10 +117,16 @@ export class EntryStore {
     // 按 order 升序；order 相同时保持原下标顺序（稳定排序）。
     // 负数 order 只可能来自手改文件（spec 规定从 0 递增），钳到 0 —— 否则
     // 一个 -1 会永远排在最前，而后续写入又会把它重编号，状态自相矛盾。
-    return migrated
-      .map((e, i) => ({ e: { ...e, order: Math.max(0, e.order) }, i }))
-      .sort((a, b) => (a.e.order - b.e.order) || (a.i - b.i))
-      .map((x) => x.e);
+    return (
+      migrated
+        .map((e, i) => ({ e: { ...e, order: Math.max(0, e.order) }, i }))
+        .sort((a, b) => (a.e.order - b.e.order) || (a.i - b.i))
+        // 槽也各自归一化一次（按 order 升序 + 负数钳零）。**放在这里而不是各
+        // 消费方**：tree / batchTree / terminalManager 拿到的 `sessions` 必须已经
+        // 是「排好序、无负数」的同一份真相，各算一遍迟早会算歪。与条目排序一样，
+        // 这一步**不改写文件** —— 迁移与归一化只存在于内存。
+        .map((x) => ({ ...x.e, sessions: sortSessions(x.e.sessions) }))
+    );
   }
 
   /**
@@ -137,6 +144,34 @@ export class EntryStore {
     if (raw === undefined) return false;
     if (!raw.some(isV1Shape)) return false;
     const bak = `${this.filePath}.bak`;
+    try {
+      await fs.access(bak);
+      return false; // 已有备份，不覆盖
+    } catch {
+      // 不存在 → 建它
+    }
+    const text = await fs.readFile(this.filePath, 'utf8');
+    await fs.writeFile(bak, text, 'utf8');
+    return true;
+  }
+
+  /**
+   * 若文件里含 v2 形态的条目，备份为 `<file>.v2.bak` 并返回 true。
+   *
+   * 与上面 `migrateAndBackup`（v1 → `<file>.bak`）**并列、互不覆盖**。三种输入
+   * 因此各得其所：v1 文件只写 `.bak`（里面是 v1 原文），v2 文件只写 `.v2.bak`
+   * （里面是 v2 原文），v3 文件一个都不写 —— 两个备份名各自都是诚实的，不会
+   * 出现「叫 `.v2.bak` 里面却是 v1」。
+   *
+   * 两条规则与 v1 那份完全同源：**只在真的要迁移时**才写（判据是 isV2Shape，
+   * 而不是「有 profile」—— 见 migrate.ts 里那条注释），且**已存在的不覆盖**
+   * ——第一次的备份才是用户的原始数据，覆盖会让它失去意义。
+   */
+  async migrateAndBackupV2(): Promise<boolean> {
+    const raw = await this.readRaw();
+    if (raw === undefined) return false;
+    if (!raw.some(isV2Shape)) return false;
+    const bak = `${this.filePath}.v2.bak`;
     try {
       await fs.access(bak);
       return false; // 已有备份，不覆盖
@@ -213,6 +248,74 @@ export class EntryStore {
       const idx = all.findIndex((e) => e.id === id);
       if (idx === -1) return;
       all[idx] = { ...all[idx], ...patch, id: all[idx].id };
+      await this.save(all);
+    });
+  }
+
+  /**
+   * 在锁内定位槽并合并补丁。条目 / 槽不存在则什么都不做。
+   *
+   * **为什么必须新增而不是复用 `update`**：`update(id, patch)` 的 patch 是调用方
+   * 在**锁外**算好的。槽级改动在锁外算，就会「load 出旧数组 → 改一个槽 → 写回」
+   * —— 同一终端的两个槽在同一轮 reconcile 里各自算出新数组时，后写者盖掉先写者
+   * （lost update），表现为「改绑偶尔不生效」。这与 `append` 注释里「order 不能
+   * 在调用方算」是**同一类**错误，用同一种办法（把复合操作收进锁内）解决。
+   *
+   * `id` 钉死在原值（照 `update` 对 `entry.id` 的做法）：补丁里混进 `id` 就会把
+   * 槽的 tmux 会话名改掉 —— 那等于换了一个会话，而调用方以为自己只是在改绑定。
+   */
+  async updateSession(
+    entryId: string,
+    sessionId: string,
+    patch: Partial<SessionSlot>,
+  ): Promise<void> {
+    return this.enqueue(async () => {
+      const all = await this.load();
+      const idx = all.findIndex((e) => e.id === entryId);
+      if (idx === -1) return;
+      const entry = all[idx];
+      if (!entry.sessions.some((s) => s.id === sessionId)) return;
+      all[idx] = {
+        ...entry,
+        sessions: entry.sessions.map(
+          (s) => (s.id === sessionId ? { ...s, ...patch, id: s.id } : s),
+        ),
+      };
+      await this.save(all);
+    });
+  }
+
+  /**
+   * 在锁内追加一个槽，`order` **在锁内分配**（理由同 `append`：在调用方算的话，
+   * `load` 与写入之间没有锁，两次并发新增会算出同一个 order，排序随即变得不确定）。
+   *
+   * 入参因此是 `Omit<SessionSlot, 'order'>` —— 调用方只需要给 id（和可选的绑定），
+   * order 由这里补齐。
+   */
+  async addSession(entryId: string, slot: Omit<SessionSlot, 'order'>): Promise<void> {
+    return this.enqueue(async () => {
+      const all = await this.load();
+      const idx = all.findIndex((e) => e.id === entryId);
+      if (idx === -1) return;
+      const entry = all[idx];
+      all[idx] = {
+        ...entry,
+        sessions: [...entry.sessions, { ...slot, order: nextSessionOrder(entry.sessions) }],
+      };
+      await this.save(all);
+    });
+  }
+
+  /** 在锁内移除一个槽。条目 / 槽不存在则什么都不做（幂等，删两次不炸）。 */
+  async removeSession(entryId: string, sessionId: string): Promise<void> {
+    return this.enqueue(async () => {
+      const all = await this.load();
+      const idx = all.findIndex((e) => e.id === entryId);
+      if (idx === -1) return;
+      const entry = all[idx];
+      const kept = entry.sessions.filter((s) => s.id !== sessionId);
+      if (kept.length === entry.sessions.length) return; // 没这个槽 → 不必写盘
+      all[idx] = { ...entry, sessions: kept };
       await this.save(all);
     });
   }
