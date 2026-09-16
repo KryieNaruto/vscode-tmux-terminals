@@ -99,6 +99,23 @@ export class TerminalManager {
        */
       retryMissing?(sources: readonly { conversationId?: string; cwd: string }[]): void;
     },
+    /**
+     * 「刚刚回写了绑定」的回调。绑定一变，树上的两处显示（三级任务名、
+     * tooltip 里的「对话」行）就都过期了，必须重算。
+     *
+     * **为什么放在 manager 而不是各调用点**：回写绑定的出口有 **7 个**
+     * —— reconcileAll 自己那一次（整批循环跑完按 `wrote` 一次性通知），
+     * 加上 6 个走 `writeBinding` 的单点：reconcileOne 1 处、resolveLaunchSpec
+     * 4 处（兜底 D、`total === 0`、startNew、选中历史对话）、
+     * bindConversationInteractive 2 处（选中、startNew）。**回写点比入口还
+     * 多**，而调用它们的入口有好几个（点击条目、⟳、激活、面板可见、
+     * 展开节点、10 秒存活轮询、restoreAll）—— 在一堆入口上逐个补 refresh
+     * 是漏一个就静默失效的写法；集中在这里，新增入口、新增回写点都自动
+     * 覆盖。
+     *
+     * 省略 = 不通知（单测与 e2e harness 直接 new 出 manager 时不受影响）。
+     */
+    private readonly onBindingsChanged?: () => void,
   ) {
     vscode.window.onDidCloseTerminal((t) => {
       this.busy.delete(t);
@@ -362,7 +379,7 @@ export class TerminalManager {
       if (candidates.length > 0) {
         // 与「手动改绑」同一侧：**只写 conversationId，不动 liveSessionId**
         //（这是推断，不是观测，不该冒充观测值）。
-        await this.store.update(entry.id, { conversationId: candidates[0].id });
+        await this.writeBinding(entry.id, { conversationId: candidates[0].id });
         return { kind: 'resume', conversationId: candidates[0].id };
       }
     }
@@ -378,12 +395,12 @@ export class TerminalManager {
       );
       if (total === 0) {
         const conversationId = newConversationId();
-        await this.store.update(entry.id, { conversationId });
+        await this.writeBinding(entry.id, { conversationId });
         return { kind: 'new', conversationId };
       }
       if (startNew) {
         const conversationId = newConversationId();
-        await this.store.update(entry.id, { conversationId });
+        await this.writeBinding(entry.id, { conversationId });
         return { kind: 'new', conversationId };
       }
       if (picked === undefined) {
@@ -404,7 +421,7 @@ export class TerminalManager {
         return undefined;
       }
 
-      await this.store.update(entry.id, { conversationId: picked.id });
+      await this.writeBinding(entry.id, { conversationId: picked.id });
       return { kind: 'resume', conversationId: picked.id };
     });
   }
@@ -432,7 +449,7 @@ export class TerminalManager {
           );
           return;
         }
-        await this.store.update(entry.id, { conversationId: picked.id });
+        await this.writeBinding(entry.id, { conversationId: picked.id });
         void vscode.window.showInformationMessage(
           `「${entry.name}」已绑定对话 ${picked.id.slice(0, 8)}…，下次启动 claude 时会接回它。`,
         );
@@ -440,7 +457,7 @@ export class TerminalManager {
       }
       if (startNew) {
         const conversationId = newConversationId();
-        await this.store.update(entry.id, { conversationId });
+        await this.writeBinding(entry.id, { conversationId });
         void vscode.window.showInformationMessage(
           `「${entry.name}」将开一条新对话 ${conversationId.slice(0, 8)}…，下次启动 claude 时使用。`,
         );
@@ -515,6 +532,9 @@ export class TerminalManager {
         // 这条绑定没刷成，但其余条目照常观测、照常回写。
       }
     }
+    // 每批最多通知一次（不放进循环里逐条回调）：树重算是整棵的，
+    // 批量回写 10 条没有理由刷 10 次。返回值语义不变，调用方仍在用。
+    if (wrote) this.onBindingsChanged?.();
     return wrote;
   }
 
@@ -574,8 +594,22 @@ export class TerminalManager {
     this.titles?.prewarm(patch?.conversationId ?? entry.conversationId, this.cwdFor(entry));
     if (patch === undefined) return { entry, live };
 
-    await this.store.update(entry.id, patch);
+    await this.writeBinding(entry.id, patch);
     return { entry: { ...entry, ...patch }, live };
+  }
+
+  /**
+   * 写绑定并通知树。**所有**回写绑定的地方都走这里 —— 少一处通知，
+   * 树上那两处显示（三级任务名、tooltip 的「对话」行）就会静默停在旧值。
+   *
+   * 与 `reconcileAll` 的分工：那里是整批共用一份快照、循环跑完按 `wrote`
+   * **一次性**通知（见该方法末尾），所以它**不**走这个出口，否则一批 N 条
+   * 会刷 N 次树。单条写入（reconcileOne、resolveLaunchSpec 各分支、
+   * bindConversationInteractive）一律走这里。
+   */
+  private async writeBinding(id: string, patch: Partial<TerminalEntry>): Promise<void> {
+    await this.store.update(id, patch);
+    this.onBindingsChanged?.();
   }
 
   private cwdFor(entry: TerminalEntry): string {

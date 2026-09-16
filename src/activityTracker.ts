@@ -63,13 +63,25 @@ export class ActivityTracker {
    * 再出现按「首次观测」处理，不会凭空冒出一次「刚运行完」
    * （见 core/activity.ts 顶部注释里的不变量）。
    *
-   * 无论有没有存活条目，每次调用结束都触发一次变化通知，让订阅方
-   * （UI 刷新）能看到状态表里的最新结果。
+   * **只有这一轮真的改变了状态表才触发变化通知**（删掉了条目，或某个
+   * 条目的 state / taskName 与旧值不同）；什么都没变就不通知。订阅方
+   * （extension.ts 里接的是整树重建）只关心变化——从前无条件通知，采样
+   * 循环每 ≈900 ms 跑一轮，就退化成每 ≈900 ms 一次零变化的整树重建，
+   * 表现为侧边栏标题栏上永不消失的进度条。
+   *
+   * 判断必须**按值**比较 state / taskName 两个字段：nextActivity 每次
+   * 都返回**新对象**，`prev !== next` 恒为真（见 core/activity.ts 该函数
+   * 注释），照那样写会退化成"每轮无条件通知"。
    */
   async poll(aliveEntryIds: readonly string[]): Promise<void> {
+    let changed = false;
+
     const aliveSet = new Set(aliveEntryIds);
     for (const id of [...this.state.keys()]) {
-      if (!aliveSet.has(id)) this.state.delete(id);
+      if (!aliveSet.has(id)) {
+        this.state.delete(id);
+        changed = true; // 条目消失也是变化
+      }
     }
 
     if (aliveEntryIds.length > 0) {
@@ -86,10 +98,16 @@ export class ActivityTracker {
           // running 不走闸门，理由见 core/tmux.ts 该函数注释。
           taskName: taskNameFromSample(s),
         };
-        this.state.set(id, nextActivity(this.state.get(id), sample));
+        const prev = this.state.get(id);
+        const next = nextActivity(prev, sample);
+        this.state.set(id, next);
+        // 按值比较，不能用 `prev !== next`（nextActivity 恒返回新对象）。
+        if (prev === undefined || prev.state !== next.state || prev.taskName !== next.taskName) {
+          changed = true;
+        }
       });
     }
 
-    this.fire();
+    if (changed) this.fire();
   }
 }

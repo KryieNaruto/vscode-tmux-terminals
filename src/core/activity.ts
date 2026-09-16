@@ -48,6 +48,10 @@ export interface EntryActivity {
  * | done-unseen | done-unseen（还没被看过，维持）|
  *
  * taskName 每次都用本次采样的值覆盖——它是「当前」信息，不需要跨态保留旧值。
+ *
+ * **注意：本函数每次都返回新对象**（与下面的 markSeen 不同），所以调用方
+ * **不能**用 `prev !== next` 判断有没有发生变化（那个比较恒为真），必须
+ * 逐字段比较 `state` 与 `taskName`。参见 activityTracker.ts 的 poll。
  */
 export function nextActivity(
   prev: EntryActivity | undefined,
