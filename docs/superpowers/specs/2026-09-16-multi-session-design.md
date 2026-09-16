@@ -62,6 +62,9 @@
 4. 二级行首小竖线显示用户设的**颜色**；profile **不再用颜色表示**，改为
    **标题后面一个不带颜色的小图标**（直连/中转各一个 codicon），tooltip
    写清楚。（落点见 §6.2）
+   > ⚠ **本条按纯文本落地（`直连` / `中转`），不是图标** —— 查证发现
+   > `description` 不支持 codicon、而标签内 codicon 要 VS Code 1.106+
+   > （须抬高 `engines` 下限）。完整理由与「一行改回图标」的做法见 §6.2 与 §13。
 5. 调色板：8 个预设色 + 末项「自定义…」可输任意 hex；任意 hex 用自绘 SVG
    （`ThemeIcon` 只能用主题色）。（落点见 §6.4）
 
@@ -289,8 +292,19 @@ async migrateAndBackupV2(): Promise<boolean>;
   - 未设 → **主题自适应的中性竖线**（`{light, dark}` 两个随扩展打包的 SVG）。
     **不用 `ThemeIcon`**：`ThemeIcon` 的颜色只能是**主题色**，表达不了任意
     hex；而竖线的语义就是「用户挑的那个颜色」，用主题色会撒谎。
-- **`description` = profile 的 codicon**（标题**后面**）：direct → `$(plug)`，
-  ccr → `$(cloud)`。**不带颜色**（`ThemeIcon` 那套颜色语义在本轮被彻底摘掉）。
+- **`description` = profile 的纯文本**（标题**后面**）：direct → `直连`，
+  ccr → `中转`。**不带颜色**（`ThemeIcon` 那套颜色语义在本轮被彻底摘掉）。
+
+  > ⚠ **这里与需求原文（「小图标（直连/中转各一个 codicon）」）有偏差，
+  > 是查证后改的，见 §13 那一行。** 结论：VS Code 的 `TreeItem.description`
+  > **不支持 codicon 渲染**（它是纯右对齐文本，写 `'$(plug)'` 会**原样显示**
+  > 这四个字符）；要在标签里渲染 codicon 只能用 `MarkdownString` 作
+  > `label`，而那是 **VS Code 1.106+** 的 API，本扩展的
+  > `engines.vscode` 是 **`^1.85.0`**，用它就必须抬高下限、老版本用户将
+  > **完全装不上**（比「图标变成文字」严重得多）。
+  > 故取纯文本这一版：信息一字不少（tooltip 里本来也写着同样的文字），
+  > 且不拿安装兼容性去换一个装饰。**要改成图标是一处 3 行的改动**
+  > （label 换 `MarkdownString` + `engines` 抬到 `^1.106`），留给用户拍板。
 - **`tooltip`** 必须写清楚 profile 的**文字含义**（`direct（官方直连）` /
   `ccr（本地中转）`）—— 因为图标本身不带颜色、不写文字，只看图标认不出来。
   tooltip 其余内容：名称、目录、模型、**颜色（hex 或「未设」）**、会话数、
@@ -892,7 +906,7 @@ async removeSession(entryId: string, sessionId: string): Promise<void>;
 | 关闭/删除会话都要一次模态确认 | 与既有的 `killSession` 一致（它会杀掉正在跑的 claude，丢失在途工作）。用户要的 X 是「随手关」，但本仓库一贯的安全姿态是「绝不静默破坏」，故保留确认。若嫌烦，可改成只在「会话存活」时确认（已是现状：X 只对存活的会话显示）。 |
 | 批量面板一级显示完整 cwd 而不是短路径 | 与主树一致（主树一级就是完整 cwd），代价是窄侧边栏里长路径被省略号截断，靠 hover 看全文。 |
 | `entry.color` 允许手改清单文件写入非法值 | `normalizeHexColor` 只在**写入路径**（`setColorInteractive`）把关。手改文件写进的 `#zzz` 会被 `colorBarSvg` 直接嵌进 SVG —— 后果是图标画不出来（VS Code 忽略非法 fill），**不会**执行任何注入（SVG 里只有这一个属性值，且 `colorBarSvg` 只接受 `normalizeHexColor` 的产物）。故 `iconFor` 对非法值**回落到中性竖线**，而不是信任输入。 |
-| **profile 的 codicon 挂在 `description` 上，此路有渲染风险** | VS Code 的 `TreeItem` 只有 `label`（文本）与 `iconPath`（行首图标）两个位置，**标题后面**唯一可用的槽位就是 `description`。把 codicon 写进 `description`（`'$(plug)'`）依赖 VS Code 对 `description` 做 codicon 替换；**若实测不生效**，用户会看到字面量 `$(plug)`。实施时必须**在 e2e/手动冒烟里实际看一眼**（`docs/smoke-test.md` 里加一条）。回退方案（按优先级）：① `description` 改用纯文字 `直连` / `中转`（不满足「小图标」但信息不丢，且与 tooltip 一致）；② 把 profile 塞进 `iconPath` 的 `{light,dark}` 组合、颜色竖线改为 `description` 里的 codicon（把风险换个位置，不解决）。**首选 ①**。 |
+| **profile 的 codicon 挂在 `description` 上 —— 查证后否决，改用纯文本** | 需求原文要的是「标题后面一个不带颜色的小图标（codicon）」。查证结论：① `TreeItem` 只有 `label`（文本）与 `iconPath`（**行首**图标）两个位置，标题后面唯一可用的是 `description`；② 而 **`description` 不支持 codicon**（纯右对齐文本，写 `'$(plug)'` 就显示 `$(plug)` 这四个字）；③ 在**标签**里渲染 codicon 需要 `MarkdownString` 作 `label`，那是 **VS Code 1.106+** 的 API，而本扩展 `engines.vscode = ^1.85.0`，用它必须抬高下限 —— 老版本用户会**根本装不上**（硬失败），比「图标退化成文字」严重得多。故 `description` 用纯文本 `直连` / `中转`：信息量相同（tooltip 里写着同样的话），不拿安装兼容性换装饰。**改回图标是一处 3 行改动**（`label` 换 `MarkdownString({ supportThemeIcons: true })` + `engines` 抬到 `^1.106`），已在回报里标给用户拍板。 |
 | 发布杂务 | `package.json` 0.1.8 → **0.2.0**，`package-lock.json` 的两处 `version` 同步订正（此前几批漏过，见 v0.1.5 的提交）。tag 只打 `v0.2.0`（0.1.6/0.1.7/0.1.8 没打，不回头补）。 |
 
 ## 14. 实施后修订
