@@ -1,5 +1,5 @@
 import * as assert from 'assert';
-import { nextSessionOrder, sortSessions } from '../../src/core/sessions';
+import { nextSessionOrder, sessionLabel, sortSessions } from '../../src/core/sessions';
 import { SessionSlot } from '../../src/core/types';
 
 const s = (id: string, order: number, extra: Partial<SessionSlot> = {}): SessionSlot => ({
@@ -72,5 +72,26 @@ describe('nextSessionOrder', () => {
 
   it('负数被当 0 看待，空槽的下一个仍是 0', () => {
     assert.strictEqual(nextSessionOrder([s('a', -9)]), 1);
+  });
+});
+
+describe('sessionLabel', () => {
+  it('非空任务名原样返回', () => {
+    assert.strictEqual(sessionLabel('修复登录超时'), '修复登录超时');
+  });
+
+  it('空串回落「无会话」', () => {
+    assert.strictEqual(sessionLabel(''), '无会话');
+  });
+
+  it('★ 只按长度判空：空白串不是「空」（回落会把一个真实的空白标题吃掉）', () => {
+    // 判据必须与调用方一致 —— 三级恒生成，标题的回落点只有这一处。
+    // 若这里顺手 trim 一遍，采样层好不容易采到的标题就会被换成「无会话」，
+    // 而没有任何报错。
+    assert.strictEqual(sessionLabel(' '), ' ');
+  });
+
+  it('单字符任务名照样算有名字', () => {
+    assert.strictEqual(sessionLabel('A'), 'A');
   });
 });

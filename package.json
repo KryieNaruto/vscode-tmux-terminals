@@ -71,8 +71,33 @@
         "icon": "$(trash)"
       },
       {
+        "command": "tmuxTerminals.addInFolder",
+        "title": "在此目录新建终端",
+        "icon": "$(add)"
+      },
+      {
+        "command": "tmuxTerminals.addSession",
+        "title": "新建会话",
+        "icon": "$(add)"
+      },
+      {
+        "command": "tmuxTerminals.closeSession",
+        "title": "关闭会话",
+        "icon": "$(close)"
+      },
+      {
+        "command": "tmuxTerminals.deleteSession",
+        "title": "删除会话",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "tmuxTerminals.setColor",
+        "title": "设置颜色…",
+        "icon": "$(symbol-color)"
+      },
+      {
         "command": "tmuxTerminals.killSession",
-        "title": "杀掉远端 tmux 会话",
+        "title": "关闭该终端下全部会话",
         "icon": "$(stop-circle)"
       },
       {
@@ -171,48 +196,73 @@
       "view/item/context": [
         {
           "command": "tmuxTerminals.open",
-          "when": "view == tmuxTerminals.list && viewItem != folder",
+          "when": "view == tmuxTerminals.list && (viewItem == sessionAlive || viewItem == sessionDead)",
           "group": "inline@1"
         },
         {
-          "command": "tmuxTerminals.killSession",
-          "when": "view == tmuxTerminals.list && viewItem == aliveSession",
-          "group": "1_kill@1"
+          "command": "tmuxTerminals.closeSession",
+          "when": "view == tmuxTerminals.list && viewItem == sessionAlive",
+          "group": "inline@2"
         },
         {
-          "command": "tmuxTerminals.setModel",
-          "when": "view == tmuxTerminals.list && (viewItem == aliveSession || viewItem == deadSession)",
-          "group": "2_edit@0"
+          "command": "tmuxTerminals.addInFolder",
+          "when": "view == tmuxTerminals.list && viewItem == folder",
+          "group": "inline@1"
         },
         {
-          "command": "tmuxTerminals.setProfile",
-          "when": "view == tmuxTerminals.list && (viewItem == aliveSession || viewItem == deadSession)",
-          "group": "2_edit@1"
+          "command": "tmuxTerminals.addSession",
+          "when": "view == tmuxTerminals.list && viewItem == terminal",
+          "group": "inline@1"
         },
         {
           "command": "tmuxTerminals.edit",
-          "when": "view == tmuxTerminals.list && (viewItem == aliveSession || viewItem == deadSession)",
+          "when": "view == tmuxTerminals.list && viewItem == terminal",
+          "group": "2_edit@0"
+        },
+        {
+          "command": "tmuxTerminals.setColor",
+          "when": "view == tmuxTerminals.list && (viewItem == terminal || viewItem == sessionAlive || viewItem == sessionDead)",
           "group": "2_edit@1"
         },
         {
-          "command": "tmuxTerminals.duplicate",
-          "when": "view == tmuxTerminals.list && (viewItem == aliveSession || viewItem == deadSession)",
+          "command": "tmuxTerminals.setModel",
+          "when": "view == tmuxTerminals.list && (viewItem == terminal || viewItem == sessionAlive || viewItem == sessionDead)",
           "group": "2_edit@2"
         },
         {
-          "command": "tmuxTerminals.toggleAutoRestore",
-          "when": "view == tmuxTerminals.list && (viewItem == aliveSession || viewItem == deadSession)",
+          "command": "tmuxTerminals.setProfile",
+          "when": "view == tmuxTerminals.list && (viewItem == terminal || viewItem == sessionAlive || viewItem == sessionDead)",
           "group": "2_edit@3"
         },
         {
           "command": "tmuxTerminals.bindConversation",
-          "when": "view == tmuxTerminals.list && (viewItem == aliveSession || viewItem == deadSession)",
+          "when": "view == tmuxTerminals.list && (viewItem == sessionAlive || viewItem == sessionDead)",
           "group": "2_edit@4"
         },
         {
-          "command": "tmuxTerminals.delete",
-          "when": "view == tmuxTerminals.list && (viewItem == aliveSession || viewItem == deadSession)",
+          "command": "tmuxTerminals.duplicate",
+          "when": "view == tmuxTerminals.list && (viewItem == terminal || viewItem == sessionAlive || viewItem == sessionDead)",
+          "group": "2_edit@5"
+        },
+        {
+          "command": "tmuxTerminals.toggleAutoRestore",
+          "when": "view == tmuxTerminals.list && (viewItem == terminal || viewItem == sessionAlive || viewItem == sessionDead)",
+          "group": "2_edit@6"
+        },
+        {
+          "command": "tmuxTerminals.killSession",
+          "when": "view == tmuxTerminals.list && viewItem == terminal",
+          "group": "1_close@1"
+        },
+        {
+          "command": "tmuxTerminals.deleteSession",
+          "when": "view == tmuxTerminals.list && (viewItem == sessionAlive || viewItem == sessionDead)",
           "group": "3_danger@1"
+        },
+        {
+          "command": "tmuxTerminals.delete",
+          "when": "view == tmuxTerminals.list && viewItem == terminal",
+          "group": "3_danger@2"
         }
       ],
       "commandPalette": [

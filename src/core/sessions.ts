@@ -43,3 +43,20 @@ export function sortSessions(slots: readonly SessionSlot[]): SessionSlot[] {
 export function nextSessionOrder(slots: readonly SessionSlot[]): number {
   return slots.reduce((m, s) => Math.max(m, Math.max(0, s.order)), -1) + 1;
 }
+
+/**
+ * 三级节点的标题：有任务名就用它，没有就回落成「无会话」。
+ *
+ * **为什么回落而不是「不生成这一行」**：三级恒生成（每个槽一行）是这一版的
+ * 前提 —— 「接回某个会话」需要一个永远点得到的落脚点。X 关掉会话之后槽还在、
+ * tmux 进程没了，那一行必须留在原处、标题回落，用户再点它就是 `--resume`
+ * 回同一条对话。若按「没有名字就不生成」，关掉的那一行会整个消失，用户将
+ * **没有任何入口**把它接回来。
+ *
+ * **只判长度、不 trim**：任务名的两个来源（pane title / 绑定对话的 aiTitle）
+ * 都已经各自做过清洗，这里再 trim 一次只可能把采集到的真实标题吃掉 —— 而
+ * 症状是「明明有标题却显示无会话」，不报错。空白串是「有名字」，不是「没有」。
+ */
+export function sessionLabel(taskName: string): string {
+  return taskName.length > 0 ? taskName : '无会话';
+}

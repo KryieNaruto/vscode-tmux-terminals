@@ -157,11 +157,36 @@ describe('package.json 清单一致性', () => {
     }
   });
 
+  /**
+   * 两个方向都要钉住，缺一个就有一整类静默失效。
+   *
+   * **方向一（菜单 → 代码）**：菜单 `when` 里引用的每个 `viewItem` 值，
+   * 代码都必须真的设置过。写错的表现是「那个菜单项永不出现」——右键菜单少
+   * 了一项不会有任何报错，只能靠人发现。
+   *
+   * **方向二（代码 → 菜单）**：代码设置的每个 `viewItem` 值，菜单里都必须
+   * 用上。写错的表现是「某级节点没有任何菜单项」——同样是静默的。
+   *
+   * ⚠ **正则必须同时认两种写法**。`contextValue` 在代码里有两个来源：
+   *   - 三元：`this.contextValue = alive ? 'sessionAlive' : 'sessionDead'`
+   *   - 直接赋值：`this.contextValue = 'terminal'`
+   * 只认三元的版本在 `folder` / `terminal` 这类**普通赋值**上完全解析不出来，
+   * 于是方向一会误报「`terminal` 永不出现」——那是**正则过时**，不是真的 bug。
+   * 这是**加强**（覆盖了原来漏掉的写法），不是为了让测试变绿而放宽断言：
+   * 三元那一支的正则一个字都没改，两个方向的原断言也一字未动。
+   *
+   * **扫描范围是两个文件**：`batchItem` 在 `src/batchTree.ts` 里，只扫
+   * `tree.ts` 会让它整个漏网。
+   */
   it('代码里设置的 viewItem 值都在菜单 when 中使用（避免写了永不生效的 contextValue）', () => {
-    const treeSrc = fs.readFileSync(path.join(repoRoot, 'src', 'tree.ts'), 'utf8');
-    const setValues = [...treeSrc.matchAll(/contextValue\s*=\s*[^;]*?'(\w+)'\s*:\s*'(\w+)'/g)].flatMap(
-      (m) => [m[1], m[2]],
+    const sources = ['tree.ts', 'batchTree.ts'].map((f) =>
+      fs.readFileSync(path.join(repoRoot, 'src', f), 'utf8'),
     );
+    const setValues = sources.flatMap((src) =>
+      [...src.matchAll(/contextValue\s*=\s*(?:[^;]*?'(\w+)'\s*:\s*'(\w+)'|'(\w+)')/g)].flatMap(
+        (m) => [m[1] ?? m[3], m[2] ?? m[3]],
+      ),
+    ).filter((v): v is string => v !== undefined);
     assert.ok(setValues.length > 0, '没解析出 contextValue，正则可能过时了');
     const usedInMenus = [...JSON.stringify(contributes.menus ?? {}).matchAll(/viewItem == (\w+)/g)].map(
       (m) => m[1],
@@ -169,6 +194,28 @@ describe('package.json 清单一致性', () => {
     // 每个被菜单引用的 viewItem 值都必须由代码设置，否则菜单项永不出现
     const neverSet = usedInMenus.filter((v) => !setValues.includes(v));
     assert.deepStrictEqual(neverSet, [], `菜单引用了代码从不设置的 contextValue（该项永不出现）: ${neverSet}`);
+  });
+
+  /**
+   * 菜单引用的 viewItem 值**恰好**是这四级节点。
+   *
+   * 上一条用例只挡「引用了不存在的值」，挡不住反方向的「某个值被悄悄删掉」
+   * —— 比如把 `terminal` 的菜单项整段删掉，上一条照样全绿，而二级行从此
+   * 没有任何右键菜单。这里把集合钉成等号：多一个（永不出现）或少一个
+   * （某级节点没有任何菜单项）都算 bug。
+   *
+   * `empty`（空清单占位）刻意**不**在集合里：它唯一的动作是「点击即新建」，
+   * 已经由 TreeItem.command 承担，不该再挂右键菜单。
+   */
+  it('菜单引用的 viewItem 值恰好是四级节点（多一个少一个都是 bug）', () => {
+    const usedInMenus = [
+      ...JSON.stringify(contributes.menus ?? {}).matchAll(/viewItem == (\w+)/g),
+    ].map((m) => m[1]);
+    assert.deepStrictEqual(
+      [...new Set(usedInMenus)].sort(),
+      ['folder', 'sessionAlive', 'sessionDead', 'terminal'],
+      `菜单引用的 viewItem 集合与预期不符（实际：${JSON.stringify([...new Set(usedInMenus)])}）`,
+    );
   });
 
   it('两个 view 同属 tmuxTerminals 容器', () => {
