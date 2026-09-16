@@ -174,6 +174,9 @@ export class EntryTreeProvider
   private entries: TerminalEntry[] = [];
   private alive = new Set<string>();
 
+  /** 标题缓存的变化订阅句柄（titleFallback 没给订阅入口时为 undefined），见 dispose()。 */
+  private titleSubscription: { dispose(): void } | undefined;
+
   constructor(
     private readonly store: {
       load(): Promise<TerminalEntry[]>;
@@ -193,11 +196,38 @@ export class EntryTreeProvider
      * 任务名回退源：**同步读内存缓存，不发 IO、不触发观测**（观测统一由
      * extension.ts 驱动，provider 不持有 reconciler）。
      * 省略 = 无回退（只剩 pane title 一个来源）。
+     *
+     * 除 `peek` 外还有一个**可选**的订阅入口：缓存后台真的写入一条新标题时
+     * 会通知一次，provider 据此重刷整棵树 —— 标题是异步落地的，而这里是同步
+     * peek，两者之间没有它就没有任何交集：读到了名字树也不会重算，二级的
+     * `collapsibleState` 停在 `None`，第三级永远不出现。
+     * 声明成可选成员：没有订阅能力的实现（比如单测里的假 cache）照常可用。
      */
     private readonly titleFallback?: {
       peek(conversationId: string | undefined): string | undefined;
+      onDidChangeTitle?(listener: () => void): { dispose(): void };
     },
-  ) {}
+  ) {
+    // 订阅只能在构造函数体里做：字段初始化器跑在参数属性赋值**之前**，
+    // 那时 this.titleFallback 还是 undefined。
+    this.titleSubscription = this.titleFallback?.onDidChangeTitle?.(() =>
+      this.emitter.fire(),
+    );
+  }
+
+  /**
+   * 解除标题缓存的订阅。
+   *
+   * **为什么不会泄漏**：provider 与 cache 都是 `activate()` 里建的扩展生命期
+   * 单例，谁都不会比谁先死，所以即使不解除也不会留下「已死对象的引用」。
+   * 提供 dispose 是为了把「谁订阅谁负责解除」写清楚，并让 provider 能进
+   * `context.subscriptions`（TreeDataProvider 接口本身没有 dispose，
+   * 框架不替我们调）。
+   */
+  dispose(): void {
+    this.titleSubscription?.dispose();
+    this.titleSubscription = undefined;
+  }
 
   refresh(): void {
     this.emitter.fire();
@@ -227,6 +257,9 @@ export class EntryTreeProvider
    * 伪装成「知道」是误导（spec §8 不变量 6）。
    *
    * 纯读：`peek` 同步、不发 IO、不触发观测（观测统一由 extension.ts 驱动）。
+   * 缓存**后来**才写入一条标题时，构造函数里那个订阅会 fire 一次 ——
+   * `getChildren` 重跑、本方法被重新求值，二级的 collapsibleState 随之从
+   * `None` 变成 `Expanded`，第三级自动出现。
    */
   private taskNameFor(entry: TerminalEntry): string {
     const fromPane = this.activity?.activityFor(entry.id)?.taskName ?? '';

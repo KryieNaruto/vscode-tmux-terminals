@@ -19,9 +19,10 @@ export interface TerminalEntry {
    * 未设 = **只**表示「本功能上线前就存在的老条目」。新建条目（含复制）在
    * 创建时就分配一个 id，因此它们永远不会被弹选择框。
    *
-   * 同一个 id 在不同阶段对应两种动作，由「那条对话存在了没有」决定：
-   * 新建条目首次启动 → `--session-id <id>` 把它建出来；
-   * 之后每次恢复 → `--resume <id>` 接回它。
+   * **首次启动不预先钉这个 id**：新建条目第一次启动就是裸 `claude`
+   * （LaunchSpec 的 `fresh`，见 core/command.ts），claude 自己开出来的那条
+   * 会话由 reconcile 观测到之后回写到这里（core/reconcile.ts）—— 否则用户
+   * 会先看到一个从没用过的预设 uuid。此后每次恢复才是 `--resume <id>` 接回它。
    *
    * **为什么必须由扩展自己记：** 实测 `claude --resume <uuid>` 是按 cwd
    * 作用域的，且 claude 进程不长期持有 .jsonl 的 fd，无法从
