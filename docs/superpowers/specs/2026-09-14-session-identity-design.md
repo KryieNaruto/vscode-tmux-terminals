@@ -1064,3 +1064,32 @@ const manager = new TerminalManager(store, tmux, titles);         // reconcile�
   单测在 `test/core/tmux.test.ts`；IO 侧在 `test/tmuxClient.integration.test.ts`
   （含「前台换成 sleep 后采样真的反映出来」的端到端一条）；采样层的闸门与
   「每条目每轮只采样一次」在 `test/activityTracker.test.ts`。
+
+### 偏差记录（2026-09-16）：§4.3 的「不引入定时器」被 `fresh` 首启推翻
+
+本条推翻 §4.3（`:288`）与 §8 不变量 11（`:889`）的「reconcile 不引入定时器、
+只在五个事件上跑」：**10 秒的存活轮询现在也调 `reconcileAll`，触发点从五个
+变成六个**。§4.3 与 §8 的原文原地保留（它们是当时的决策依据），以本条为准。
+
+- **为什么必须推翻**：0.1.6 把新建条目的首次启动改成了**裸 `claude`**（不带
+  任何会话参数，见 `README.md`「条目 ↔ 对话 绑定」）。这直接否定了本设计的一个
+  隐含前提 —— **「绑定天然可信」**。§4.3 敢只挂事件触发，是因为当时认为
+  `conversationId` 是写一次即定的权威事实，事件触发够用户把它纠正过来；而
+  `fresh` 之后，条目出生时**预分配**的那个 id 与 claude 实际开出来的 id
+  **可能根本不是同一个**，绑定只能靠**周期性观测**（pane → 注册表）纠回来。
+- **五个触发点全失效的场合是正常用法**：原有五个触发点（激活 / ⟳ / 点击条目 /
+  切 profile / 展开或面板可见）**全是用户动作**。用户「新建完就一直待在终端里
+  提问、不碰侧边栏」完全正常，此时一个都不发 —— 绑定永远停在幽灵 id 上，
+  `TaskTitleCache.retryMissing` 每 25 秒重读一个永远不存在的文件，三级任务名
+  因此永不出现。故把 reconcile 挂到**本来就存在**的 10 秒存活轮询
+  （`src/extension.ts` 的 `poll()`，§7.1 保留的那条）上：它天然同受
+  `view.visible` 约束，面板隐藏时同样不跑。
+- **代价可控的依据**：① 整批条目**共用一份 `LivenessSnapshot`**
+  （`readLiveness`：一次 `ps` + 一次注册表 readdir，§3.1），这一拍不是按条目各
+  查一遍；② 绑定已收敛时 `reconcileBinding` 返回 `undefined`，`reconcileAll`
+  会 `continue` —— **稳态下不写盘**，清单文件 mtime 不变。§10（`:978` 的
+  「触发点只有五个事件、无定时器」）那条取舍里「放着不管时绑定可能滞后」的代价
+  也随之消失；换来的是每 10 秒一次与既有轮询**同拍**的观测（不额外多一次
+  `tmux ls`）。
+- **顺序**：`poll()` 里先 `reconcileAll(entries)` 再
+  `manager.retryTitles(entries)` —— 前者把绑定改对，后者才有正确的 id 可重试。
