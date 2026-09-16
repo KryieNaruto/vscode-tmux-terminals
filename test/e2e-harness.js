@@ -41,12 +41,40 @@ const run = promisify(execFile);
 // ---- 1. 注入 vscode stub ----
 const calls = {
   terminals: [], messages: [], warns: [], errors: [], literals: [], newSessions: [], quickPicks: [],
+  quickPickShapeViolations: [],
 };
 
 // 让某一节可以控制下一个 modal / QuickPick 弹窗的应答；
 // 两者默认都是 undefined（= 用户取消）。
 let modalAnswer;
 let quickPickAnswer;
+
+// VS Code 稳定 API 里 QuickPickItem 允许出现的字段（对照 @types/vscode 的
+// index.d.ts 抄的）。任何不在这个集合、也不在 EXTRA_QUICKPICK_KEYS 里的键，
+// 都可能是 proposed API —— 而对装成 vsix 的正常扩展来说，用 proposed API 的
+// 后果是 showQuickPick 直接抛错、整个选择框弹不出来（0.1.7 的
+// quickPickItemTooltip 事故就是这么炸的）。所以在进 stub 的那一刻拦住。
+const STABLE_QUICKPICK_KEYS = new Set([
+  'label', 'kind', 'iconPath', 'description', 'detail',
+  'resourceUri', 'picked', 'alwaysShow',
+]);
+
+// 本扩展自己挂在候选项上的负载字段（见 src/terminalManager.ts 的
+// ConversationPickItem）。它们不是 VS Code API 的一部分，VS Code 会忽略。
+const EXTRA_QUICKPICK_KEYS = new Set(['candidate', 'owner']);
+
+/** 返回 items 上所有「VS Code 不认识、我们也没打算让它忽略」的字段名。 */
+function quickPickShapeViolations(items) {
+  const bad = new Set();
+  for (const it of items) {
+    // 纯字符串项（模型清单那种）没有字段可查，跳过
+    if (it === null || typeof it !== 'object') continue;
+    for (const k of Object.keys(it)) {
+      if (!STABLE_QUICKPICK_KEYS.has(k) && !EXTRA_QUICKPICK_KEYS.has(k)) bad.add(k);
+    }
+  }
+  return [...bad];
+}
 
 class TreeItem {
   constructor(label, collapsibleState) {
@@ -123,6 +151,19 @@ const vscodeStub = {
     showInputBox() { return Promise.resolve(undefined); },
     showQuickPick(items, opts) {
       calls.quickPicks.push({ items, opts });
+      // 进 stub 的每一项都查一遍字段：见 quickPickShapeViolations 的说明。
+      // **在这里当场判失败**，而不是攒起来等某个用例去读 —— 攒着就需要每个
+      // 走选择框的用例各写一条断言，漏一个就又是个缺口。这里是所有选择框
+      // 调用的必经之路，挂在它上面才没有死角。
+      const violations = quickPickShapeViolations(items);
+      if (violations.length > 0) {
+        calls.quickPickShapeViolations.push(...violations);
+        chk(
+          `QuickPick 项字段必须全在稳定 API 内（发现：${violations.join('、')}）`,
+          false,
+          JSON.stringify(items.map((i) => (i !== null && typeof i === 'object' ? Object.keys(i) : typeof i))),
+        );
+      }
       return Promise.resolve(
         typeof quickPickAnswer === 'function' ? quickPickAnswer(items, opts) : quickPickAnswer,
       );
@@ -250,7 +291,7 @@ const attachedTo = (term) =>
   !!term && term.sent.some((s) => String(s.text).includes('tmux attach'));
 
 /** 造一个「历史对话」文件。 */
-async function writeConversation(uuid, cwd, summary, projectDir) {
+async function writeConversation(uuid, cwd, firstMessage, projectDir) {
   const dir = path.join(HOME, '.claude', 'projects', projectDir);
   await fs.promises.mkdir(dir, { recursive: true });
   await fs.promises.writeFile(
@@ -260,7 +301,7 @@ async function writeConversation(uuid, cwd, summary, projectDir) {
       JSON.stringify({ type: 'attachment', cwd }),
       JSON.stringify({
         type: 'user', userType: 'external', isSidechain: false, cwd,
-        message: { role: 'user', content: summary },
+        message: { role: 'user', content: firstMessage },
       }),
     ].join('\n'),
     'utf8',
@@ -587,6 +628,7 @@ async function projectSnapshot() {
     calls.terminals.length = 0; calls.literals.length = 0;
     calls.newSessions.length = 0; calls.quickPicks.length = 0;
     calls.errors.length = 0; calls.messages.length = 0;
+    calls.quickPickShapeViolations.length = 0;
   };
 
   const mk = (id, name, cwd, extra) => ({
@@ -667,6 +709,17 @@ async function projectSnapshot() {
       (r) => r.stdout.trim(), () => '');
     chk('本机 PATH 里确实有真实 claude —— 所以测试必须用 PATH 桩挡住它',
       real.length > 0, real);
+
+    // 这道闸必须真的会红：喂一个带 proposed API 字段的项进去，它得报出来。
+    {
+      const bad = quickPickShapeViolations([
+        { label: 'a' },
+        { label: 'b', tooltip: 'x' },
+        { label: 'c', candidate: {}, owner: 'o' },
+      ]);
+      chk('字段白名单：能抓出 proposed API 字段 tooltip（这道闸不是空转）',
+        bad.length === 1 && bad[0] === 'tooltip', JSON.stringify(bad));
+    }
   }
 
   console.log('\n=== 1. 老条目（无绑定）+ 无候选 → --session-id 新建并永久绑定 ===');
@@ -802,7 +855,7 @@ async function projectSnapshot() {
     chk('★ 末尾那项明确写着「新建一条对话」',
       /新建一条对话/.test((items[items.length - 1] || {}).label || ''),
       JSON.stringify(items.map((i) => i.label)));
-    chk('对话候选显示 时间 · 摘要 · 体积',
+    chk('对话候选显示 时间 · 首条消息原文 · 体积',
       items.slice(0, -1).every((i) => /·/.test(i.label) && /KB|MB|B/.test(i.label)),
       JSON.stringify(items.map((i) => i.label)));
     chk('★ 选中的对话被永久绑定到条目', bound(ID_LEGACY) === PICKED_CONV,

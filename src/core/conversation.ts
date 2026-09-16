@@ -25,32 +25,17 @@ export interface ConversationCandidate {
   mtimeMs: number;
   /** 文件体积（字节），用于在列表里辨认 */
   bytes: number;
-  /** 首条用户消息的摘要；取不到为空串 */
-  summary: string;
-  /**
-   * **最后**一个真实用户问题（已压平截断）；取不到时整个字段缺省。
-   *
-   * 只在**按 cwd 过滤之后**才填（见 conversationFiles 的 listConversationsForCwd）：
-   * 全量枚举那 290+ 个文件时读尾部是纯浪费。
-   */
-  lastQuestion?: string;
-  /** **最后**一条助手回答的正文（已压平截断）；取不到时整个字段缺省 */
-  lastAnswer?: string;
+  /** 首条用户消息的**原文**（只压平空白，不压缩语义）；取不到为空串 */
+  firstMessage: string;
 }
 
-/** 摘要最长字符数 —— QuickPick 一行装不下更多，也够认出「就是这个终端」。 */
-const SUMMARY_MAX = 60;
-
-/** 详情行（QuickPick 项的第二行小字）里「最后的问题」的长度上限。 */
-const QUESTION_MAX = 80;
-
-/**
- * 悬停浮层里「最后的回答」的长度上限。
+/** 首条用户消息在选择框里最多带多少个字符。
  *
- * 比列表行宽松得多（浮层本来就为放长文而生），但仍要截断 —— 一条回答可以有几
- * KB，整段塞进 tooltip 既读不动也白白占内存。
- */
-const ANSWER_MAX = 200;
+ * 这不是为了「一行放得下」—— 放不下是 VS Code 那一行自己截断的事，比这个数
+ * 早得多。这是**上限的兜底**：粘贴几万字进会话是常事，而这段文本要随每一项
+ * 候选走一遍渲染与进程间传递，不设上限就是白白搬运。取 300 —— 约为最宽的
+ * 选择框一行能显示的两倍多，正常永远轮不到它来截断。 */
+const FIRST_MESSAGE_MAX = 300;
 
 /** 从 user 消息的 content 里取纯文本（可能是字符串，也可能是分块数组）。 */
 function firstText(content: unknown): string | undefined {
@@ -67,42 +52,18 @@ function firstText(content: unknown): string | undefined {
 }
 
 /**
- * 从 assistant 消息的 content 里取**最后一个非空** text 块。
+ * 压平空白（**含换行**）并截断。
  *
- * 与 firstText 相对：assistant 的一轮常常是「说一句 + 一串 tool_use」，真正
- * 说出口的话往往是最后一个 text 块，正着取会拿到过渡语。
+ * 压平是硬约束，不是美化：QuickPick 的 label 在 VS Code 里是 `white-space:
+ * pre` + 行高钉死 + `overflow:hidden`，**换行不会折行、会被裁掉**。多行的一条
+ * 消息若原样塞进去，会显示成「只有第一行、后面全没了」，看起来像丢了内容。
+ * 压成一行至少让截断发生在行尾、且有省略号。
  *
- * **只认非空块**（`trim().length > 0`）。实测末尾常跟一个纯空白的 text 块
- * （`'   '`）；若把它当成「最后一个 text 块」返回，调用点只会判为「取不到」
- * 而**直接放弃**，前面那个真正说了话的块就再也轮不到了 —— 这与本函数
- * 「最后一个**非空** text 块」的契约不符。跳过空块继续往前找，才拿得到
- * 用户真正看到的那句话。
- *
- * 判空收口在这一处：调用点（parseConversationTail）无需再对同一件事设第二
- * 道闸，否则「空块」的语义会散在两处，改一处漏一处。
+ * max 默认取 FIRST_MESSAGE_MAX（上限的兜底，见那里的说明）；300 只是防「粘贴
+ * 几万字」这类极端输入白白搬运，正常永远轮不到它来截断 —— 真正的截断发生在
+ * VS Code 那一行，比它早得多。
  */
-function lastText(content: unknown): string | undefined {
-  if (Array.isArray(content)) {
-    for (let i = content.length - 1; i >= 0; i--) {
-      const block = content[i];
-      if (typeof block !== 'object' || block === null) continue;
-      const b = block as { type?: unknown; text?: unknown };
-      // 空白块不是「说出口的话」：跳过它，继续往前找那个真正有内容的
-      if (b.type === 'text' && typeof b.text === 'string' && b.text.trim().length > 0) {
-        return b.text;
-      }
-    }
-  }
-  return undefined;
-}
-
-/**
- * 压平空白并截断，避免多行摘要在列表里错位。
- *
- * max 默认取 SUMMARY_MAX（QuickPick 一行的高度）；tooltip 那类放得下长文的地方
- * 显式传更大的值 —— 默认值必须保持原样，既有的调用与测试都钉在 60 上。
- */
-function condense(text: string, max: number = SUMMARY_MAX): string {
+function condense(text: string, max: number = FIRST_MESSAGE_MAX): string {
   const flat = text.replace(/\s+/g, ' ').trim();
   return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
@@ -110,7 +71,7 @@ function condense(text: string, max: number = SUMMARY_MAX): string {
 /**
  * claude 把**斜杠命令**写成合成的 user 消息。它不是用户敲进去的话，但长得和
  * 用户消息一模一样 —— 不识别的话，一条以 `/clear` 开头的会话，其首条 user
- * 消息就是这些包裹文本，列表里整个摘要都成了噪音。
+ * 消息就是这些包裹文本，列表里整个首条消息都成了噪音。
  *
  * 下面这几个标签是**本机 transcript 实测到的原文**，不是猜的：
  * - `local-command-caveat` —— 命令消息的免责声明（"Caveat: The messages below
@@ -161,14 +122,17 @@ export function isSyntheticUserText(text: string): boolean {
 }
 
 /**
- * 从一段 .jsonl 文本（通常只读了文件头部）里提取 cwd 与首条用户消息摘要。
+ * 从一段 .jsonl 文本（通常只读了文件头部）里提取 cwd 与首条用户消息（原文）。
+ *
+ * 「原文」= 只压平空白、不压缩语义（见 condense）—— 用户要认的是「上次在聊的
+ * 那个」，任何改写都会让这段话变得不像他自己敲的。
  *
  * 容错是契约：末行多半被截断、某些行类型不熟悉 —— 一律跳过，绝不抛错。
  * 解析不出来就返回空对象，**绝不编造**。
  */
-export function parseConversationHead(text: string): { cwd?: string; summary?: string } {
+export function parseConversationHead(text: string): { cwd?: string; firstMessage?: string } {
   let cwd: string | undefined;
-  let summary: string | undefined;
+  let firstMessage: string | undefined;
 
   for (const raw of text.split('\n')) {
     if (raw.length === 0) continue;
@@ -185,82 +149,21 @@ export function parseConversationHead(text: string): { cwd?: string; summary?: s
       cwd = rec.cwd;
     }
     // 跳过子代理（isSidechain）的消息 —— 那不是用户敲的，认不出终端
-    if (summary === undefined && rec.type === 'user' && rec.isSidechain !== true) {
+    if (firstMessage === undefined && rec.type === 'user' && rec.isSidechain !== true) {
       const msg = rec.message as { content?: unknown } | undefined;
       const t = msg === undefined ? undefined : firstText(msg.content);
       // 斜杠命令的合成包裹消息也不是用户敲的 —— 跳过它继续往下扫，
-      // 而不是就此认定「这个会话没有摘要」（见 isSyntheticUserText）。
+      // 而不是就此认定「这个会话没有首条消息」（见 isSyntheticUserText）。
       if (t !== undefined && t.trim().length > 0 && !isSyntheticUserText(t)) {
-        summary = condense(t);
+        firstMessage = condense(t);
       }
     }
-    if (cwd !== undefined && summary !== undefined) break;
+    if (cwd !== undefined && firstMessage !== undefined) break;
   }
 
   return {
     ...(cwd !== undefined ? { cwd } : {}),
-    ...(summary !== undefined ? { summary } : {}),
-  };
-}
-
-/**
- * 从一段（通常是**尾部**的）jsonl 文本里取**最后**一个用户问题与**最后**一条
- * 助手回答，供 QuickPick 的 detail / tooltip 显示。
- *
- * 为什么要读尾部：头部的首条消息只能说明「这个会话在讲什么」，而用户要认的是
- * 「哪一条是我上次在聊的那个」—— 最后聊的内容才最接近他的记忆。
- *
- * 容错是契约，与 parseConversationHead 完全一致：解析不出的行一律跳过、绝不抛错，
- * 取不到就不给那个字段，**绝不编造**。尾部窗口的起点落在某条记录中间，所以
- * 「跳过解析不出的行」在这里首先要挡的就是那个半行 —— 它必然 JSON.parse 失败。
- *
- * 用户问题的判据与头部同一套：`type === 'user'`、非子代理、`firstText` 拿得到、
- * 且**不是合成包裹消息**。倒着扫，第一个命中的就是最后那一问；若最后一条恰好是
- * 斜杠命令，会自然往前找到真正的提问。`firstText` 只认 text 块，所以 tool_result
- * 回执天然不会被当成用户提问 —— 这是对的，回执不是他说的话。
- *
- * 回答取 `message.content` 里**最后一个**非空 text 块（见 lastText）。子代理
- * （isSidechain）的产出不是这个终端在聊的内容，与头部同一判据，一并跳过。
- *
- * 两段文本都在这里压平截断（回答的上限更宽松）：返回的就是能直接塞进 QuickPick
- * 的形状，调用方不必再各自截一遍。
- */
-export function parseConversationTail(text: string): { question?: string; answer?: string } {
-  let question: string | undefined;
-  let answer: string | undefined;
-
-  const lines = text.split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (question !== undefined && answer !== undefined) break;
-    const raw = lines[i];
-    if (raw.length === 0) continue;
-    let o: unknown;
-    try {
-      o = JSON.parse(raw);
-    } catch {
-      continue; // 窗口起点处被截断的半行 / 不认识的行
-    }
-    if (typeof o !== 'object' || o === null) continue;
-    const rec = o as Record<string, unknown>;
-    if (rec.isSidechain === true) continue; // 子代理的消息，不是这个终端在聊的内容
-
-    const msg = rec.message as { content?: unknown } | undefined;
-    if (question === undefined && rec.type === 'user') {
-      const t = msg === undefined ? undefined : firstText(msg.content);
-      if (t !== undefined && t.trim().length > 0 && !isSyntheticUserText(t)) {
-        question = condense(t, QUESTION_MAX);
-      }
-    } else if (answer === undefined && rec.type === 'assistant') {
-      const t = msg === undefined ? undefined : lastText(msg.content);
-      // 只判 undefined：lastText 已保证返回的必是**非空** text 块，这里不再
-      // 重复 trim 判空 —— 对同一件事设两道闸，改了 lastText 还得记得改这里。
-      if (t !== undefined) answer = condense(t, ANSWER_MAX);
-    }
-  }
-
-  return {
-    ...(question !== undefined ? { question } : {}),
-    ...(answer !== undefined ? { answer } : {}),
+    ...(firstMessage !== undefined ? { firstMessage } : {}),
   };
 }
 
@@ -343,41 +246,14 @@ function localStamp(ms: number): string {
 }
 
 /**
- * QuickPick 的一行：`<时间> · <首条用户消息摘要> · <体积>`。
+ * QuickPick 的一行：`<时间> · <首条用户消息原文> · <体积>`。
  * 三样都要有，用户才能认出「就是这个终端」。
+ *
+ * **只有这一行**：没有第二行（detail），也没有悬停浮层 —— 理由见
+ * terminalManager.pickConversation 的说明。
  */
 export function formatCandidate(c: ConversationCandidate): string {
-  return `${localStamp(c.mtimeMs)} · ${c.summary.length > 0 ? c.summary : '（无摘要）'} · ${formatBytes(c.bytes)}`;
-}
-
-/**
- * QuickPick 项的 **detail**（常显的第二行小字）：最后那一问。
- *
- * 只放问题、不放回答：detail 就一行小字，把回答也塞进去只会两头都看不全 ——
- * 回答留给悬停浮层（见 formatCandidateTooltip）。没有可显示的问答时返回
- * undefined，让浮动列表少一行空行，而不是显示一行「最后问：」。
- */
-export function formatCandidateDetail(c: ConversationCandidate): string | undefined {
-  const q = c.lastQuestion;
-  return q === undefined || q.length === 0 ? undefined : `最后问：${q}`;
-}
-
-/**
- * 悬停浮层的 **markdown 源**，由 vscode 侧包成 `MarkdownString`。
- *
- * 返回源文本而不是 MarkdownString，是为了让本文件维持零 vscode 依赖、能脱离
- * 编辑器直接单测（本文件头部的约定）。段落之间必须留**空行**：markdown 会把
- * 单个换行折叠成空格，问答就糊成一行了。
- */
-export function formatCandidateTooltip(c: ConversationCandidate): string | undefined {
-  const parts: string[] = [];
-  if (c.lastQuestion !== undefined && c.lastQuestion.length > 0) {
-    parts.push(`最后的问题：${c.lastQuestion}`);
-  }
-  if (c.lastAnswer !== undefined && c.lastAnswer.length > 0) {
-    parts.push(`最后的回答：${c.lastAnswer}`);
-  }
-  return parts.length === 0 ? undefined : parts.join('\n\n');
+  return `${localStamp(c.mtimeMs)} · ${c.firstMessage.length > 0 ? c.firstMessage : '（无首条消息）'} · ${formatBytes(c.bytes)}`;
 }
 
 /**

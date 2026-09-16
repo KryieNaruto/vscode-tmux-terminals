@@ -3,9 +3,7 @@ import * as path from 'path';
 import {
   ConversationCandidate,
   belongsToCwd,
-  candidatesForCwd,
   parseConversationHead,
-  parseConversationTail,
 } from './core/conversation';
 
 /**
@@ -15,8 +13,8 @@ import {
  *
  * **只读文件头部。** 实测单条会话可以到 7.8 MB，而我们需要的信息（cwd、
  * 首条用户消息）都在开头 ~20 KB 内。整读 293 个文件会白读几百 MB。
- * 超出上限就退化为「没有摘要」——候选仍然可用（时间 + 体积 + 目录足以辨认），
- * 绝不因为没有摘要就把这条候选丢掉。
+ * 超出上限就退化为没有首条消息（显示成「（无首条消息）」）——候选仍然可用
+ * （时间 + 体积 + 目录足以辨认），绝不因为没有它就把这条候选丢掉。
  *
  * 目录名（`-ssd-qiansenwei-workspace` 之类）**只用来找文件，不用来判断归属** ——
  * 转义规则不可靠（`_`、`.` 也会变成 `-`），归属一律以文件里记录的 cwd 字段为准。
@@ -77,6 +75,10 @@ async function readHead(file: string, bytes: number): Promise<string> {
 /**
  * 尾部读取窗口。**不是** HEAD_BYTES 的别名 —— 语义不同（这里读文件尾），
  * 数值相同只是巧合，两者各自独立演进。
+ *
+ * 现在唯一的消费者是 **taskTitles.ts 的 ai-title 回退读**
+ * （`findConversationFile` → `readTail` → `parseAiTitle`）。选择框那条链
+ * （`listConversationsForCwd`）已于 2026-09-16 整条移除，不再读尾部。
  */
 export const TAIL_BYTES = 64 * 1024;
 
@@ -174,24 +176,17 @@ export async function findConversations(home: string, id: string): Promise<strin
   return found.filter((cwd): cwd is string => cwd !== undefined);
 }
 
-/** 一条候选 + 它所在的文件路径。路径**不进导出接口**，只在本文件内用来读尾部。 */
-interface ConversationRecord {
-  candidate: ConversationCandidate;
-  file: string;
-}
-
 /**
- * 枚举所有候选对话，并**在内部保留每条的文件路径**。
+ * 枚举所有候选对话。
  *
- * 路径不塞进 ConversationCandidate：它是读盘细节，导出出去只会诱惑别的调用方
- * 自己再去 open 一遍。这里留着，是为了 listConversationsForCwd 能对幸存下来的
- * 那几条直接 readTail —— 否则就得用 findConversationFile 按 id 再扫一遍全部
- * project 目录（N 个候选 × 31 个目录的 readdir + 头部读），纯属重复劳动。
+ * **不保留文件路径**：路径是读盘细节，导出出去只会诱惑别的调用方自己再去
+ * open 一遍。曾经这里为「按 cwd 过滤之后再对幸存者 readTail」留着路径，那条链
+ * （最后一问一答）已于 2026-09-16 整条移除 —— 现在没有任何消费者需要它。
  *
  * 每一步都独立容错：某个 project 目录读不动、某个文件读不动，跳过即可，
  * 绝不让一条坏数据毁掉整次枚举（用户要靠这个列表找回自己的对话）。
  */
-async function listConversationRecords(home: string): Promise<ConversationRecord[]> {
+async function listConversationRecords(home: string): Promise<ConversationCandidate[]> {
   const root = path.join(home, '.claude', 'projects');
   let dirs: string[];
   try {
@@ -221,71 +216,29 @@ async function listConversationRecords(home: string): Promise<ConversationRecord
       // 读不出 cwd 就无法判断归属 —— 宁可漏掉一条，也绝不猜。
       if (parsed.cwd === undefined) return undefined;
       return {
-        candidate: {
-          id: path.basename(full).replace(/\.jsonl$/, ''),
-          cwd: parsed.cwd,
-          mtimeMs: stat.mtimeMs,
-          bytes: stat.size,
-          summary: parsed.summary ?? '',
-        },
-        file: full,
+        id: path.basename(full).replace(/\.jsonl$/, ''),
+        cwd: parsed.cwd,
+        mtimeMs: stat.mtimeMs,
+        bytes: stat.size,
+        firstMessage: parsed.firstMessage ?? '',
       };
     } catch {
       return undefined; // 单条读不动不影响其余
     }
   });
 
-  return records.filter((r): r is ConversationRecord => r !== undefined);
+  return records.filter((r): r is ConversationCandidate => r !== undefined);
 }
 
 /**
- * 读出所有候选对话（不含最后一问一答）。
+ * 读出所有候选对话（**只读文件头部，不读尾部**）。
  *
- * 需要「最后一问一答」的场景请用 listConversationsForCwd —— 那个才会按 cwd
- * 过滤后再读尾部；对全部 292 个文件读尾部是纯浪费。
+ * 尾部读与本函数无关：唯一需要它的场景是 ai-title 回退（taskTitles.ts 走
+ * `findConversationFile` + `readTail`），对一条对话只读一次。按 cwd 的过滤由
+ * 调用方在内存里用 `candidatesForCwd` 做 —— 过滤本来就不需要额外读盘，故没有
+ * 也不需要「按 cwd 过滤版」的枚举函数（曾经有过一个会在过滤后补读尾部的
+ * `listConversationsForCwd`，2026-09-16 随「最后一问一答」整条移除）。
  */
 export async function listConversations(home: string): Promise<ConversationCandidate[]> {
-  return (await listConversationRecords(home)).map((r) => r.candidate);
-}
-
-/**
- * 该 cwd 下的候选对话，并补上**最后一问一答**（QuickPick 的 detail / tooltip）。
- *
- * **先按 cwd 过滤、再读尾部**：全量是 292 个文件、404 MB（见文件头注释），
- * 而一个 cwd 下通常只有十几条。顺序反了就是给每条无关的对话白读一次盘。
- *
- * 并发读尾部，同样走 mapLimited —— 逐个 await 在这里退化回那个 8.7 s 的串行
- * 版本（见 CONCURRENCY 处注释）。
- *
- * 每条独立容错：尾部读不动 / 解析不出，就当作「没有问答」，**绝不因此丢掉这条
- * 候选** —— 列表是用户找回自己对话的唯一入口，为了一点装饰性信息丢条目是
- * 本末倒置。
- */
-export async function listConversationsForCwd(
-  home: string,
-  cwd: string,
-): Promise<ConversationCandidate[]> {
-  const records = await listConversationRecords(home);
-  const kept = candidatesForCwd(records.map((r) => r.candidate), cwd);
-
-  // id → 文件路径。同一个 id 出现在两个 project 目录下是可能的（同一个会话被
-  // 复制过），但落在**同一个 cwd** 下就不可能同时存在两条 —— 后者才是这里会
-  // 撞键的场景，故取先出现的那条即可。
-  const fileById = new Map(records.map((r) => [r.candidate.id, r.file]));
-
-  return mapLimited(kept, CONCURRENCY, async (candidate) => {
-    const file = fileById.get(candidate.id);
-    if (file === undefined) return candidate;
-    try {
-      const tail = await readTail(file, TAIL_BYTES);
-      const { question, answer } = parseConversationTail(tail);
-      return {
-        ...candidate,
-        ...(question !== undefined ? { lastQuestion: question } : {}),
-        ...(answer !== undefined ? { lastAnswer: answer } : {}),
-      };
-    } catch {
-      return candidate; // 读不动就当没有问答，候选照常返回
-    }
-  });
+  return listConversationRecords(home);
 }

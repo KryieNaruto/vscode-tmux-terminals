@@ -18,14 +18,12 @@ import {
   NEW_CONVERSATION_LABEL,
   belongsToCwd,
   candidatesForCwd,
-  formatCandidateDetail,
-  formatCandidateTooltip,
   formatCandidateWithOwner,
   ownersOf,
 } from './core/conversation';
 import { isClaudeCommand, resumeFailed } from './core/claude';
 import { readProfileConfig } from './claudeConfig';
-import { findConversations, listConversations, listConversationsForCwd } from './conversationFiles';
+import { findConversations, listConversations } from './conversationFiles';
 import { LivenessSnapshot, liveSessionIn, readLiveness } from './liveSessions';
 import { reconcileBinding } from './core/reconcile';
 import { EntryStore, newConversationId, newId } from './core/store';
@@ -207,9 +205,16 @@ export class TerminalManager {
    * 列表**末尾固定跟一项「＋ 新建一条对话」**：新对话只能由用户主动选出来，
    * 绝不由「取消」隐式产生（见 resolveLaunchSpec）。
    *
-   * 每项还带**最后一问一答**：一行常显的问题（detail）+ 悬停浮层的问答
-   * （tooltip）。实测用户有十几条同 cwd 的对话，光靠「首条消息摘要 + 时间」
-   * 认不出「上次在聊的那个」—— 最后聊的内容才最接近记忆。
+   * 每项的显示：`时间 · 首条用户消息**原文** · 体积`，**只有这一行**。
+   * 实测用户有十几条同 cwd 的对话，光靠「时间 + 体积」认不出「上次在聊的那个」，
+   * 所以要有一段能认出内容的文字 —— 取的是首条用户消息的原文（只压平空白，
+   * 不压缩语义、由 VS Code 按行宽自己截断）。
+   *
+   * **没有第二行**：不再显示「最后问」，也不再显示「最后回答」。后者原本挂在
+   * `QuickPickItem.tooltip` 上，而那是 proposed API（`quickPickItemTooltip`），
+   * 正常安装的扩展一用就让 `showQuickPick` 抛错、整个选择框弹不出来；而 detail
+   * 那行在 VS Code 里是钉死 44px、overflow:hidden 的固定行高，长篇回答本来也
+   * 放不下。要看会话内容，接回终端即可。
    *
    * **调用方必须已经处在 `pickChain` 的一个 op 内**（本方法自己不再入队）。
    * 读 owners 必须与写绑定处在同一个 op 里，否则两个共用 cwd 的老条目会
@@ -220,10 +225,10 @@ export class TerminalManager {
     title: string,
   ): Promise<{ total: number; picked?: ConversationCandidate; owner?: string; startNew: boolean }> {
     const cwd = this.cwdFor(entry);
-    // 用 listConversationsForCwd 而不是「listConversations + candidatesForCwd」：
-    // 前者在**按 cwd 过滤之后**才去读尾部补最后一问一答，后者会先枚举全部
-    // 292 个文件，多读的那些尾部全是白读。
-    const candidates = await listConversationsForCwd(this.home(), cwd);
+    // 按 cwd 过滤在**内存里**做（candidatesForCwd），不再有「过滤完再去读
+    // 每条的尾部」那一步 —— 那是给「最后一问一答」服务的，而它已经不显示了。
+    // 于是每次弹框少读 N × 64KB，且这一步与别处取候选走的是同一条路。
+    const candidates = candidatesForCwd(await listConversations(this.home()), cwd);
     if (candidates.length === 0) {
       // 没有任何可接回的 → 没有列表可弹，调用方直接开一条新的
       return { total: 0, startNew: false, picked: undefined };
@@ -234,22 +239,22 @@ export class TerminalManager {
     const owners = ownersOf(await this.store.load(), entry.id);
 
     // 末尾固定跟一项「＋ 新建一条对话」：新对话只能由用户主动选出来。
-    // 它**不参与** detail/tooltip 那套渲染 —— 它没有 conversationId，也不该
+    // 它**不参与**候选那套渲染 —— 它没有 conversationId，也不该
     // 长得像一条历史对话。
     const newItem: ConversationPickItem = { label: NEW_CONVERSATION_LABEL };
     const convoItems: ConversationPickItem[] = candidates.map((c) => {
       const owner = owners.get(c.id);
-      const detail = formatCandidateDetail(c);
-      const tooltip = formatCandidateTooltip(c);
-      return {
+      // 刻意**不用展开**（`...({ label, candidate })`）拼这个对象：TypeScript 对
+      // 展开进来的属性不做过量属性检查，往 VS Code 的 API 对象上塞一个它不认识
+      // 的字段（比如 proposed API）时 tsc 一声不吭 —— 这个 bug 正是这么溜过类型
+      // 检查、直到运行时 showQuickPick 抛错才暴露的。改成逐字段赋值，多写一行
+      // 换来 tsc 能拦住下一个。
+      const item: ConversationPickItem = {
         label: formatCandidateWithOwner(c, owner),
         candidate: c,
-        ...(owner !== undefined ? { owner } : {}),
-        // 取不到问答就不给这两个字段：QuickPick 少一行，而不是显示一行空的
-        ...(detail !== undefined ? { detail } : {}),
-        // tooltip 用 MarkdownString：问答之间要分段，纯字符串会糊成一行
-        ...(tooltip !== undefined ? { tooltip: new vscode.MarkdownString(tooltip) } : {}),
       };
+      if (owner !== undefined) item.owner = owner;
+      return item;
     });
     const pick = await vscode.window.showQuickPick<ConversationPickItem>(
       [...convoItems, newItem],
