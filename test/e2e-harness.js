@@ -41,13 +41,14 @@ const run = promisify(execFile);
 // ---- 1. 注入 vscode stub ----
 const calls = {
   terminals: [], messages: [], warns: [], errors: [], literals: [], newSessions: [], quickPicks: [],
-  quickPickShapeViolations: [],
+  quickPickShapeViolations: [], inputBoxes: [],
 };
 
-// 让某一节可以控制下一个 modal / QuickPick 弹窗的应答；
-// 两者默认都是 undefined（= 用户取消）。
+// 让某一节可以控制下一个 modal / QuickPick / InputBox 弹窗的应答；
+// 三者默认都是 undefined（= 用户取消 / 没输入）。
 let modalAnswer;
 let quickPickAnswer;
+let inputBoxAnswer;
 
 // VS Code 稳定 API 里 QuickPickItem 允许出现的字段（对照 @types/vscode 的
 // index.d.ts 抄的）。任何不在这个集合、也不在 EXTRA_QUICKPICK_KEYS 里的键，
@@ -148,7 +149,15 @@ const vscodeStub = {
     },
     showErrorMessage(m) { calls.errors.push(m); return Promise.resolve(undefined); },
     showInformationMessage(m) { calls.messages.push(m); return Promise.resolve(undefined); },
-    showInputBox() { return Promise.resolve(undefined); },
+    // 支持「函数式应答」，与 showQuickPick / showWarningMessage 一致：多数用例
+    // 只需要一个固定值，但「先输非法 hex 再输合法 hex」这类要按调用次序给不同值，
+    // 那时就用函数。
+    showInputBox(opts) {
+      calls.inputBoxes.push(opts || {});
+      return Promise.resolve(
+        typeof inputBoxAnswer === 'function' ? inputBoxAnswer(opts || {}) : inputBoxAnswer,
+      );
+    },
     showQuickPick(items, opts) {
       calls.quickPicks.push({ items, opts });
       // 进 stub 的每一项都查一遍字段：见 quickPickShapeViolations 的说明。
@@ -631,7 +640,28 @@ async function projectSnapshot() {
       next[j] = { ...next[j], ...patch, id: next[j].id };
       this.entries[i] = { ...this.entries[i], sessions: next };
     },
-    async remove() {}, async findByName() {}, async reorder() {},
+    // v3：新增会话走槽级原语（生产代码的 addSessionInteractive →
+    // store.addSession），order 在「锁内」分配 —— 假 store 没有锁，但必须把
+    // 「order 由这里补齐、调用方不传」这条契约照搬，否则 addSessionInteractive
+    // 一进到那一行就抛「addSession is not a function」。
+    async addSession(entryId, slot) {
+      const i = this.entries.findIndex((e) => e.id === entryId);
+      if (i < 0) return;
+      const sessions = this.entries[i].sessions || [];
+      const next = sessions.reduce((m, s) => Math.max(m, Math.max(0, s.order || 0)), -1) + 1;
+      this.entries[i] = { ...this.entries[i], sessions: [...sessions, { ...slot, order: next }] };
+    },
+    async removeSession(entryId, sessionId) {
+      const i = this.entries.findIndex((e) => e.id === entryId);
+      if (i < 0) return;
+      const sessions = this.entries[i].sessions || [];
+      this.entries[i] = { ...this.entries[i], sessions: sessions.filter((s) => s.id !== sessionId) };
+    },
+    // 真删。从前这里是空实现 —— 那时没有任何用例走到 deleteEntry，所以看不出
+    // 差别；多会话之后「删除条目必须递归杀掉其下每个会话」只能靠「条目真没了 +
+    // tmux 会话真没了」两条一起断言，空实现会让前一条永远为假（fresh() 仍找得到）。
+    async remove(id) { this.entries = this.entries.filter((e) => e.id !== id); },
+    async findByName() {}, async reorder() {},
   };
   const fresh = (id) => store.entries.find((e) => e.id === id);
   /** 绑定是**会话级**的（v3）：断言读的是该条目第一个槽上的绑定。 */
@@ -644,7 +674,8 @@ async function projectSnapshot() {
     calls.terminals.length = 0; calls.literals.length = 0;
     calls.newSessions.length = 0; calls.quickPicks.length = 0;
     calls.errors.length = 0; calls.messages.length = 0;
-    calls.quickPickShapeViolations.length = 0;
+    calls.warns.length = 0;
+    calls.quickPickShapeViolations.length = 0; calls.inputBoxes.length = 0;
   };
 
   // v3：一条目 = 一个**会话槽数组**。既有用例全是「一条目一会话」，故这里把
@@ -1860,6 +1891,412 @@ async function projectSnapshot() {
     const third3 = await p3.getChildren(node3);
     chk('20c 三级节点标签是原文',
       third3.length === 1 && third3[0].label === shellTitle, JSON.stringify(third3.map((t) => t.label)));
+  }
+
+  // ==========================================================================
+  // 多会话（v3）：一个终端挂 N 个会话。以下每一节都对应一条不变量。
+  // 新用例**自己构造 sessions 数组**，不复用 mk —— 那个 helper 是给「一条目
+  // 一会话」的既有用例用的（槽 id 取条目 id），两种形状混在一个 helper 里
+  // 只会两头不讨好。
+  // ==========================================================================
+
+  console.log('\n=== 21. 多会话：一个终端挂 2 个会话，各自独立打开 ===');
+  {
+    const id = 'e2emulti001';
+    const SLOT_A = 'e2emultia01';
+    const SLOT_B = 'e2emultib01';
+    const CONV_A = 'cccccccc-0001-0000-0000-000000000000';
+    const CONV_B = 'cccccccc-0002-0000-0000-000000000000';
+    ALL.push(id, SLOT_A, SLOT_B);
+    await writeConversation(CONV_A, BOUND_CWD, '多会话里的第一条', PROJECT);
+    await writeConversation(CONV_B, BOUND_CWD, '多会话里的第二条', PROJECT);
+    store.entries.push({
+      id, name: 'MULTI', cwd: BOUND_CWD, profile: 'ccr', autoRestore: false,
+      sessions: [
+        { id: SLOT_A, conversationId: CONV_A, order: 0 },
+        { id: SLOT_B, conversationId: CONV_B, order: 1 },
+      ],
+    });
+
+    resetCalls();
+    const mgr = newManager();
+    await mgr.openSession(fresh(id), fresh(id).sessions[0]);
+    await sleep(1800);
+    await mgr.openSession(fresh(id), fresh(id).sessions[1]);
+    await sleep(1800);
+
+    chk('21a ★ tmux 会话名由**槽** id 派生（不是条目 id）',
+      (await tmux.hasSession(S(SLOT_A))) && (await tmux.hasSession(S(SLOT_B))),
+      `A=${await tmux.hasSession(S(SLOT_A))} B=${await tmux.hasSession(S(SLOT_B))}`);
+
+    const sentA = literalsTo(S(SLOT_A));
+    const sentB = literalsTo(S(SLOT_B));
+    chk('21b ★ 第一个槽 --resume 的是它自己的对话',
+      sentA.some((t) => t.includes(`--resume '${CONV_A}'`)) &&
+      !sentA.some((t) => t.includes(CONV_B)), JSON.stringify(sentA));
+    chk('21c ★ 第二个槽 --resume 的是它自己的对话（绝不串到第一条）',
+      sentB.some((t) => t.includes(`--resume '${CONV_B}'`)) &&
+      !sentB.some((t) => t.includes(CONV_A)), JSON.stringify(sentB));
+
+    const multi = fresh(id);
+    chk('21d 两个绑定各自留在自己的槽上，一字未动',
+      multi.sessions[0].conversationId === CONV_A && multi.sessions[1].conversationId === CONV_B,
+      JSON.stringify(multi.sessions.map((s) => s.conversationId)));
+    chk('21e 两个面板都建出来了（各槽一个）', calls.terminals.length === 2,
+      `实际 ${calls.terminals.length}`);
+  }
+
+  console.log('\n=== 22. X（关闭会话）：只杀 tmux 进程，槽与绑定一字未动 ===');
+  {
+    const id = 'e2eclose001';
+    const SLOT = 'e2eclosea01';
+    const CONV = 'cccccccc-0003-0000-0000-000000000000';
+    ALL.push(id, SLOT);
+    await writeConversation(CONV, BOUND_CWD, 'X 之后要接回的那条', PROJECT);
+    store.entries.push({
+      id, name: 'CLOSE', cwd: BOUND_CWD, profile: 'ccr', autoRestore: false,
+      sessions: [{ id: SLOT, conversationId: CONV, order: 0 }],
+    });
+
+    resetCalls();
+    const mgr = newManager();
+    await mgr.openSession(fresh(id), fresh(id).sessions[0]);
+    await sleep(1500);
+    chk('22a 前置条件：会话已建出来', await tmux.hasSession(S(SLOT)));
+
+    modalAnswer = '关闭';
+    await mgr.closeSession(fresh(id), fresh(id).sessions[0]);
+    modalAnswer = undefined;
+
+    chk('22b ★ tmux 会话确实被杀掉', (await tmux.hasSession(S(SLOT))) === false);
+    const closed = fresh(id);
+    chk('22c ★ 条目仍在、槽仍在（X 不是删除）',
+      !!closed && closed.sessions.length === 1 && closed.sessions[0].id === SLOT,
+      JSON.stringify(closed && closed.sessions));
+    chk('22d ★ 绑定一字未变 —— 这是「三级是接回会话的」能成立的前提',
+      closed.sessions[0].conversationId === CONV, String(closed.sessions[0].conversationId));
+
+    resetCalls();
+    await mgr.openSession(fresh(id), fresh(id).sessions[0]);
+    await sleep(1800);
+    const back = literalsTo(S(SLOT));
+    chk('22e ★ 再点那一行 = --resume 回同一条对话',
+      back.some((t) => t.includes(`--resume '${CONV}'`)), JSON.stringify(back));
+    chk('22f ★ 而不是开一条新对话（没有 --session-id、没有裸 claude）',
+      !back.some((t) => t.includes('--session-id')), JSON.stringify(back));
+  }
+
+  console.log('\n=== 23. 删除会话 vs 删除条目（判断 A / 不变量 8） ===');
+  {
+    const id = 'e2edel0001';
+    const S1 = 'e2edelslot1';
+    const S2 = 'e2edelslot2';
+    ALL.push(id, S1, S2);
+    store.entries.push({
+      id, name: 'DEL', cwd: SCRATCH, profile: 'ccr', autoRestore: false,
+      sessions: [
+        { id: S1, conversationId: 'cccccccc-0004-0000-0000-000000000000', order: 0 },
+        { id: S2, conversationId: 'cccccccc-0005-0000-0000-000000000000', order: 1 },
+      ],
+    });
+    const mgr = newManager();
+
+    // 直接把两个 tmux 会话建出来（不走 openSession，省一轮 3s 的等待）
+    await tmux.newSession(S(S1), SCRATCH);
+    await tmux.newSession(S(S2), SCRATCH);
+    resetCalls();
+    modalAnswer = '删除';
+    await mgr.deleteSession(fresh(id), fresh(id).sessions[0]);
+    modalAnswer = undefined;
+
+    const afterDel = fresh(id);
+    chk('23a ★ 删除会话只让**该槽**消失',
+      !!afterDel && afterDel.sessions.length === 1 && afterDel.sessions[0].id === S2,
+      JSON.stringify(afterDel && afterDel.sessions.map((s) => s.id)));
+    chk('23b ★ 该槽的 tmux 会话被杀', (await tmux.hasSession(S(S1))) === false);
+    chk('23c ★ 同终端其余槽的 tmux 会话**不受影响**', await tmux.hasSession(S(S2)));
+    chk('23d 条目本身还在', !!afterDel);
+
+    // 删除条目：其下**每个**槽都要被杀（旧文案「远端 tmux 会话不受影响」已作废）。
+    // 刻意另起一个**双槽**条目来做这一步：上面那个已经被删掉一个槽了，拿它验
+    // 「每个槽都杀」只能覆盖到一个槽 —— 那样这条断言就退化成了「杀死存在的那个」，
+    // 漏杀别的槽（例如只杀 sessions[0]）照样能过。
+    const id2 = 'e2edel0002';
+    const S3 = 'e2edelslot3';
+    const S4 = 'e2edelslot4';
+    ALL.push(id2, S3, S4);
+    store.entries.push({
+      id: id2, name: 'DEL2', cwd: SCRATCH, profile: 'ccr', autoRestore: false,
+      sessions: [
+        { id: S3, conversationId: 'cccccccc-0006-0000-0000-000000000000', order: 0 },
+        { id: S4, conversationId: 'cccccccc-0007-0000-0000-000000000000', order: 1 },
+      ],
+    });
+    await tmux.newSession(S(S3), SCRATCH);
+    await tmux.newSession(S(S4), SCRATCH);
+
+    resetCalls();
+    modalAnswer = '删除';
+    await mgr.deleteEntry(fresh(id2));
+    modalAnswer = undefined;
+
+    chk('23e ★ 条目消失', fresh(id2) === undefined);
+    chk('23f ★ 其下**每个**槽的 tmux 会话都被杀掉',
+      (await tmux.hasSession(S(S3))) === false && (await tmux.hasSession(S(S4))) === false,
+      `S3=${await tmux.hasSession(S(S3))} S4=${await tmux.hasSession(S(S4))}`);
+    chk('23g ★ 确认框点名了作用对象与会话数，且不再说「远端 tmux 会话不受影响」',
+      calls.warns.some((m) => String(m).includes('DEL2') && String(m).includes('2 个会话')) &&
+      !calls.warns.some((m) => String(m).includes('不受影响')),
+      JSON.stringify(calls.warns));
+  }
+
+  console.log('\n=== 24. 新建会话（二级 +）：零弹框，只加一个会话位，不自动打开 ===');
+  {
+    const id = 'e2eadd0001';
+    ALL.push(id);
+    store.entries.push(mk(id, 'ADDSESS', SCRATCH));
+    const before = fresh(id).sessions.length;
+
+    resetCalls();
+    const mgr = newManager();
+    await mgr.addSessionInteractive(fresh(id));
+
+    chk('24a ★ 零弹框：选择框 / 输入框 / 提示框一个都没弹',
+      calls.quickPicks.length === 0 && calls.messages.length === 0 &&
+      calls.warns.length === 0 && calls.inputBoxes.length === 0,
+      JSON.stringify({ q: calls.quickPicks.length, m: calls.messages.length,
+        w: calls.warns.length, i: calls.inputBoxes.length }));
+
+    const after = fresh(id);
+    chk('24b 槽数 +1', after.sessions.length === before + 1,
+      `${before} → ${after.sessions.length}`);
+    const added = after.sessions[after.sessions.length - 1];
+    chk('24c ★ 新槽用的是 newId()，**不 borrow 条目 id**（那只是迁移的规则）',
+      added.id !== id && added.id.length > 0 && added.id !== after.sessions[0].id,
+      `条目 ${id} 新槽 ${added.id}`);
+
+    chk('24d ★ 不自动打开终端（「+」是加一个会话位，不产生任何副作用）',
+      calls.terminals.length === 0 && calls.newSessions.length === 0 && calls.literals.length === 0,
+      JSON.stringify({ t: calls.terminals.length, n: calls.newSessions.length,
+        l: calls.literals.length }));
+  }
+
+  console.log('\n=== 25. 新建条目：带 1 个会话槽；一级 + 的 cwd 预填且可改（判断 B） ===');
+  {
+    const CWD = '/tmp/tmuxterm-e2e-folder';
+    store.entries.push(mk('e2ekeep0001', 'KEEP', SCRATCH));
+    ALL.push('e2ekeep0001');
+
+    resetCalls();
+    const mgr = newManager();
+    inputBoxAnswer = (opts) => (opts.title === '终端名称' ? 'ADDED' : CWD);
+    quickPickAnswer = (items, opts) => {
+      // 用 startsWith 而不是全等：候选过多时标题会变成
+      // 「远程目录（候选过多，仅显示前 50 条，可手动输入其他）」，而扫到 /tmp
+      // 这一层时**一定**会超过 50 条（每个测试目录都在里面）。按全等匹配会让
+      // askCwd 拿到 undefined、整条新建流程中止，症状却是「新建条目没生效」。
+      if (String(opts.title).startsWith('远程目录')) return '$(pencil) 手动输入…';
+      if (String(opts.title).includes('全部恢复')) return '否';
+      return undefined;
+    };
+    await mgr.addEntryInteractive(CWD);
+    inputBoxAnswer = undefined;
+    quickPickAnswer = undefined;
+
+    const cwdPick = calls.quickPicks.find((q) => String(q.opts.title).startsWith('远程目录'));
+    chk('25a ★ 一级 + 把该文件夹的 cwd 当作**可改的**预填（placeHolder）',
+      !!cwdPick && cwdPick.opts.placeHolder === CWD,
+      JSON.stringify(calls.quickPicks.map((q) => [q.opts.title, q.opts.placeHolder])));
+
+    const added = store.entries[store.entries.length - 1];
+    chk('25b ★ 新建条目带 1 个会话槽（不是 0 个 —— 0 槽的条目点了没反应）',
+      added.name === 'ADDED' && added.sessions.length === 1,
+      JSON.stringify({ name: added.name, sessions: added.sessions }));
+    chk('25c ★ 槽 id 是新 id，不等于条目 id', added.sessions[0].id !== added.id,
+      `条目 ${added.id} 槽 ${added.sessions[0].id}`);
+    chk('25d 槽预分配了 conversationId（首次启动才不会弹选择框）',
+      UUID_RE.test(String(added.sessions[0].conversationId)),
+      String(added.sessions[0].conversationId));
+    chk('25e 目录取自用户输入的那一份', added.cwd === CWD, String(added.cwd));
+  }
+
+  console.log('\n=== 26. profile / 模型属于二级：改一次，其下全部存活会话一起变（不变量 6） ===');
+  {
+    const id = 'e2eprof0001';
+    const SLOTS = ['e2eprofslt1', 'e2eprofslt2', 'e2eprofslt3'];
+    const CONVS = [
+      'cccccccc-0006-0000-0000-000000000000',
+      'cccccccc-0007-0000-0000-000000000000',
+      'cccccccc-0008-0000-0000-000000000000',
+    ];
+    ALL.push(id, ...SLOTS);
+    for (let i = 0; i < 3; i++) {
+      await writeConversation(CONVS[i], BOUND_CWD, `第 ${i + 1} 个会话的对话`, PROJECT);
+    }
+    store.entries.push({
+      id, name: 'PROF', cwd: BOUND_CWD, profile: 'ccr', autoRestore: false, model: 'deepseek-chat',
+      sessions: SLOTS.map((s, i) => ({ id: s, conversationId: CONVS[i], order: i })),
+    });
+    // 三个槽各起一个真 pane，前台跑假 claude（`head -n 1`：收到 `/exit` 即退出，
+    // restartClaude 的 waitForShell 才过得去）
+    for (const s of SLOTS) {
+      await tmux.newSession(S(s), BOUND_CWD);
+      await sleep(400);
+      await tmux.sendLiteral(S(s), `${FAKE_CLAUDE_EXITING} -n 1`);
+      await tmux.sendEnter(S(s));
+      await sleep(500);
+    }
+    chk('26 前置条件：三个槽的 pane 前台都是 claude',
+      (await Promise.all(SLOTS.map(async (s) => (await tmux.currentCommand(S(s))).startsWith('claude'))))
+        .every(Boolean));
+
+    resetCalls();
+    const mgr = newManager();
+    await mgr.applyProfile(fresh(id), 'direct');
+    await sleep(600);
+
+    const after = fresh(id);
+    chk('26a profile 落在**条目**上（三级没有独立存储）', after.profile === 'direct', after.profile);
+    chk('26b ★ 槽里没有任何 profile / model 字段',
+      after.sessions.every((s) => !('profile' in s) && !('model' in s)),
+      JSON.stringify(after.sessions));
+    chk('26c model 被一并清空（profile 命名空间不同）', after.model === undefined, String(after.model));
+
+    const sent = SLOTS.map((s) => literalsTo(S(s)));
+    chk('26d ★ 3 个存活槽全部被重启（每个都收到 /exit）',
+      sent.every((l) => l.includes('/exit')), JSON.stringify(sent));
+    chk('26e ★ 每个槽 --resume 的是**自己**那条对话',
+      CONVS.every((c, i) => sent[i].some((t) => t.includes(`--resume '${c}'`))),
+      JSON.stringify(sent));
+  }
+
+  console.log('\n=== 27. 复制：逐槽重造 id 与绑定，剥掉 liveSessionId（§7.6） ===');
+  {
+    const id = 'e2edup0001';
+    const CONVS = [
+      'cccccccc-0009-0000-0000-000000000000',
+      'cccccccc-0010-0000-0000-000000000000',
+    ];
+    ALL.push(id);
+    store.entries.push({
+      id, name: 'DUP', cwd: BOUND_CWD, profile: 'ccr', autoRestore: false, model: 'm1',
+      sessions: [
+        { id: 'e2edupslt01', conversationId: CONVS[0], liveSessionId: CONVS[0], order: 0 },
+        { id: 'e2edupslt02', conversationId: CONVS[1], liveSessionId: CONVS[1], order: 5 },
+      ],
+    });
+
+    resetCalls();
+    const mgr = newManager();
+    await mgr.duplicateEntry(fresh(id));
+    const copy = store.entries[store.entries.length - 1];
+
+    chk('27a 复制品有 2 个槽（数量保留）', copy.sessions.length === 2, String(copy.sessions.length));
+    chk('27b ★ 每个槽都换了新 id，且互不相同',
+      copy.sessions.every((s) => s.id !== 'e2edupslt01' && s.id !== 'e2edupslt02') &&
+      copy.sessions[0].id !== copy.sessions[1].id,
+      JSON.stringify(copy.sessions.map((s) => s.id)));
+    chk('27c ★ 每个槽的 conversationId 都重新生成（照抄会让两个 claude 同写一条 .jsonl）',
+      copy.sessions[0].conversationId !== CONVS[0] &&
+      copy.sessions[1].conversationId !== CONVS[1] &&
+      UUID_RE.test(String(copy.sessions[0].conversationId)) &&
+      UUID_RE.test(String(copy.sessions[1].conversationId)),
+      JSON.stringify(copy.sessions.map((s) => s.conversationId)));
+    chk('27d ★ liveSessionId 全部剥掉（带着它 reconcile 会误判「没变化」而永不改绑）',
+      copy.sessions.every((s) => s.liveSessionId === undefined),
+      JSON.stringify(copy.sessions));
+    chk('27e 槽的 order 原样保留',
+      copy.sessions[0].order === 0 && copy.sessions[1].order === 5,
+      JSON.stringify(copy.sessions.map((s) => s.order)));
+  }
+
+  console.log('\n=== 28. 迁移端到端：v2 文件 → 槽 id === 原条目 id，且生成 .v2.bak（不变量 1） ===');
+  {
+    const { EntryStore } = require(path.join(ROOT, 'out/src/core/store.js'));
+    const v2File = `/tmp/vscode-tmux-terminals-e2e-v2-${process.pid}.json`;
+    const V2_CONV = 'dddddddd-0001-0000-0000-000000000000';
+    const V2_LIVE = 'dddddddd-0002-0000-0000-000000000000';
+    const v2Text = JSON.stringify([
+      {
+        id: 'v2entry001', name: 'V2', cwd: '/tmp/tmuxterm-e2e-v2', profile: 'ccr',
+        conversationId: V2_CONV, liveSessionId: V2_LIVE, autoRestore: true, order: 0,
+      },
+    ], null, 2);
+    await fs.promises.rm(v2File, { force: true });
+    await fs.promises.rm(`${v2File}.v2.bak`, { force: true });
+    await fs.promises.writeFile(v2File, v2Text, 'utf8');
+
+    const v2Store = new EntryStore(v2File);
+    const migrated = await v2Store.migrateAndBackupV2();
+    const loaded = await v2Store.load();
+
+    chk('28a 迁移真的发生了', migrated === true);
+    chk('28b 合成出恰好 1 个槽', loaded[0].sessions.length === 1,
+      JSON.stringify(loaded[0].sessions));
+    chk('28c ★★ 槽 id === 原条目 id（写错不报错，只会让正在跑的会话变成「无会话」）',
+      loaded[0].sessions[0].id === 'v2entry001', String(loaded[0].sessions[0].id));
+    chk('28d v2 的绑定原样落到槽上（不是编造的、也不是丢掉的）',
+      loaded[0].sessions[0].conversationId === V2_CONV &&
+      loaded[0].sessions[0].liveSessionId === V2_LIVE,
+      JSON.stringify(loaded[0].sessions[0]));
+    chk('28e 顶层不再有 conversationId / liveSessionId（绑定是会话级的）',
+      loaded[0].conversationId === undefined && loaded[0].liveSessionId === undefined,
+      JSON.stringify(loaded[0]));
+
+    const bak = await fs.promises.readFile(`${v2File}.v2.bak`, 'utf8');
+    chk('28f ★ .v2.bak 已生成，且内容**逐字节**等于原文',
+      bak === v2Text, `备份 ${bak.length} 字节 / 原文 ${v2Text.length} 字节`);
+    chk('28g 已有 .v2.bak 时不覆盖（第一次的备份才是原始数据）',
+      (await v2Store.migrateAndBackupV2()) === false);
+
+    await fs.promises.rm(v2File, { force: true });
+    await fs.promises.rm(`${v2File}.v2.bak`, { force: true });
+  }
+
+  console.log('\n=== 29. 设置颜色：调色板取预设色 + 自定义输入必过 normalizeHexColor ===');
+  {
+    const id = 'e2ecolor001';
+    ALL.push(id);
+    store.entries.push(mk(id, 'COLOR', SCRATCH));
+
+    resetCalls();
+    const mgr = newManager();
+    // 大写预设色：写进清单的必须是归一化后的小写
+    quickPickAnswer = '#46A758';
+    await mgr.setColorInteractive(fresh(id));
+    quickPickAnswer = undefined;
+    chk('29a ★ 预设色以归一化的小写 hex 落盘', fresh(id).color === '#46a758',
+      String(fresh(id).color));
+
+    // 自定义：末项才是「自定义…」
+    resetCalls();
+    quickPickAnswer = (items) => items[items.length - 1];
+    const boxes = [];
+    inputBoxAnswer = (opts) => {
+      boxes.push(opts);
+      return '#gggggg';   // 非法 hex
+    };
+    await mgr.setColorInteractive(fresh(id));
+    quickPickAnswer = undefined;
+    inputBoxAnswer = undefined;
+
+    chk('29b ★ 非法 hex 被 validateInput 拦下（`#gggggg` 拒、合法值放行）',
+      boxes.length === 1 && boxes[0].validateInput('#gggggg') !== null &&
+      boxes[0].validateInput('#abc') === null,
+      JSON.stringify(boxes.map((b) => b.validateInput && b.validateInput('#gggggg'))));
+    chk('29c ★★ 非法值**绝不写进清单**（颜色保持上一次那个）',
+      fresh(id).color === '#46a758', String(fresh(id).color));
+
+    // 合法但带大小写的三位简写 → 展开成小写六位
+    resetCalls();
+    const mgr2 = newManager();
+    quickPickAnswer = (items) => items[items.length - 1];
+    inputBoxAnswer = () => '#AbC';
+    await mgr2.setColorInteractive(fresh(id));
+    quickPickAnswer = undefined;
+    inputBoxAnswer = undefined;
+    chk('29d ★ 三位简写展开成小写六位后落盘', fresh(id).color === '#aabbcc',
+      String(fresh(id).color));
   }
 
   console.log('\n=== 15. 清理 + 用户环境未被触碰 ===');

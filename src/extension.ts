@@ -157,9 +157,15 @@ export function activate(context: vscode.ExtensionContext): void {
       const sessions = new Set(await tmux.listSessions());
       provider.setAlive(sessions); // 顺带把树的存活标记推到最新（setAlive 只在变化时 fire）
       const entries = await store.load();
+      // 键必须是**槽 id**：采样层内部就是 `sessionNameFor(id)`，而 v3 的 tmux
+      // 会话名由**槽** id 派生（一个终端挂 N 个槽 = N 个 tmux 会话）。
+      // 喂条目 id 的后果是：同一终端下只有「槽 id 恰好等于条目 id」的那一个
+      // （迁移出来的、或本 Task 之前新建的）能对上，第 2 个起的会话**永远**
+      // 采不到样 ⇒ 那一行的运行图标永远不转，且不报任何错 —— 静默、无测试能抓。
       const aliveIds = entries
-        .filter((e) => sessions.has(sessionNameFor(e.id)))
-        .map((e) => e.id);
+        .flatMap((e) => e.sessions)
+        .filter((s) => sessions.has(sessionNameFor(s.id)))
+        .map((s) => s.id);
       await tracker.poll(aliveIds);
     } finally {
       activityInFlight = false;

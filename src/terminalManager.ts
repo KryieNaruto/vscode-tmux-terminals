@@ -22,6 +22,7 @@ import {
   ownersOf,
 } from './core/conversation';
 import { isClaudeCommand, resumeFailed } from './core/claude';
+import { PRESET_COLORS, normalizeHexColor } from './core/colors';
 import { readProfileConfig } from './claudeConfig';
 import { findConversations, listConversations } from './conversationFiles';
 import { LivenessSnapshot, liveSessionIn, readLiveness } from './liveSessions';
@@ -414,8 +415,11 @@ export class TerminalManager {
     // 各自看到「还没人绑」，双双接到同一条对话上 —— 两个 claude 进程同时写
     // 同一个 .jsonl。顺带也避免了确认模态与下一个条目的选择框并存。
     return this.enqueuePick(async (): Promise<LaunchSpec | undefined> => {
+      // 标题带上**终端名 + 是哪个会话**：一个终端可以挂 N 个槽，而
+      // restoreAll 会并行恢复它们 —— 只说终端名，用户看到两个一模一样的
+      // 选择框时分不清正在给哪一个选（实测恢复 8 条时就会连弹）。
       const { total, picked, owner, startNew } = await this.pickConversation(
-        entry, `「${entry.name}」接回哪条对话？`,
+        entry, `「${entry.name}」的${this.slotLabel(entry, slot)}接回哪条对话？`,
       );
       if (total === 0) {
         const conversationId = newConversationId();
@@ -519,9 +523,10 @@ export class TerminalManager {
   /**
    * 观测一批条目的活跃会话并回写绑定。返回 true = 至少写了一条。
    *
-   * - 只处理「tmux 会话存活」的**槽**：会话都没了就没有活着的 claude 可观测，
-   *   此时**绝不**去改绑定（那会让 D 兜底之外的地方凭空「猜」）。空槽的条目
-   *   一并跳过 —— 它没有会话名可查。
+   * - 循环是**条目 × 槽**，只处理「tmux 会话存活」的**槽**（判据从「条目的会话
+   *   存活」收缩到「该槽的会话存活」）：会话都没了就没有活着的 claude 可观测，
+   *   此时**绝不**去改绑定（那会让 D 兜底之外的地方凭空「猜」）。没有任何槽的
+   *   条目一并跳过 —— 它没有会话名可查。
    * - 整批共用一份 LivenessSnapshot：`ps` 只 spawn 一次。
    * - 每条只在 reconcileBinding 返回非 undefined 时写一次 store.updateSession。
    * - 顺带预热任务名缓存：渲染层才能同步 peek 到「绑定对话的 aiTitle」。
@@ -547,27 +552,31 @@ export class TerminalManager {
     const snapshot = snap ?? (await readLiveness(this.home()));
     let wrote = false;
     for (const entry of entries) {
-      // v3：观测、绑定、回写都落在**槽**上（tmux 会话名由槽 id 派生）。
-      // 空槽的条目**什么都不做** —— 没有槽就没有会话名可查，硬凑一个等于去
+      // v3：观测、绑定、回写都落在**槽**上（tmux 会话名由槽 id 派生），
+      // 因此这里要遍历该条目下的**每一个**槽 —— 只取 sessions[0] 的话，同一个
+      // 终端下第 2 个起的会话永远不会被观测，它们的绑定会永久停在原值上。
+      // 注意：整批仍然只读**一份** snapshot（上面那一份），循环套在它外面。
+      // 没有槽的条目自然什么都不做：没有槽就没有会话名可查，硬凑一个等于去
       // 观测一个跟它毫无关系的会话，然后把结果写进别人的槽。
-      const slot = entry.sessions[0];
-      if (slot === undefined) continue;
-      if (!alive.has(sessionNameFor(slot.id))) continue; // 会话都不在了 → 不观测
-      try {
-        const live = await this.liveFor(snapshot, slot);
-        // reconcileBinding 一个字符都没改：它本来只认
-        // {conversationId, liveSessionId} 这个形状，SessionSlot 结构上正是它。
-        const patch = reconcileBinding(slot, live);
-        this.titles?.prewarm(patch?.conversationId ?? slot.conversationId, this.cwdFor(entry));
-        if (patch === undefined) continue;
-        // 必须走槽级原语（锁内读-改-写）：在锁外「读出数组→改一个槽→写回」会
-        // 让同一终端下两个槽的改动互相盖掉（lost update），表现为「改绑偶尔
-        // 不生效」。
-        await this.store.updateSession(entry.id, slot.id, patch);
-        wrote = true;
-      } catch {
-        // 单条写回失败不该中断整批（见本方法注释与 restoreAll 的契约）。
-        // 这条绑定没刷成，但其余条目照常观测、照常回写。
+      for (const slot of entry.sessions) {
+        if (!alive.has(sessionNameFor(slot.id))) continue; // 该槽的会话不在了 → 不观测
+        try {
+          const live = await this.liveFor(snapshot, slot);
+          // reconcileBinding 一个字符都没改：它本来只认
+          // {conversationId, liveSessionId} 这个形状，SessionSlot 结构上正是它。
+          const patch = reconcileBinding(slot, live);
+          this.titles?.prewarm(patch?.conversationId ?? slot.conversationId, this.cwdFor(entry));
+          if (patch === undefined) continue;
+          // 必须走槽级原语（锁内读-改-写）：在锁外「读出数组→改一个槽→写回」会
+          // 让同一终端下两个槽的改动互相盖掉（lost update），表现为「改绑偶尔
+          // 不生效」。**同一轮里两个槽各算一次补丁**，正是这条约束最容易破的
+          // 场景（同条目、同一次 reconcile）。
+          await this.store.updateSession(entry.id, slot.id, patch);
+          wrote = true;
+        } catch {
+          // 单条写回失败不该中断整批（见本方法注释与 restoreAll 的契约）。
+          // 这条绑定没刷成，但其余槽照常观测、照常回写。
+        }
       }
     }
     // 每批最多通知一次（不放进循环里逐条回调）：树重算是整棵的，
@@ -664,6 +673,37 @@ export class TerminalManager {
 
   private cwdFor(entry: TerminalEntry): string {
     return expandHome(entry.cwd, this.home());
+  }
+
+  /**
+   * 该终端下**此刻存活**的槽（tmux 会话在）。
+   *
+   * 条目级动作（切 profile / 切模型）作用在整个终端上，但能**立刻**生效的只有
+   * 存活的那些会话：死掉的槽不用去打扰，它下次启动时由 commandFor 带上新配置，
+   * 本来就会是新的。所以这里返回的是「需要现在动手」的那批，而不是「全部」。
+   */
+  private async aliveSlots(entry: TerminalEntry): Promise<SessionSlot[]> {
+    const out: SessionSlot[] = [];
+    for (const slot of entry.sessions) {
+      if (await this.tmux.hasSession(sessionNameFor(slot.id))) out.push(slot);
+    }
+    return out;
+  }
+
+  /**
+   * 在模态确认框里点名「作用在哪一个会话槽上」。
+   *
+   * 只写终端名是不够的：一个终端可以挂 N 个会话，而三级菜单里的条目级动作
+   * （profile / 模型 / 颜色 / 复制）作用范围是**整个终端** —— 不点名，用户在
+   * 一个会话行上点「切换直连」会以为只切了这一个（spec §7.3、§7.5）。
+   *
+   * 用**显示序号**（1 起，load 已按 order 排好）而不是槽 id：id 是随机十六进制
+   * 串，在对话框里认不出来；序号与树上第几行一一对应。找不到（调用方手里的
+   * 条目副本已过期）时退回中性说法，绝不编一个序号出来。
+   */
+  private slotLabel(entry: TerminalEntry, slot: SessionSlot): string {
+    const i = entry.sessions.findIndex((s) => s.id === slot.id);
+    return i < 0 ? '该会话' : `第 ${i + 1} 个会话`;
   }
 
   /**
@@ -867,19 +907,25 @@ export class TerminalManager {
   }
 
   /**
-   * 恢复所有标记了 autoRestore 的条目。
+   * 恢复所有标记了 autoRestore 的条目 —— 恢复的是它们的**每一个会话槽**。
+   *
+   * autoRestore 是**条目**的属性（「这个终端要不要参与一键恢复」），所以它对其下
+   * 所有会话生效：一个挂着 3 个会话的终端被标为参与恢复，就是恢复 3 个会话。
+   * 这与「profile / 模型只存在二级一份、三级共享」是同一个模式的延伸。
    *
    * 终端并行打开，**不 await openSession**：它会等 `waitForShell`
-   * （上限 3s）并逐条派发预设命令。若串行 await，N 个条目在某个
-   * 会话迟迟不就绪时最坏要等 N×3s 才全部开完 —— 而用户要的正是
-   * 「一次点开整组工作区」。并行则各终端的命令派发互不阻塞。
+   * （上限 3s）并逐个派发预设命令。若串行 await，N 个槽在某个会话迟迟不就绪时
+   * 最坏要等 N×3s 才全部开完 —— 而用户要的正是「一次点开整组工作区」。并行则
+   * 各终端的命令派发互不阻塞。
    *
    * 错误必须逐个捕获：openSession 内部已自行把失败呈现给用户，这里
-   * 只防止一个条目的异常中断整批恢复。
+   * 只防止一个槽的异常中断整批恢复。
    */
   restoreAll(): void {
     void (async () => {
       const entries = (await this.store.load()).filter((e) => e.autoRestore);
+      // 判据按**条目**（与今天一致），不看槽数：否则「有 3 个条目但都是 0 槽」
+      // 会静默什么都不做，用户以为按钮坏了。
       if (entries.length === 0) {
         vscode.window.showInformationMessage('没有标记为「参与全部恢复」的条目。');
         return;
@@ -887,18 +933,21 @@ export class TerminalManager {
       // 整批共用**一份** LivenessSnapshot：先跑一次 reconcileAll 回写绑定，
       // 再把同一份快照逐条透传给 openSession → reconcileOne，全程只 spawn 一次
       // `ps`。spec §4.3/§8 的「共享快照」约束必须在**最常用的批量路径**上
-      // 成立 —— 否则 N 个条目各 spawn 一次 `ps`。
+      // 成立 —— 否则 N 个槽各 spawn 一次 `ps`。
       const snap = await readLiveness(this.home());
       await this.reconcileAll(entries, snap);
       for (const e of entries) {
-        // 逐条取它的第一个槽。空槽的条目（`sessions: []`）在这里**不产生任何
-        // 恢复动作** —— openSession 会当场静默返回，这不算失败。
-        void this.openSession(e, e.sessions[0], { snap }).catch(() => {
-          // openSession 已经把可预期的失败呈现给用户了；这里只兜住意外异常，
-          // 避免一个条目炸掉整批恢复
-        });
-        // 轻微错开，避免 N 个终端在同一瞬间争抢创建
-        await new Promise((r) => setTimeout(r, 50));
+        // flatten 到**槽**：一个条目要开的终端数与它的会话数一样多。
+        // 槽数为 0 的条目在这里**不产生任何恢复动作**（它没有会话可恢复），
+        // 但也不算失败 —— 循环体一次都不进。
+        for (const slot of e.sessions) {
+          void this.openSession(e, slot, { snap }).catch(() => {
+            // openSession 已经把可预期的失败呈现给用户了；这里只兜住意外异常，
+            // 避免一个会话炸掉整批恢复
+          });
+          // 轻微错开，避免 N 个终端在同一瞬间争抢创建
+          await new Promise((r) => setTimeout(r, 50));
+        }
       }
     })();
   }
@@ -941,17 +990,14 @@ export class TerminalManager {
    */
   private async restartClaude(
     entry: TerminalEntry,
+    /**
+     * 要重启的**槽**。只由 applyProfile 传进来，且只传它挑出的**存活**槽 ——
+     * 因此这里不再有「空槽」那一路：一个槽都没有时 applyProfile 根本不会走到
+     * 重启（没有会话可重启，直接落配置）。绑定取自这个槽。
+     */
+    slot: SessionSlot,
     launch: TerminalEntry,
   ): Promise<boolean> {
-    // 绑定是会话级的：重启的是**这个终端下的第一个槽**。空槽的条目没有对话
-    // 可接回 —— 与「没有绑定」同侧，拒绝重启（绝不退回复 `--continue`）。
-    const slot = entry.sessions[0];
-    if (slot === undefined) {
-      void vscode.window.showErrorMessage(
-        `「${entry.name}」还没有任何会话，已拒绝重启 —— 无槽可接回。`,
-      );
-      return false;
-    }
     const session = sessionNameFor(slot.id);
 
     // 切 profile 也是 reconcile 的触发点（spec §4.3）。必须 `--resume` 之前做：
@@ -962,8 +1008,8 @@ export class TerminalManager {
     const bound = current.conversationId;
     if (bound === undefined || bound.length === 0) {
       void vscode.window.showErrorMessage(
-        `「${entry.name}」还没有绑定对话，已拒绝重启 —— 无法确定该接回哪一条。` +
-        `请先用右键菜单「选择要接回的对话…」绑定，再切 profile。`,
+        `「${entry.name}」的${this.slotLabel(entry, slot)}还没有绑定对话，已拒绝重启 —— ` +
+        `无法确定该接回哪一条。请先用右键菜单「选择要接回的对话…」绑定，再切 profile。`,
       );
       return false;
     }
@@ -995,7 +1041,7 @@ export class TerminalManager {
   }
 
   /**
-   * 把模型设置应用到一条条目。
+   * 把模型设置应用到**一个终端**（model 只存在条目上，其下所有会话共享）。
    *
    * 未运行的会话：只改配置。下次 openEntry 由 commandFor 带出 `--model`
    * （实测 `--model` 启动参数**不**污染全局默认）。
@@ -1004,6 +1050,9 @@ export class TerminalManager {
    * 对话当前模型的机制（实测 bare `claude --continue` 会保留原对话的模型，
    * 命令行 `--model` 也盖不过 resumed 会话），代价是 `/model` 会顺带改写
    * `~/.claude/settings.json` 的全局默认 —— 这是用户显式接受的取舍。
+   *
+   * **每个存活的槽都要发一次**：一个终端挂 3 个 claude，只给第一个发等于
+   * 另外两个默默跑在旧模型上 —— 而用户看到「设置成功」的提示，无从察觉。
    *
    * 清空（model 未给）时回落到该 profile 的默认模型；读不到默认则只落
    * 配置、提示下次启动生效。
@@ -1016,13 +1065,12 @@ export class TerminalManager {
    * 「成功/失败」，而非把拒绝当成功。
    */
   async applyModel(entry: TerminalEntry, model: string | undefined): Promise<boolean> {
-    // 会话名由第一个**槽**的 id 派生。空槽的条目（`sessions: []`）没有任何会话
-    // 可切 —— 与「会话没在跑」同侧：只落配置，下次启动时生效。
-    const slot = entry.sessions[0];
-    const session = slot === undefined ? undefined : sessionNameFor(slot.id);
+    // 能立刻生效的是「其下所有**存活**的槽」。一个都没有（`sessions: []`，
+    // 或全是死会话）与「会话没在跑」同侧：只落配置，下次启动时生效。
+    const alive = await this.aliveSlots(entry);
     const normalized = model && model.length > 0 ? model : undefined;
 
-    if (session === undefined || !(await this.tmux.hasSession(session))) {
+    if (alive.length === 0) {
       await this.store.update(entry.id, { model: normalized });
       return true;
     }
@@ -1041,9 +1089,14 @@ export class TerminalManager {
       return true;
     }
 
-    if (!(await this.canSendControl(session))) {
-      this.refuse(entry, '切模型');
-      return false;
+    // 安全闸门对**每一个**存活槽都过一遍，且**都在发送之前**：只切一半会让
+    // 用户以为切好了，而实际上还有会话跑在旧模型上 —— 那种不一致比整体拒绝
+    // 更难排查。任一个不合格就整体拒绝、不改配置（与从前单会话时的语义一致）。
+    for (const slot of alive) {
+      if (!(await this.canSendControl(sessionNameFor(slot.id)))) {
+        this.refuse(entry, '切模型');
+        return false;
+      }
     }
     // 控制字符会把一行 `/model x` 拆成两条输入：`sendLiteral` 不解释 `\n`，
     // 但终端把它当回车 —— 第二行会作为新的键盘输入打进活着的会话。模型名
@@ -1054,8 +1107,11 @@ export class TerminalManager {
       );
       return false;
     }
-    await this.tmux.sendLiteral(session, `/model ${target}`);
-    await this.tmux.sendEnter(session);
+    for (const slot of alive) {
+      const session = sessionNameFor(slot.id);
+      await this.tmux.sendLiteral(session, `/model ${target}`);
+      await this.tmux.sendEnter(session);
+    }
     await this.store.update(entry.id, { model: normalized });
     return true;
   }
@@ -1069,6 +1125,10 @@ export class TerminalManager {
    *
    * model 一并清空：两个 profile 的模型命名空间不同（deepseek-* vs
    * claude-*），沿用旧值几乎必然无效，回落到新 profile 的默认才正确。
+   *
+   * **其下每个存活的槽都要重启**，而且各自 `--resume` **自己**那条对话
+   * （绑定在槽上，不在条目上）：一个终端挂 3 个 claude，只重启第一个等于
+   * 另外两个还在用旧 profile 的端点与鉴权。
    */
   /**
    * 返回 false 表示被安全守卫拒绝（或重启失败），未改动配置；true 表示
@@ -1076,13 +1136,15 @@ export class TerminalManager {
    */
   async applyProfile(entry: TerminalEntry, profile: Profile): Promise<boolean> {
     if (entry.profile === profile) return true;
-    // 会话名由第一个**槽**的 id 派生。空槽的条目没有会话要重启 —— 直接落配置。
-    const slot = entry.sessions[0];
-    const session = slot === undefined ? undefined : sessionNameFor(slot.id);
+    // 只有存活的槽需要重启；一个都没有就直接落配置。
+    const alive = await this.aliveSlots(entry);
 
-    if (session !== undefined && (await this.tmux.hasSession(session))) {
-      const ok = await this.restartClaude(entry, { ...entry, profile, model: undefined });
-      if (!ok) return false; // 被拒绝时不动配置
+    for (const slot of alive) {
+      const ok = await this.restartClaude(entry, slot, { ...entry, profile, model: undefined });
+      // 被拒绝时不动配置。**中途失败也整体不落配置**：已经重启过的槽接回的是
+      // 各自的对话、配置没变，还是旧 profile —— 与「什么都没发生」自洽；
+      // 若这时落配置，树显示新 profile 而部分会话仍跑旧端点，反而对不上。
+      if (!ok) return false;
     }
     // model 必须一并落盘：store.update **合并**补丁，只写 profile 会让旧的
     // model（ccr 命名空间，如 deepseek-*）残留 —— 启动命令会带着无效的
@@ -1170,7 +1232,14 @@ export class TerminalManager {
 
   // ---- 交互式增删改 ----
 
-  async addEntryInteractive(): Promise<void> {
+  /**
+   * 新建一个终端条目。标题栏的 `+` 与一级（文件夹）行上的 `+` 共用它。
+   *
+   * `defaultCwd` 来自一级那一行（那个文件夹的 cwd），只作为 `askCwd` 的预填
+   * **占位值**，用户照样可以改 —— 文件夹是 `groupByCwd` 按 cwd 自动生成的
+   * **虚拟**节点，它没有实体可依附，能做的只有「把它的 cwd 当成新建时的默认值」。
+   */
+  async addEntryInteractive(defaultCwd?: string): Promise<void> {
     const all = await this.store.load();
     const name = await this.askName('', all.map((e) => e.name));
     // 必须用 undefined 判断取消，不能用 `!name`：validateName 已禁止空名，
@@ -1178,7 +1247,7 @@ export class TerminalManager {
     // `!name` 恰好也拦住了取消，语义却是错的，日后放开空名就会变成
     // 「取消后仍继续往下问目录」。
     if (name === undefined) return;
-    const cwd = await this.askCwd();
+    const cwd = await this.askCwd(defaultCwd);
     if (cwd === undefined) return;
     const autoRestore = await this.askAutoRestore(true);
     if (autoRestore === undefined) return;
@@ -1186,9 +1255,9 @@ export class TerminalManager {
     // 新建条目**必须带 1 个空会话槽**，不是 0 个：0 槽的条目会显示成不可展开
     // 的一行、点了也没反应，比今天差 ——「建完点开就能用」与今天的体验必须一致。
     //
-    // 槽 id 取**条目 id**（不是另发一个）：v3 之前 tmux 会话名一直是
-    // `tmuxterm-<条目 id>`，沿用同一个 id 才能让「谁在跑」的每一处判据都指同
-    // 一个会话（迁移合成槽用的是同一条规则，见 core/migrate.ts）。
+    // 槽 id 用**新 id**，不再借用条目 id：那条「槽 id = 条目 id」的规则只属于
+    // v1/v2 迁移（迁移面对的是「别人已经拿旧 id 建好了 tmux 会话」的局面，
+    // 见 core/migrate.ts）。新条目没有这个包袱，两种来源的 id 也不会撞。
     //
     // 槽里预分配 conversationId：这样「无 conversationId」此后**只**表示
     // 「本功能上线前的老条目」，新建的条目永远不会被弹选择框。
@@ -1196,11 +1265,25 @@ export class TerminalManager {
     // （裸 claude，一个会话参数都不带），这条 id 只是占住「已绑定、别弹
     // 选择框」的位；真正在用的那条对话由 reconcile 观测到之后回写
     // （见 resolveLaunchSpec 与 core/reconcile.ts）。
-    const id = newId();
     await this.store.append({
-      id, name, cwd, profile: 'ccr', autoRestore,
-      sessions: [{ id, conversationId: newConversationId(), order: 0 }],
+      id: newId(), name, cwd, profile: 'ccr', autoRestore,
+      sessions: [{ id: newId(), conversationId: newConversationId(), order: 0 }],
     });
+  }
+
+  /**
+   * 在某个终端下加一个会话槽（二级行上的 `+`）。
+   *
+   * **零弹框**：问名字、问目录在这里都没有意义（名字与目录是二级的配置，
+   * 新会话全继承）。新槽绑定为空，第一次点开它走的是
+   * `resolveLaunchSpec` 的未绑定分支。
+   *
+   * **不自动打开终端**：「+」是「加一个会话位」，不是「立刻起一个 claude」，
+   * 因此它没有任何副作用，也就没有「点错了要收拾」的问题。打开是紧接着点
+   * 那一行的事（spec §13 的取舍：代价是新建会话变成两步）。
+   */
+  async addSessionInteractive(entry: TerminalEntry): Promise<void> {
+    await this.store.addSession(entry.id, { id: newId() });
   }
 
   async editEntryInteractive(entry: TerminalEntry): Promise<void> {
@@ -1236,49 +1319,27 @@ export class TerminalManager {
     //    「没变化」而不改绑 —— 复制品从此永远跟着源条目那条会话走。
     //  与 conversationId 一样：复制品是另一个终端，一切都该从「未观测」开始。
     // 槽的**数量与 order 原样保留**：复制一个有 3 个会话的终端 = 复制出一个
-    // 有 3 个空槽的终端。
-    //
-    // 第一个槽的 id 取**复制品的新条目 id**，而不是另发一个：扩展里「谁在跑」
-    // 有两处判据 —— tree 按槽 id 派生 tmux 会话名，而 extension.ts 的存活/活动
-    // 轮询此刻仍按**条目** id 派生（本 Task 不动 extension.ts）。两者必须指同
-    // 一个会话，所以第一个槽沿用条目 id（与新建条目、v1/v2 迁移同一条规则）。
-    // 多槽阶段（后续 Task）会给第 2 个及以后的槽另发新 id。
+    // 有 3 个空槽的终端（槽的 id 每个都是新的，所以也不会与原终端的 tmux
+    // 会话名撞车）。
     const { order: _dropOrder, sessions, ...rest } = entry;
-    const id = newId();
     await this.store.append({
-      ...rest, id, name,
-      sessions: sessions.map((s, i) => ({
-        id: i === 0 ? id : newId(),
+      ...rest, id: newId(), name,
+      sessions: sessions.map((s) => ({
+        id: newId(),
         conversationId: newConversationId(),
         order: s.order,
       })),
     });
   }
 
-  async deleteEntry(entry: TerminalEntry): Promise<void> {
-    const pick = await vscode.window.showWarningMessage(
-      `删除条目「${entry.name}」？远端 tmux 会话不受影响。`,
-      { modal: true },
-      '删除',
-    );
-    if (pick !== '删除') return;
-    await this.store.remove(entry.id);
-  }
-
-  async killSession(entry: TerminalEntry): Promise<void> {
-    // 会话名由第一个**槽**的 id 派生。空槽的条目没有任何会话可杀：先挡在
-    // 确认框之前 —— 弹一个「确定要杀吗」然后什么都不做，比不弹更糟。
-    const slot = entry.sessions[0];
-    if (slot === undefined) return;
-    const pick = await vscode.window.showWarningMessage(
-      `杀掉远端 tmux 会话「${entry.name}」？其中正在运行的进程会一并终止，对应终端也会关闭。`,
-      { modal: true },
-      '杀掉',
-    );
-    if (pick !== '杀掉') return;
-
-    const session = sessionNameFor(slot.id);
-
+  /**
+   * 杀掉一个 tmux 会话并收掉它的面板。**三步顺序不可换。**
+   *
+   * 这是三处「关闭 / 删除」共用的唯一出口：抽出来是为了让「顺序反了会让面板
+   * 停在 tmux 界面」这条知识只有一份 —— 复制三遍就会有一份先腐坏，而症状
+   * （UI 与实际不符、下次点击以为「杀不掉」）跟真正的 bug 长得一样。
+   */
+  private async killSlot(session: string): Promise<void> {
     // 顺序不能变：先摘客户端，再杀会话。否则「终端里的 attach」与「kill」
     // 之间的时序窗口会让面板停在 tmux 界面，造成 UI 与实际不符。
     await this.tmux.detachClients(session);
@@ -1291,8 +1352,149 @@ export class TerminalManager {
       this.terminals.delete(session);
       term.dispose();
     }
+  }
 
-    vscode.window.showInformationMessage(`已杀掉会话「${entry.name}」。`);
+  /**
+   * 关闭一个会话（三级行上的 `X`）：杀 tmux 进程，**槽与绑定原样保留**。
+   *
+   * **这里是「三级是接回会话的」能成立的前提**：`conversationId` 一字不动，
+   * 所以再点那一行时 `resolveLaunchSpec` 自然会 `--resume` 回**同一条**对话。
+   * 顺手清掉绑定（哪怕是「反正进程都没了」这种看起来无害的清法）会让这个
+   * 特性彻底失效 —— 再点就变成开一条新对话，而用户以为接回了原来那条。
+   */
+  async closeSession(entry: TerminalEntry, slot: SessionSlot): Promise<void> {
+    const pick = await vscode.window.showWarningMessage(
+      `关闭「${entry.name}」的${this.slotLabel(entry, slot)}？\n` +
+      `其中正在运行的进程会一并终止，对应终端也会关闭。\n` +
+      `该会话与它绑定的对话会保留 —— 再点那一行即可接回同一条对话。`,
+      { modal: true },
+      '关闭',
+    );
+    if (pick !== '关闭') return;
+    await this.killSlot(sessionNameFor(slot.id));
+  }
+
+  /**
+   * 删除一个会话（三级行右键）：杀 tmux 进程 **+ 把这个槽从清单里去掉**。
+   *
+   * 与 `closeSession` 的分界就是「槽在不在」：X 是关掉但留着（随时能接回），
+   * 这个是连同绑定一起删掉。三级行上同时挂着这两条是刻意的 —— 在一个会话行
+   * 上误删**整个终端**（连同其下所有会话与对话绑定）的破坏性太大，所以三级
+   * 的「删除」只能是删会话，删条目留在二级。
+   */
+  async deleteSession(entry: TerminalEntry, slot: SessionSlot): Promise<void> {
+    const pick = await vscode.window.showWarningMessage(
+      `删除「${entry.name}」的${this.slotLabel(entry, slot)}？\n` +
+      `其中正在运行的进程会一并终止，该会话与它的对话绑定会一起从清单里移除` +
+      `（对话记录文件本身不动，但扩展不再认得它）。`,
+      { modal: true },
+      '删除',
+    );
+    if (pick !== '删除') return;
+    await this.killSlot(sessionNameFor(slot.id));
+    await this.store.removeSession(entry.id, slot.id);
+  }
+
+  /**
+   * 删除整个终端条目：**递归杀掉其下每一个会话**，然后移除条目。
+   *
+   * 「远端 tmux 会话不受影响」是 0.1.8 的行为，本轮**反过来了** —— 删了条目
+   * 却留着一堆后台 claude 在跑，用户既看不见也管不着（清单里已经没有它们了）。
+   * 确认框文案必须跟着改，否则用户按旧文案的预期去点，损失的是在途工作。
+   *
+   * 槽数为 0 的条目照常可删（没有会话可杀，循环一次都不进）。
+   */
+  async deleteEntry(entry: TerminalEntry): Promise<void> {
+    const pick = await vscode.window.showWarningMessage(
+      `删除终端「${entry.name}」？\n` +
+      `它下面的 ${entry.sessions.length} 个会话都会被一并杀掉（正在跑的 claude 会终止），` +
+      `条目与全部会话绑定一起从清单里移除。`,
+      { modal: true },
+      '删除',
+    );
+    if (pick !== '删除') return;
+    for (const slot of entry.sessions) {
+      await this.killSlot(sessionNameFor(slot.id));
+    }
+    await this.store.remove(entry.id);
+  }
+
+  /**
+   * 关闭该终端下的**全部**会话（二级行右键），**条目与槽都保留**。
+   *
+   * 命令 ID 与名字沿用 `killSession`（spec §3.3 第 4 条：不删任何既有命令 ID，
+   * 以免打坏用户已有的 keybinding），只是语义从「杀掉该条目的那个会话」收窄成
+   * 「关掉这个终端下所有会话」—— 在 v3 里「条目的那个会话」已经没有唯一答案了。
+   */
+  async killSession(entry: TerminalEntry): Promise<void> {
+    // 没有任何槽就没什么可杀：先挡在确认框之前 —— 弹一个「确定要杀吗」然后
+    // 什么都不做，比不弹更糟。
+    if (entry.sessions.length === 0) return;
+    const pick = await vscode.window.showWarningMessage(
+      `关闭「${entry.name}」下的全部 ${entry.sessions.length} 个会话？` +
+      `其中正在运行的进程会一并终止，对应终端也会关闭。条目与会话槽保留。`,
+      { modal: true },
+      '杀掉',
+    );
+    if (pick !== '杀掉') return;
+
+    for (const slot of entry.sessions) {
+      await this.killSlot(sessionNameFor(slot.id));
+    }
+    vscode.window.showInformationMessage(`已关闭「${entry.name}」下的全部会话。`);
+  }
+
+  /**
+   * 设置二级行首那条竖线的颜色。
+   *
+   * 调色板 = 8 个预设 + 末项「自定义…」，末项才走输入框。**两道闸**：
+   * `validateInput` 当场把非法值挡回去（用户能立刻改），返回后再
+   * `normalizeHexColor` 一次 —— 输入框那一关是给用户看的，这一关是给清单看
+   * 的：**非法值绝不写进清单**，否则同一个颜色会有两种写法、图标还会落成两个
+   * 文件，而且 `colorBarSvg` 拿到的就是脏数据。
+   *
+   * 本 Task 只做到「写 store」为止；把 SVG 落到 `<globalStorage>/colors/`
+   * 并刷新图标是渲染侧的事（`src/colorIcons.ts`）。
+   */
+  async setColorInteractive(entry: TerminalEntry): Promise<void> {
+    const CUSTOM = '$(pencil) 自定义…';
+    const pick = await vscode.window.showQuickPick([...PRESET_COLORS, CUSTOM], {
+      title: `为「${entry.name}」设置颜色`,
+      placeHolder: entry.color ?? '（未设，中性竖线）',
+    });
+    if (pick === undefined) return;
+
+    let color: string | undefined;
+    if (pick !== CUSTOM) {
+      color = normalizeHexColor(pick);
+      // 预设色本身就是归一化过的（colors.test.ts 钉着），走到这里为 undefined
+      // 只可能是 PRESET_COLORS 被改坏了 —— 那时宁可什么都不做，也不写脏值。
+      if (color === undefined) return;
+    } else {
+      const typed = await vscode.window.showInputBox({
+        title: '颜色',
+        prompt: '十六进制颜色，例如 #4e9a51；留空 = 清除颜色（回到中性竖线）',
+        value: entry.color ?? '',
+        validateInput: (v) =>
+          (v.trim().length === 0 || normalizeHexColor(v) !== undefined
+            ? null
+            : '需要一个十六进制颜色，例如 #4e9a51'),
+      });
+      if (typed === undefined) return;
+      const trimmed = typed.trim();
+      if (trimmed.length === 0) {
+        // 清空 → 回到中性竖线。写 undefined 而不是空串：`entry.color` 的
+        // 契约是「未设 = 中性」，空串会变成第三种状态，图标层还得再兜一次。
+        await this.store.update(entry.id, { color: undefined });
+        return;
+      }
+      color = normalizeHexColor(trimmed);
+      // validateInput 只是 UI 层的第一道闸，这里才是真正把关的那一道：
+      // 对不合法输入**放弃**（不写清单、不猜近似色）。用户在框里看到过
+      // 「需要一个十六进制颜色」的提示，知道该重来一次。
+      if (color === undefined) return;
+    }
+    await this.store.update(entry.id, { color });
   }
 
   async toggleAutoRestore(entry: TerminalEntry): Promise<void> {
