@@ -4,6 +4,9 @@ import { TerminalEntry } from '../../src/core/types';
 
 const mk = (id: string, cwd: string): TerminalEntry => ({
   id, name: id, cwd, profile: 'ccr', autoRestore: true, order: 0,
+  // 夹具补 `sessions`（v3 的必需字段）：本文件验的是**按 cwd 分组**，与槽无关。
+  // 断言一个字没动。
+  sessions: [],
 });
 
 describe('groupByCwd', () => {

@@ -5,7 +5,11 @@ import { TerminalEntry } from '../../src/core/types';
 function e(patch: Partial<TerminalEntry> = {}): TerminalEntry {
   return {
     id: 'abc123', name: 'n', cwd: '/tmp',
-    profile: 'ccr', autoRestore: true, order: 0, ...patch,
+    profile: 'ccr', autoRestore: true, order: 0,
+    // 夹具补 `sessions`：本文件验的是**命令派生**，与槽无关，给个合法空槽即可
+    // （`[]` 是 v3 的合法状态）。断言一个字没动。
+    sessions: [],
+    ...patch,
   };
 }
 

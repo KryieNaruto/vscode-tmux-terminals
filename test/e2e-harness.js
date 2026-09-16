@@ -219,7 +219,7 @@ const CONV_RESTART = 'aaaaaaaa-0004-0000-0000-000000000000';
 const CONV_RESTART2 = 'aaaaaaaa-0008-0000-0000-000000000000';
 const CONV_FAIL = 'aaaaaaaa-0005-0000-0000-000000000000';
 const CONV_STALE = 'aaaaaaaa-0006-0000-0000-000000000000';
-// 与 CONV_FRESH 一样**始终不被创建**，但绑定它的条目 liveSessionId 有值 ——
+// 与 CONV_FRESH 一样**始终不被创建**，但绑定它的那个槽 liveSessionId 有值 ——
 // 用它区分「首启（从未跑起来过）」与「记录被外部删了（曾观测到跑起来过）」。
 const CONV_LOST = 'aaaaaaaa-0009-0000-0000-000000000000';
 const PICKED_CONV = '99999999-8888-7777-6666-555555555555';
@@ -618,10 +618,26 @@ async function projectSnapshot() {
       const i = this.entries.findIndex((e) => e.id === id);
       if (i >= 0) this.entries[i] = { ...this.entries[i], ...patch };
     },
+    // v3：绑定回写走槽级原语（生产代码的 writeBinding → store.updateSession）。
+    // 假 store 也必须实现它，否则 openSession 一进到写绑定那一行就抛
+    // 「updateSession is not a function」，而症状看起来是「绑定没刷成」。
+    async updateSession(entryId, sessionId, patch) {
+      const i = this.entries.findIndex((e) => e.id === entryId);
+      if (i < 0) return;
+      const sessions = this.entries[i].sessions || [];
+      const j = sessions.findIndex((s) => s.id === sessionId);
+      if (j < 0) return;
+      const next = sessions.slice();
+      next[j] = { ...next[j], ...patch, id: next[j].id };
+      this.entries[i] = { ...this.entries[i], sessions: next };
+    },
     async remove() {}, async findByName() {}, async reorder() {},
   };
   const fresh = (id) => store.entries.find((e) => e.id === id);
-  const bound = (id) => fresh(id) && fresh(id).conversationId;
+  /** 绑定是**会话级**的（v3）：断言读的是该条目第一个槽上的绑定。 */
+  const bound = (id) => fresh(id) && fresh(id).sessions[0] && fresh(id).sessions[0].conversationId;
+  /** 该条目第一个槽的便捷读取（多会话的用例不用它，自己构造 sessions）。 */
+  const slot0 = (e) => e.sessions[0];
   const literalsTo = (session) =>
     calls.literals.filter((l) => l.name === session).map((l) => l.text);
   const resetCalls = () => {
@@ -631,9 +647,25 @@ async function projectSnapshot() {
     calls.quickPickShapeViolations.length = 0;
   };
 
-  const mk = (id, name, cwd, extra) => ({
-    id, name, cwd, profile: 'ccr', autoRestore: true, order: 0, ...extra,
-  });
+  // v3：一条目 = 一个**会话槽数组**。既有用例全是「一条目一会话」，故这里把
+  // conversationId / liveSessionId 转发进唯一的那个槽，槽 id 取条目 id
+  // （与 v1/v2 迁移的合成规则同构：tmux 会话名由槽 id 派生，沿用条目 id 才能
+  // 认得出迁移前就在跑的会话）。
+  //
+  // **只进槽、不进顶层**：照抄到顶层会让清单里长出两个不该有的字段，而 harness
+  // 是 JS，TS 的类型检查管不到这里 —— 只能靠这一行显式剥掉。
+  //
+  // 槽的 order 固定 0：既有用例都是单槽，不需要别的顺序。**多会话的新用例自己
+  // 构造 sessions 数组**（两个槽、各自的 order），不复用 mk —— 一个 helper 不
+  // 该为了两种形状变得两头不讨好。
+  const mk = (id, name, cwd, extra = {}) => {
+    const { conversationId, liveSessionId, ...entryLevel } = extra;
+    return {
+      id, name, cwd, profile: 'ccr', autoRestore: false,
+      sessions: [{ id, conversationId, liveSessionId, order: 0 }],
+      ...entryLevel,
+    };
+  };
   store.entries = [
     mk(ID_NEW, 'NEW', SCRATCH),                                   // 老条目：无 conversationId
     mk(ID_FRESH, 'FRESH', BOUND_CWD, { conversationId: CONV_FRESH }),
@@ -726,7 +758,7 @@ async function projectSnapshot() {
   {
     resetCalls();
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_NEW));
+    await mgr.openSession(fresh(ID_NEW), fresh(ID_NEW).sessions[0]);
     await sleep(2500);
 
     const t1 = calls.terminals[calls.terminals.length - 1];
@@ -744,7 +776,7 @@ async function projectSnapshot() {
   {
     resetCalls();
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_FRESH));
+    await mgr.openSession(fresh(ID_FRESH), fresh(ID_FRESH).sessions[0]);
     await sleep(2500);
 
     chk('★ 全程没弹选择框（新建条目不该被问）', calls.quickPicks.length === 0,
@@ -767,10 +799,10 @@ async function projectSnapshot() {
     // 只覆盖「记录被外部删了要出声」这条路径：单测里有，e2e 原先完全没有。
     resetCalls();
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_LOST));
+    await mgr.openSession(fresh(ID_LOST), fresh(ID_LOST).sessions[0]);
     await sleep(2500);
 
-    // 与第 2 组的**唯一**差别是 entry.liveSessionId 有值（= 上一次已确认观测到
+    // 与第 2 组的**唯一**差别是槽的 liveSessionId 有值（= 上一次已确认观测到
     // 这个终端在跑哪条会话）。对话文件在「文件」这一层两件事不可区分，全靠它
     // 分开：没有它 = 从未跑起来过（第 2 组，静默）；有它 = 那条 .jsonl 被外部
     // 删了（手动 rm、清理工具），这时沉默会让用户以为「对话又没了」，必须出声。
@@ -790,7 +822,7 @@ async function projectSnapshot() {
   {
     resetCalls();
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_DEAD));
+    await mgr.openSession(fresh(ID_DEAD), fresh(ID_DEAD).sessions[0]);
     await sleep(2500);
 
     chk('会话被重建', await tmux.hasSession(S(ID_DEAD)));
@@ -810,7 +842,7 @@ async function projectSnapshot() {
 
     resetCalls();
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_ALIVE));
+    await mgr.openSession(fresh(ID_ALIVE), fresh(ID_ALIVE).sessions[0]);
     await sleep(1200);
 
     chk('接回了已有会话', calls.terminals.some(attachedTo));
@@ -827,7 +859,7 @@ async function projectSnapshot() {
 
     resetCalls();
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_SHELL));
+    await mgr.openSession(fresh(ID_SHELL), fresh(ID_SHELL).sessions[0]);
     await sleep(1500);
 
     const sent = literalsTo(S(ID_SHELL));
@@ -842,7 +874,7 @@ async function projectSnapshot() {
     resetCalls();
     quickPickAnswer = (items) => items.find((i) => i.candidate && i.candidate.id === PICKED_CONV);
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_LEGACY));
+    await mgr.openSession(fresh(ID_LEGACY), fresh(ID_LEGACY).sessions[0]);
     await sleep(2500);
     quickPickAnswer = undefined;
 
@@ -873,7 +905,7 @@ async function projectSnapshot() {
     resetCalls();
     quickPickAnswer = (items) => { quickPickAnswer = undefined; return undefined; };  // 只看列表内容
     const mgrPeek = newManager();
-    await mgrPeek.openEntry(fresh(ID_SHARE));
+    await mgrPeek.openSession(fresh(ID_SHARE), fresh(ID_SHARE).sessions[0]);
     await sleep(2500);
     // 注意：本用例里 CONV_CWD 下还有另一条已绑给 CONFLICT 的对话，
     // 所以必须按 id 取到 PICKED_CONV 那一项，而不是「第一个带归属的」。
@@ -887,7 +919,7 @@ async function projectSnapshot() {
     quickPickAnswer = pickShared;
     modalAnswer = undefined;                       // 取消
     const mgr1 = newManager();
-    await mgr1.openEntry(fresh(ID_SHARE));
+    await mgr1.openSession(fresh(ID_SHARE), fresh(ID_SHARE).sessions[0]);
     await sleep(2500);
     modalAnswer = undefined;
     chk('★ 拒绝确认后未绑定（绝不悄悄共写同一条对话）', bound(ID_SHARE) === undefined,
@@ -901,7 +933,7 @@ async function projectSnapshot() {
     quickPickAnswer = pickShared;
     modalAnswer = '仍然接这条';
     const mgr2 = newManager();
-    await mgr2.openEntry(fresh(ID_SHARE));
+    await mgr2.openSession(fresh(ID_SHARE), fresh(ID_SHARE).sessions[0]);
     await sleep(2500);
     modalAnswer = undefined;
     quickPickAnswer = undefined;
@@ -951,7 +983,7 @@ async function projectSnapshot() {
       return items.find((i) => i.candidate && i.candidate.id === PICKED_CONV);
     };
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_TOCTOU));
+    await mgr.openSession(fresh(ID_TOCTOU), fresh(ID_TOCTOU).sessions[0]);
     await sleep(2000);
     quickPickAnswer = undefined;
     modalAnswer = undefined;
@@ -971,17 +1003,22 @@ async function projectSnapshot() {
     // RACE_CONV 此时还没人绑：第一个条目会绑上它，第二个必须看见它已被绑
     quickPickAnswer = (items) => items.find((i) => i.candidate && i.candidate.id === RACE_CONV);
     modalAnswer = undefined;   // 第二个若被要求确认 → 取消
-    // 真实的 store.update 是一次**文件写入**，有真实耗时。把它放慢，
+    // 真实的 store.updateSession 是一次**文件写入**，有真实耗时。把它放慢，
     // 「读 owners 在 op 内、写绑定在 op 外」这个缺陷就一定会露马脚：
     // 第二个条目会在第一个的写入落盘之前读到「还没人绑」。
-    const origUpdate = store.update.bind(store);
-    store.update = async (id, patch) => { await sleep(300); return origUpdate(id, patch); };
+    // 注意放慢的是 **updateSession**（v3 的绑定回写出口），不是 update ——
+    // 挂错方法等于这一节什么都没验。
+    const origUpdate = store.updateSession.bind(store);
+    store.updateSession = async (id, sid, patch) => { await sleep(300); return origUpdate(id, sid, patch); };
 
     const mgr = newManager();
-    // 并发发起（restoreAll 内部就是这么并发 openEntry 的）
-    await Promise.all([mgr.openEntry(fresh(ID_RACE_A)), mgr.openEntry(fresh(ID_RACE_B))]);
+    // 并发发起（restoreAll 内部就是这么并发 openSession 的）
+    await Promise.all([
+      mgr.openSession(fresh(ID_RACE_A), fresh(ID_RACE_A).sessions[0]),
+      mgr.openSession(fresh(ID_RACE_B), fresh(ID_RACE_B).sessions[0]),
+    ]);
     await sleep(2500);
-    store.update = origUpdate;
+    store.updateSession = origUpdate;
     quickPickAnswer = undefined;
     modalAnswer = undefined;
 
@@ -999,8 +1036,8 @@ async function projectSnapshot() {
   {
     resetCalls();
     // 两个条目都恢复成「未绑定」，这样它们都会经过选择框
-    await store.update(ID_RACE_A, { conversationId: undefined });
-    await store.update(ID_RACE_B, { conversationId: undefined });
+    await store.updateSession(ID_RACE_A, ID_RACE_A, { conversationId: undefined });
+    await store.updateSession(ID_RACE_B, ID_RACE_B, { conversationId: undefined });
     let modalCalls = 0;
     let picksDuringModal = -1;
     // 两个条目都选「已绑给 LEGACY」的 PICKED_CONV → 都会走确认模态
@@ -1016,7 +1053,10 @@ async function projectSnapshot() {
     };
 
     const mgr = newManager();
-    await Promise.all([mgr.openEntry(fresh(ID_RACE_A)), mgr.openEntry(fresh(ID_RACE_B))]);
+    await Promise.all([
+      mgr.openSession(fresh(ID_RACE_A), fresh(ID_RACE_A).sessions[0]),
+      mgr.openSession(fresh(ID_RACE_B), fresh(ID_RACE_B).sessions[0]),
+    ]);
     await sleep(2500);
     quickPickAnswer = undefined;
     modalAnswer = undefined;
@@ -1033,7 +1073,7 @@ async function projectSnapshot() {
     resetCalls();
     quickPickAnswer = (items) => items[items.length - 1];   // 末项 = 新建
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_LEGACY_NEW));
+    await mgr.openSession(fresh(ID_LEGACY_NEW), fresh(ID_LEGACY_NEW).sessions[0]);
     await sleep(2500);
     quickPickAnswer = undefined;
 
@@ -1050,7 +1090,7 @@ async function projectSnapshot() {
     resetCalls();
     quickPickAnswer = undefined;   // Esc
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_LEGACY_ESC));
+    await mgr.openSession(fresh(ID_LEGACY_ESC), fresh(ID_LEGACY_ESC).sessions[0]);
     await sleep(2500);
 
     chk('会话照常建好并 attach（面板可用）', await tmux.hasSession(S(ID_LEGACY_ESC))
@@ -1085,7 +1125,8 @@ async function projectSnapshot() {
     // 9b. 无绑定 → 拒绝，绝不自作主张接一条最新的
     // 会话必须活着，否则 applyProfile 根本不会走到 restartClaude
     await newSessionWithClaude(ID_NOBIND, FAKE_CLAUDE_EXITING, '-n 1');
-    await store.update(ID_NOBIND, { conversationId: undefined });   // 模拟「还没绑定」
+    // 模拟「还没绑定」：绑定在槽上，故清的是该条目唯一那个槽的绑定。
+    await store.updateSession(ID_NOBIND, ID_NOBIND, { conversationId: undefined });
     resetCalls();
     const mgr2 = newManager();
     const before = fresh(ID_NOBIND).profile;
@@ -1104,7 +1145,7 @@ async function projectSnapshot() {
     resetCalls();
     launchBin = FAIL_BIN;             // 这个会话里的 claude 会报「找不到对话」
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_RESUMEFAIL));
+    await mgr.openSession(fresh(ID_RESUMEFAIL), fresh(ID_RESUMEFAIL).sessions[0]);
     await sleep(1500);
     launchBin = QUIET_BIN;
 
@@ -1120,7 +1161,7 @@ async function projectSnapshot() {
     await tmux.newSession(S(ID_CONFLICT), BOUND_CWD);
     resetCalls();
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_CONFLICT));
+    await mgr.openSession(fresh(ID_CONFLICT), fresh(ID_CONFLICT).sessions[0]);
     await sleep(1500);
 
     chk('★ 一条命令都没发（--resume 按 cwd 作用域，发出去也接不回）',
@@ -1145,7 +1186,7 @@ async function projectSnapshot() {
       const stale = makeSurvivor(nm(0));   // 无 shellIntegration → 判不出空闲
       vscodeStub.window.terminals.push(stale);
 
-      await mgr.openEntry(fresh(STALE_IDS[0]));
+      await mgr.openSession(fresh(STALE_IDS[0]), fresh(STALE_IDS[0]).sessions[0]);
       await sleep(2500);
 
       chk('11a 会话已死 + 陈旧面板：会话被重新建出来',
@@ -1165,7 +1206,7 @@ async function projectSnapshot() {
       const stale = makeSurvivor(nm(1));
       vscodeStub.window.terminals.push(stale);
 
-      await mgr.openEntry(fresh(STALE_IDS[1]));
+      await mgr.openSession(fresh(STALE_IDS[1]), fresh(STALE_IDS[1]).sessions[0]);
       await sleep(1500);
 
       chk('11b 会话仍存在（未误重建）', await tmux.hasSession(S(STALE_IDS[1])));
@@ -1186,7 +1227,7 @@ async function projectSnapshot() {
       const foreignIdle = makeSurvivor(nm(2), { shellIntegration: {} });
       vscodeStub.window.terminals.push(foreignIdle);
 
-      await mgr.openEntry(fresh(STALE_IDS[2]));
+      await mgr.openSession(fresh(STALE_IDS[2]), fresh(STALE_IDS[2]).sessions[0]);
       await sleep(1500);
 
       chk('11c ★ 上一个世代的面板（即使看着空闲）也不往里打字',
@@ -1202,14 +1243,14 @@ async function projectSnapshot() {
     {
       resetCalls();
       const mgr = newManager();
-      await mgr.openEntry(fresh(STALE_IDS[2]));   // 建会话 + 建**我们自己的**面板
+      await mgr.openSession(fresh(STALE_IDS[2]), fresh(STALE_IDS[2]).sessions[0]);   // 建会话 + 建**我们自己的**面板
       await sleep(2000);
       const ourPanel = calls.terminals[calls.terminals.length - 1];
       chk('11c2 前置条件：建出了我们自己的面板', !!ourPanel && attachedTo(ourPanel));
 
       await run('tmux', ['kill-session', '-t', `=${S(STALE_IDS[2])}`]);   // 会话死掉
       resetCalls();
-      await mgr.openEntry(fresh(STALE_IDS[2]));   // 会话已死 → 需要客户端
+      await mgr.openSession(fresh(STALE_IDS[2]), fresh(STALE_IDS[2]).sessions[0]);   // 会话已死 → 需要客户端
       await sleep(2000);
 
       chk('11c2 ★ 复用了我们自己建的面板（不再多开一个）', calls.terminals.length === 0,
@@ -1228,7 +1269,7 @@ async function projectSnapshot() {
       const foreign = makeSurvivor(nm(2), { shellIntegration: {} });
       vscodeStub.window.terminals.push(foreign);
 
-      await mgr.openEntry(fresh(STALE_IDS[2]));
+      await mgr.openSession(fresh(STALE_IDS[2]), fresh(STALE_IDS[2]).sessions[0]);
       await sleep(1200);
       await detachRealClient();
 
@@ -1248,7 +1289,7 @@ async function projectSnapshot() {
       vscodeStub.window.terminals.push(busySurvivor);
       shellExecutionStart.fire({ terminal: busySurvivor });   // 模拟用户正在跑编译
 
-      await mgr.openEntry(fresh(STALE_IDS[3]));
+      await mgr.openSession(fresh(STALE_IDS[3]), fresh(STALE_IDS[3]).sessions[0]);
       await sleep(1500);
 
       chk('11d ★ 面板里有命令在跑 → 不往里打字（宁可多开一个面板）',
@@ -1269,7 +1310,7 @@ async function projectSnapshot() {
     await tmux.newSession(S(ID_PREFIX), SCRATCH);
     resetCalls();
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_B));
+    await mgr.openSession(fresh(ID_B), fresh(ID_B).sessions[0]);
     await sleep(2500);
     chk('B 的会话已建立', await tmux.hasSession(S(ID_B)));
     chk('B 执行了自己的启动命令', literalsTo(S(ID_B)).length === 1, JSON.stringify(calls.literals));
@@ -1284,7 +1325,7 @@ async function projectSnapshot() {
     resetCalls();
     await tmux.newSession(s, SCRATCH);   // 先建真会话
     const mgr = newManager();
-    await mgr.openEntry(fresh(ID_KILL));
+    await mgr.openSession(fresh(ID_KILL), fresh(ID_KILL).sessions[0]);
     await sleep(1500);
     const killTerm = calls.terminals[calls.terminals.length - 1];
     chk('openEntry 建出了代表该会话的终端', !!killTerm && killTerm.name === 'KILL');
@@ -1306,7 +1347,7 @@ async function projectSnapshot() {
     chk('代表该会话的终端被 dispose', killTerm.disposed === 1, `实际 dispose ${killTerm.disposed} 次`);
 
     resetCalls();
-    await mgr.openEntry(fresh(ID_KILL));
+    await mgr.openSession(fresh(ID_KILL), fresh(ID_KILL).sessions[0]);
     await sleep(1500);
     chk('Map 已清理：再次 openEntry 新建了终端', calls.terminals.length === 1,
       `实际新终端数 ${calls.terminals.length}`);
@@ -1355,11 +1396,11 @@ async function projectSnapshot() {
       !!copy && copy.id !== src.id && copy.name !== src.name,
       `src=${src.id}/${src.name} copy=${copy && copy.id}/${copy && copy.name}`);
     chk('★ 复制品的 conversationId 已被重新生成（不是源条目那条）',
-      copy.conversationId !== src.conversationId,
-      `src=${src.conversationId} copy=${copy.conversationId}`);
+      copy.sessions[0].conversationId !== src.sessions[0].conversationId,
+      `src=${src.sessions[0].conversationId} copy=${copy.sessions[0].conversationId}`);
     chk('★ 也不是 undefined（否则会被当成「老条目」而在恢复时弹选择框）',
-      copy.conversationId !== undefined && UUID_RE.test(copy.conversationId),
-      String(copy.conversationId));
+      copy.sessions[0].conversationId !== undefined && UUID_RE.test(copy.sessions[0].conversationId),
+      String(copy.sessions[0].conversationId));
   }
 
   console.log('\n=== 17. 竞态：会话在等待期间被别的窗口抢先创建 → 只接回、绝不发命令 ===');
@@ -1374,7 +1415,7 @@ async function projectSnapshot() {
       await run('tmux', ['new-session', '-d', '-s', name, '-c', cwd]);
       return false;
     };
-    await mgr.openEntry(fresh(ID_RACEBRANCH));
+    await mgr.openSession(fresh(ID_RACEBRANCH), fresh(ID_RACEBRANCH).sessions[0]);
     await sleep(1500);
     tmux.newSession = origNew;
 
@@ -1506,11 +1547,12 @@ async function projectSnapshot() {
 
       resetCalls();
       const mgr = newManager();
-      await mgr.openEntry(fresh(id));
+      await mgr.openSession(fresh(id), fresh(id).sessions[0]);
       await sleep(2500);
 
       chk('19a ★ 绑定被刷成注册表里的新会话（/new 自愈）', bound(id) === sessionB, `实际 ${bound(id)}`);
-      chk('19a ★ liveSessionId 记为观测值', fresh(id).liveSessionId === sessionB, String(fresh(id).liveSessionId));
+      chk('19a ★ liveSessionId 记为观测值',
+        fresh(id).sessions[0].liveSessionId === sessionB, String(fresh(id).sessions[0].liveSessionId));
       const sent = literalsTo(S(id));
       chk('19a ★ 发出去的是 --resume 新会话，绝不是旧会话',
         sent.some((t) => t.includes(`--resume '${sessionB}'`)) &&
@@ -1575,12 +1617,13 @@ async function projectSnapshot() {
 
       resetCalls();
       const mgr = newManager();
-      await mgr.openEntry(fresh(id));
+      await mgr.openSession(fresh(id), fresh(id).sessions[0]);
       await sleep(2500);
 
       chk('19c ★ 手动改绑的 conversationId 没有被冲回观测值',
         bound(id) === manual, `实际 ${bound(id)}`);
-      chk('19c liveSessionId 保持为观测值', fresh(id).liveSessionId === observed, String(fresh(id).liveSessionId));
+      chk('19c liveSessionId 保持为观测值',
+        fresh(id).sessions[0].liveSessionId === observed, String(fresh(id).sessions[0].liveSessionId));
       chk('19c 接回的仍是用户手动选的那条',
         literalsTo(S(id)).some((t) => t.includes(`--resume '${manual}'`)), JSON.stringify(literalsTo(S(id))));
     }
@@ -1599,12 +1642,12 @@ async function projectSnapshot() {
 
       resetCalls();
       const mgr = newManager();
-      await mgr.openEntry(fresh(id));
+      await mgr.openSession(fresh(id), fresh(id).sessions[0]);
       await sleep(2500);
 
       chk('19d ★ 观测不到活跃会话 → 绑定一字未改（liveSessionId 仍是空）',
-        bound(id) === bound0 && fresh(id).liveSessionId === undefined,
-        `conv=${bound(id)} live=${fresh(id).liveSessionId}`);
+        bound(id) === bound0 && fresh(id).sessions[0].liveSessionId === undefined,
+        `conv=${bound(id)} live=${fresh(id).sessions[0].liveSessionId}`);
     }
 
     // ---- 19e. 兜底 D 正面：单条目 + claude 已死 → 自动接回最新候选，不问 ----
@@ -1627,6 +1670,17 @@ async function projectSnapshot() {
           const i = this.entries.findIndex((e) => e.id === entryId);
           if (i >= 0) this.entries[i] = { ...this.entries[i], ...patch };
         },
+        // v3 的绑定回写走槽级原语，假 store 也必须实现它。
+        async updateSession(entryId, sessionId, patch) {
+          const i = this.entries.findIndex((e) => e.id === entryId);
+          if (i < 0) return;
+          const sessions = this.entries[i].sessions || [];
+          const j = sessions.findIndex((s) => s.id === sessionId);
+          if (j < 0) return;
+          const next = sessions.slice();
+          next[j] = { ...next[j], ...patch, id: next[j].id };
+          this.entries[i] = { ...this.entries[i], sessions: next };
+        },
       };
       await tmux.newSession(S(id), SOLE_CWD);   // 只有 bash：claude 已死
       await sleep(500);
@@ -1634,17 +1688,18 @@ async function projectSnapshot() {
       resetCalls();
       const mgr = new TerminalManager(local, tmux);
       mgr.home = () => HOME;
-      await mgr.openEntry(local.entries[0]);
+      await mgr.openSession(local.entries[0], local.entries[0].sessions[0]);
       await sleep(2500);
 
       chk('19e ★ 单条目 + claude 已死 → 自动接回同 cwd 下 mtime 最新的对话',
         literalsTo(S(id)).some((t) => t.includes(`--resume '${newer}'`)), JSON.stringify(literalsTo(S(id))));
       chk('19e ★ 没有弹选择框（收窄后的 D 正是为了不问）', calls.quickPicks.length === 0,
         JSON.stringify(calls.quickPicks.map((q) => q.opts && q.opts.title)));
-      chk('19e 绑定被落下（推断值）', local.entries[0].conversationId === newer,
-        String(local.entries[0].conversationId));
+      chk('19e 绑定被落下（推断值）', local.entries[0].sessions[0].conversationId === newer,
+        String(local.entries[0].sessions[0].conversationId));
       chk('19e ★ 推断不冒充观测：liveSessionId 保持未设',
-        local.entries[0].liveSessionId === undefined, String(local.entries[0].liveSessionId));
+        local.entries[0].sessions[0].liveSessionId === undefined,
+        String(local.entries[0].sessions[0].liveSessionId));
     }
 
     // ---- 19f. 兜底 D 反面：展开后同一个 cwd 的两个条目 → 不得启用 D ----
@@ -1661,6 +1716,17 @@ async function projectSnapshot() {
       const local = {
         entries: [mk(idA, 'SHARED-A', '~/shared'), mk(idB, 'SHARED-B', realCwd)],
         async load() { return this.entries.map((e) => ({ ...e })); },
+        // v3 的绑定回写走槽级原语，假 store 也必须实现它。
+        async updateSession(entryId, sessionId, patch) {
+          const i = this.entries.findIndex((e) => e.id === entryId);
+          if (i < 0) return;
+          const sessions = this.entries[i].sessions || [];
+          const j = sessions.findIndex((s) => s.id === sessionId);
+          if (j < 0) return;
+          const next = sessions.slice();
+          next[j] = { ...next[j], ...patch, id: next[j].id };
+          this.entries[i] = { ...this.entries[i], sessions: next };
+        },
         async update(entryId, patch) {
           const i = this.entries.findIndex((e) => e.id === entryId);
           if (i >= 0) this.entries[i] = { ...this.entries[i], ...patch };
@@ -1673,14 +1739,14 @@ async function projectSnapshot() {
       quickPickAnswer = undefined;              // 用户按 Esc = 什么都不启动
       const mgr = new TerminalManager(local, tmux);
       mgr.home = () => HOME;
-      await mgr.openEntry(local.entries[0]);
+      await mgr.openSession(local.entries[0], local.entries[0].sessions[0]);
       await sleep(1500);
 
       chk('19f ★ 展开后同 cwd 的两个条目 → D 不生效，退回弹选择框问用户',
         calls.quickPicks.length === 1, JSON.stringify(calls.quickPicks.length));
       chk('19f ★ 一条启动命令都没发', literalsTo(S(idA)).length === 0, JSON.stringify(literalsTo(S(idA))));
-      chk('19f 绑定未被改动', local.entries[0].conversationId === undefined,
-        String(local.entries[0].conversationId));
+      chk('19f 绑定未被改动', local.entries[0].sessions[0].conversationId === undefined,
+        String(local.entries[0].sessions[0].conversationId));
     }
 
     // ---- 19g. 复制条目：复制品不得继承 liveSessionId（不变量 3 在复制路径上的延伸）----
@@ -1697,10 +1763,10 @@ async function projectSnapshot() {
       // 「已观测会话」，reconcileBinding 第二分支（live === liveSessionId）
       // 会误判「没变化」而不改绑 —— 复制品永远跟着源条目那条会话走。
       chk('19g ★ 复制品不带 liveSessionId（否则 reconcile 第二分支会误判「没变化」而不改绑）',
-        copy.liveSessionId === undefined, String(copy.liveSessionId));
+        copy.sessions[0].liveSessionId === undefined, String(copy.sessions[0].liveSessionId));
       chk('19g 复制品另有自己的 conversationId（不照抄源条目的绑定）',
-        typeof copy.conversationId === 'string' && copy.conversationId !== observed,
-        String(copy.conversationId));
+        typeof copy.sessions[0].conversationId === 'string' && copy.sessions[0].conversationId !== observed,
+        String(copy.sessions[0].conversationId));
     }
   }
 
