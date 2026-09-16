@@ -27,7 +27,7 @@ function fakeSampler(samples: Record<string, PaneSample>): PaneSampleReader {
 }
 
 describe('ActivityTracker.poll', () => {
-  it('无存活条目时不调用 paneSample，仍触发一次变化通知', async () => {
+  it('无存活条目时不调用 paneSample，也不触发变化通知', async () => {
     let calls = 0;
     const tmux: PaneSampleReader = {
       async paneSample() { calls++; return { foreground: '', title: '' }; },
@@ -37,7 +37,7 @@ describe('ActivityTracker.poll', () => {
     tracker.onDidChange(() => fired++);
     await tracker.poll([]);
     assert.strictEqual(calls, 0);
-    assert.strictEqual(fired, 1);
+    assert.strictEqual(fired, 0, '状态表本来就是空的，这一轮什么都没变');
   });
 
   it('首次轮询：运行中的会话状态为 running，任务名解析正确', async () => {
@@ -76,14 +76,59 @@ describe('ActivityTracker.poll', () => {
     assert.deepStrictEqual(tracker.activityFor('a'), { state: 'idle', taskName: '编译内核' });
   });
 
-  it('每次 poll 都触发一次变化通知', async () => {
+  it('首次 poll 触发通知；状态与任务名都没变时不再触发', async () => {
     const tmux = fakeTmux({ 'tmuxterm-a': '✳ Claude Code' });
     const tracker = new ActivityTracker(tmux);
     let fired = 0;
     tracker.onDidChange(() => fired++);
     await tracker.poll(['a']);
+    assert.strictEqual(fired, 1, '首次观测到条目的 current 状态，算一次变化');
     await tracker.poll(['a']);
-    assert.strictEqual(fired, 2);
+    assert.strictEqual(fired, 1, '两轮采样值完全相同，`state`/`taskName` 都没变');
+  });
+
+  it('同一批 id 连 poll 多轮、采样值不变：只在第一轮通知一次', async () => {
+    const tmux = fakeTmux({ 'tmuxterm-a': '⠐ 编译内核', 'tmuxterm-b': '✳ Claude Code' });
+    const tracker = new ActivityTracker(tmux);
+    let fired = 0;
+    tracker.onDidChange(() => fired++);
+    await tracker.poll(['a', 'b']);
+    await tracker.poll(['a', 'b']);
+    await tracker.poll(['a', 'b']);
+    assert.strictEqual(fired, 1, '后两轮 a 仍是 running、b 仍是 idle，零变化');
+  });
+
+  it('state 不变但 taskName 变了 → 恰好通知一次', async () => {
+    const titles: Record<string, string> = { 'tmuxterm-a': '✳ Claude Code' };
+    const tmux = fakeTmux(titles);
+    const tracker = new ActivityTracker(tmux);
+    await tracker.poll(['a']);
+    assert.deepStrictEqual(tracker.activityFor('a'), { state: 'idle', taskName: '' });
+
+    let fired = 0;
+    tracker.onDidChange(() => fired++);
+    titles['tmuxterm-a'] = '✳ 编译内核'; // 仍是空闲（✳ 不是运行指示符），但任务名不同
+    await tracker.poll(['a']);
+    assert.deepStrictEqual(tracker.activityFor('a'), { state: 'idle', taskName: '编译内核' });
+    assert.strictEqual(fired, 1, 'state 没变、taskName 变了，也是一次变化');
+
+    await tracker.poll(['a']);
+    assert.strictEqual(fired, 1, '再轮一轮完全没变，不该再通知');
+  });
+
+  it('条目从存活变为不存活：移出状态表时通知一次，其后不再通知', async () => {
+    const tmux = fakeTmux({ 'tmuxterm-a': '⠐ 编译内核', 'tmuxterm-b': '⠐ 编译内核' });
+    const tracker = new ActivityTracker(tmux);
+    await tracker.poll(['a', 'b']);
+
+    let fired = 0;
+    tracker.onDidChange(() => fired++);
+    await tracker.poll(['b']); // a 不再存活 → 从状态表里删掉
+    assert.strictEqual(tracker.activityFor('a'), undefined);
+    assert.strictEqual(fired, 1, '删掉一个条目算一次变化');
+
+    await tracker.poll(['b']); // b 的状态与任务名都没变
+    assert.strictEqual(fired, 1, '这一轮什么都没变，不该通知');
   });
 });
 

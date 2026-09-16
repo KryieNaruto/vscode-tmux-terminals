@@ -48,7 +48,10 @@ export function activate(context: vscode.ExtensionContext): void {
   // 不需要额外适配。
   const tracker = new ActivityTracker(tmux);
   const provider = new EntryTreeProvider(store, tracker, titles);   // 渲染：peek
-  const manager = new TerminalManager(store, tmux, titles);         // reconcile：prewarm
+  // 绑定回写 → 树上的三级任务名与 tooltip 的「对话」行都过期了，必须重算。
+  // 从前靠 ActivityTracker 每 900ms 的无条件整树重建兜着，那个兜底已经去掉了
+  // （改成只有真变化才通知），不接这一根就会停在旧值上。
+  const manager = new TerminalManager(store, tmux, titles, () => provider.refresh());
 
   const view = vscode.window.createTreeView('tmuxTerminals.list', {
     treeDataProvider: provider,
@@ -89,13 +92,41 @@ export function activate(context: vscode.ExtensionContext): void {
     inFlight = true;
     try {
       provider.setAlive(new Set(await tmux.listSessions()));
+      const entries = await store.load();
+      // 这一拍**还要观测并改绑**。`fresh` 首启（0.1.6）把「绑定天然可信」
+      // 这个前提推翻了：新建条目在出生时就预分配了一个 conversationId，可
+      // 裸 `claude` 实际开出来的是**另一条**会话 —— 预分配的那个成了幽灵。
+      // 绑定不再是写一次即定的事实，只能靠**周期性观测**（pane → 注册表）
+      // 纠回来。而原有的 reconcile 触发点全是用户动作，用户"新建完就一直
+      // 待在终端里提问、不碰侧边栏"是完全正常的用法，那时一个都不发 ——
+      // 绑定会永远停在幽灵 id 上，三级任务名也就永远出不来。
+      await manager.reconcileAll(entries); // 观测并改绑
+      // 顺序不能反：先 reconcileAll 把绑定改对，retryTitles 才有**正确的
+      // id** 可重试（否则它每 25 秒去重读一个永远不存在的文件）。
+      //
       // 任务名缓存的低频重试就挂在这一拍上。
       // **刻意不挂 900ms 的活动采样**：那一拍只关心 pane 前台状态，而这里
       // 每次都要 tail-read 一个可能上 MB 的 transcript，跟着 900ms 跑是灾难。
       // 挂在 poll 上也意味着它天然受同一个 `view.visible` 开关约束：面板
-      // 隐藏时这拍根本不跑 —— 没人看的时候不必重读。缓存内部另有
-      // RETRY_COOLDOWN_MS 冷却，所以每条的实际读盘频率远低于 10s 一次。
-      manager.retryTitles(await store.load());
+      // 隐藏时这拍根本不跑 —— 没人看的时候不必重读。
+      //
+      // 读盘节奏按条目分成两种：**已存活但还没缓存到标题**的条目，光靠
+      // 这一拍里 reconcileAll 的 prewarm 就会重读 —— prewarm 只做
+      // `cache.has` / `pending.has` 两个早返回，**不查 RETRY_COOLDOWN_MS
+      // 那张冷却表**，所以对它们是实打实的**每 10 秒一次**，不是 25 秒。
+      // retryMissing 的 25 秒冷却仍然有效，但主要落在**会话已死**的条目上：
+      // reconcileAll 跳过不存活的条目，那条路径上没人替它刷新冷却表。
+      //
+      // 多出来的读盘代价可接受：重读走的是 `readTail`，只读 transcript 的
+      // **尾部窗口**（`TAIL_BYTES`，64 KB），不是整份文件；而**已经有标题
+      // 缓存**的条目会命中 prewarm 的第一个早返回，根本不读盘 —— 稳态下
+      // 没有任何额外读盘。
+      //
+      // 这一拍多跑的 reconcile 成本可接受：整批条目共用一份 `readLiveness`
+      // 快照（一次 `ps` + 一次注册表 readdir），不是按条目各查一遍；绑定已
+      // 收敛时 `reconcileBinding` 返回 `undefined`，`reconcileAll` 会
+      // `continue` —— **稳态下不写盘**。
+      manager.retryTitles(entries); // 补晚到的 aiTitle
     } finally {
       inFlight = false;
     }
@@ -144,10 +175,17 @@ export function activate(context: vscode.ExtensionContext): void {
     void pollActivity();
   };
 
-  // ---- 会话身份：reconcile 的触发点（不引入定时器，见 spec §4.3）----
-  // 五个触发点：激活（本文件的末尾）、⟳ 刷新（下面的 refresh 命令）、
+  // ---- 会话身份：reconcile 的触发点（见 spec §4.3 及其偏差记录）----
+  // **六个**触发点：激活（本文件的末尾）、⟳ 刷新（下面的 refresh 命令）、
   // 点击条目（TerminalManager.openEntry）、切 profile
-  // （TerminalManager.restartClaude）、展开树 / 面板变为可见（下面的订阅）。
+  // （TerminalManager.restartClaude）、展开树 / 面板变为可见（下面的订阅），
+  // 以及**上面的 10 秒存活轮询**。
+  // 最后一个推翻了 spec §4.3 的「不引入定时器」（该文件已记入偏差记录）：
+  // `fresh` 首启（0.1.6）让「绑定」不再是权威事实 —— 条目预分配的 id 与
+  // claude 实际开出来的 id 可能根本不是同一个，只能靠周期性观测把绑定纠回
+  // 来；而原有五个触发点全是**用户动作**，用户"新建完就一直待在终端里、不碰
+  // 侧边栏"时一个都不发。故挂在本来就存在的存活轮询上（它天然同受
+  // `view.visible` 约束）。代价见上面 poll() 的说明。
   // 观测的驱动者只有这一处：provider 不持有 reconciler。
   let reconcileInFlight: Promise<boolean> | undefined;
   const reconcileNow = (): Promise<boolean> => {
