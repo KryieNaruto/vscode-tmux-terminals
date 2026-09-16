@@ -469,7 +469,17 @@ feat: 三级树改为「文件夹 → 终端 → 会话」
 - `grep -n "shortLabels" src/` → **只在 `core/labels.ts` 自身的定义处出现**，
   生产代码不再调用它（SPEC §3.3 第 5 条 / §13 的取舍）。**函数与
   `test/core/labels.test.ts` 都保留**，不许删。
-- `grep -n "batchFolder" src/batchTree.ts src/extension.ts package.json` → 三处都有。
+- `grep -rn "shortLabels" src/` → 只剩 `src/core/labels.ts` 自身的定义。
+- `grep -n "batchToggleFolder" src/batchTree.ts src/extension.ts package.json` →
+  三处都有（`batchTree.ts` 的一级 command、`extension.ts` 的 `reg`、
+  `package.json` 的声明 + `commandPalette when:false`）。
+- `grep -n "batchFolder" src/batchTree.ts` → 作为 **`contextValue`** 出现在
+  `batchTree.ts`（**不进任何菜单**，故 `package.json` 里不该有这个串）。
+
+  > 原文这条 Expected 写成「`batchFolder` 在 `package.json` 里也要出现」是
+  > **笔误**：命令 id 是 `batchToggleFolder`，它**不含**子串 `batchFolder`。
+  > 要让它命中只能改命令 id（违反 SPEC §7.1/§9.2）或给 `batchFolder` 挂菜单项
+  > （会打破 manifest 的 `viewItem` 恰等断言）。以 SPEC 为准。
 
 ### 提交
 
@@ -485,38 +495,59 @@ feat: 批量面板按文件夹分组，点一级标题即全选其下条目
 
 ---
 
-## Task 5 — e2e harness：多会话专项用例收口
+## Task 5 — 测试收口：SPEC §12 覆盖度审计 + 剩余变异确认
 
-Task 2/3/4 已经陆续加了用例。这一步做**剩余与收口**：把 SPEC §12.4 的清单
-逐条对照一遍，补掉遗漏的那几条，并跑**变异测试**。
+Task 2/2b/2c/3/4 已经把 SPEC §12.4 的用例基本写完了。这一步**不再重复造用例**，
+做两件更有价值的事：**按 SPEC §12 逐条审计覆盖度**（找出「写了但没测到」与
+「压根没写」的），以及**补跑还没做过的变异**。
 
 ### 文件
-- `test/e2e-harness.js`
-- （可能）`test/core/*.test.ts` 的少量补强
+- `test/e2e-harness.js`（补缺口）
+- `test/core/*.test.ts`（补缺口）
 
 ### 步骤
-1. 拿 SPEC §12.4 的清单逐条核对 harness，**缺哪条补哪条**（尤其：
-   完整 cwd 的批量文件夹、颜色 SVG 落盘且内容含该 hex、
-   二级不再打开终端、`addInFolder` 的 cwd 预填）。
-2. **变异测试**（SPEC §12.4 末段四处，逐个做、做完立刻回退）：
-   ① 迁移里槽 id 写成 `newId()`；② `closeSession` 顺手清 `conversationId`；
-   ③ `deleteEntry` 不杀 tmux；④ `folderSelectionState` 把空数组判成 `'all'`。
-   **每处都要贴出「哪条断言变红了」** —— 若某处没让任何断言变红，说明该行为
-   **缺测试**，补上再重做该变异。
+
+1. **覆盖度审计（§12.1 / §12.2 / §12.3 逐条）**：把 SPEC 三节里列的每个用例
+   逐条对照现有测试，产出一张**三段清单**：
+   - `已覆盖`（贴出用例名或 `it(...)` 标题）
+   - `缺失`（然后补上）
+   - `不适用`（写明为什么 —— 比如某条被后续 Task 的设计变更取代了）
+   特别要确认这几条真的在：`sessionLabel` 的回落（§12.3）、
+   `sessions: []` → `collapsibleState = None`（不变量 9 的唯一剩余可达形态）、
+   `isV2Shape` 的四种输入（§12.2）、`updateSession` 并发不丢更新（§12.2）、
+   空数组 → `folderSelectionState` 返回 `'none'`（§12.1，**空组绝不显示成已选**）。
+
+2. **审计「预期不改」的测试文件是否真的没被改**（SPEC §12.2 点名了一批）。
+   `git log --oneline` + `git diff` 逐个数：哪些改了、为什么必须改
+   （只允许「类型收紧导致的夹具补字段」与「SPEC 明确要求改写的」两类）。
+   **任何断言被削弱都要在这里暴露出来。**
+
+3. **补跑还没做过的变异**（SPEC §12.4 末段四处里剩下的三个；①「迁移槽 id 写成
+   `newId()`」Task 1 已做过）：
+   - ② `closeSession` 顺手把 `conversationId` 清掉
+   - ③ `deleteEntry` 改成不杀 tmux
+   - ④ `folderSelectionState` 把**空数组**判成 `'all'`（注意 Task 4 变异的是
+     「partial → 全选」那条语义，**空数组这条是另一条**，别混）
+   **每处都要贴「哪条断言变红了」**；**若某处没让任何断言变红 → 说明该行为缺
+   测试，补上再用该变异复验**。做完立刻回退，回退后重跑确认全绿。
 
 ### Expected
-- `npm run e2e` 全绿，且用例名能一一对上 SPEC §12.4 的清单。
-- 四处变异的**变红证据**（每条一句话：变异点 → 变红的用例名）。
-- `npm test` 全绿。
+- 三段覆盖度清单（已覆盖 / 缺失 / 不适用），**缺失项为 0**。
+- 「预期不改」文件的审计结论（哪些改了、归类到上面两类中的哪一类）。
+- 三处变异的变红证据（变异点 → 变红的用例名）。**不允许出现「没红」的变异而不补测试。**
+- `npm test` 全绿、用例数不减；`npm run e2e` 全绿、断言数不减。
 
 ### 提交
 
 ```
-test: 多会话专项 e2e 用例收口 + 四处变异确认
+test: SPEC §12 覆盖度审计 + 补跑三处变异
 
-补齐批量文件夹全选、颜色 SVG 落盘、二级不再打开、一级 + 的 cwd 预填
-这几条；并用四处变异（槽 id、X 清绑定、删除条目不杀 tmux、空组判成全选）
-逐条确认对应断言真的会红。
+按 SPEC §12.1/§12.2/§12.3 逐条对照现有测试，补掉缺口；并逐个数清
+「预期不改」的测试文件里哪些真的改了、为什么必须改（只允许类型收紧
+的夹具补字段与 SPEC 明确要求改写两类）。
+
+补跑三处尚未做过的变异：closeSession 清 conversationId、
+deleteEntry 不杀 tmux、空数组被判成 all —— 每个都贴出变红的用例名。
 ```
 
 ---
