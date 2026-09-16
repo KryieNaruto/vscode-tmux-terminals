@@ -58,6 +58,39 @@ describe('package.json 清单一致性', () => {
     assert.deepStrictEqual(unused, [], `这些配置项已声明但从未被读取: ${unused}`);
   });
 
+  /**
+   * `EntryStore` 上**每一个**迁移入口都必须真的被 `activate()` 调用。
+   *
+   * **为什么需要这条**：上面那条「声明的配置项已声明但从未被读取」管的是
+   * 一类同型 bug —— **「设施写好了却没人调用」**。它同样是**单元测试天然
+   * 看不见的一类**：方法本身有完整单测、全绿，e2e 也能直接调它，但生产路径
+   * 从没接上。实测踩到的例子（本次）：SPEC §5.4 写明「extension.ts 两处都调，
+   * 各自弹一条提示」，而 `EntryStore.migrateAndBackupV2()` 只被
+   * `test/core/store.test.ts` 与 `test/e2e-harness.js` **直接调用**过，
+   * `extension.ts` 只调了 v1 那个。后果是升级时不会生成 `<file>.v2.bak`：
+   * 迁移本身正常（`load()` 在内存里升到 v3，条目与绑定都在），但用户永远
+   * 拿不到那份「升级前的原文」备份 —— 而备份不写成不报错，属于纯静默失效。
+   * 当时 488 个用例全绿，没有一条能发现它。
+   *
+   * **判据分两半，缺一不可**：
+   *   - 入口集合**从 `store.ts` 的源码里解析**（而不是在这里写死两个方法名）。
+   *     这样将来再加迁移入口时，这条断言自动覆盖到它 —— 否则「新入口忘了
+   *     接线」会因为没人记得回来改这份名单而再次漏网。
+   *   - 调用点去 `extension.ts` 里找 `.<方法名>(`，即真的走 store 实例调用，
+   *     而不是只出现在注释或 import 里。
+   */
+  it('EntryStore 的每个迁移入口都在 extension.ts 里被调用（防止接线漏掉）', () => {
+    const storeSrc = fs.readFileSync(path.join(repoRoot, 'src', 'core', 'store.ts'), 'utf8');
+    const entries = [...storeSrc.matchAll(/^\s+async (migrate\w*)\(/gm)].map((m) => m[1]);
+    assert.ok(entries.length > 0, '没在 store.ts 里解析出迁移入口，正则可能过时了');
+    const uncalled = entries.filter((name) => !EXTENSION_SRC.includes(`.${name}(`));
+    assert.deepStrictEqual(
+      uncalled,
+      [],
+      `这些迁移入口从未被 extension.ts 调用（备份/迁移等于没发生）: ${uncalled}`,
+    );
+  });
+
   it('声明的命令都在 extension.ts 里注册了', () => {
     const declared = (contributes.commands ?? []).map((c: { command: string }) => c.command);
     const registered = new Set([...EXTENSION_SRC.matchAll(/reg\('([^']+)'/g)].map((m) => m[1]));
