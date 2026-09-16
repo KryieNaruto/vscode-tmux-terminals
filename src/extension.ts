@@ -3,7 +3,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { EntryStore } from './core/store';
 import { TmuxClient } from './tmuxClient';
-import { EntryTreeItem, EntryTreeProvider, TaskTreeItem } from './tree';
+import { EntryTreeItem, EntryTreeProvider, FolderTreeItem, SessionTreeItem } from './tree';
+import { ColorIconCache } from './colorIcons';
 import { BatchTreeProvider } from './batchTree';
 import { readProfileConfig } from './claudeConfig';
 import { TerminalManager } from './terminalManager';
@@ -47,11 +48,38 @@ export function activate(context: vscode.ExtensionContext): void {
   // 前台进程名与 pane title），结构上满足 ActivityTracker 需要的最小接口，
   // 不需要额外适配。
   const tracker = new ActivityTracker(tmux);
-  const provider = new EntryTreeProvider(store, tracker, titles);   // 渲染：peek
+  // 二级行首那条颜色竖线。**自绘 SVG 必须落在可写的目录里** —— 扩展安装目录
+  // （vsix 解出来的地方）可能是只读的，往那儿写会在「用户第一次设颜色」时
+  // 抛 EROFS，而报错时机离原因很远。globalStorage 是扩展自己的可写地盘。
+  //
+  // 中性竖线（未设颜色时用的两个）反过来：它们是**随包发布**的静态资源，
+  // 从 extensionUri 下取，不需要也不应该被复制到 storage 里。
+  const colorIcons = new ColorIconCache(
+    path.join(context.globalStorageUri.fsPath, 'colors'),
+    context.extensionUri,
+  );
+  const provider = new EntryTreeProvider(store, tracker, titles, colorIcons);   // 渲染：peek
   // 绑定回写 → 树上的三级任务名与 tooltip 的「对话」行都过期了，必须重算。
   // 从前靠 ActivityTracker 每 900ms 的无条件整树重建兜着，那个兜底已经去掉了
   // （改成只有真变化才通知），不接这一根就会停在旧值上。
   const manager = new TerminalManager(store, tmux, titles, () => provider.refresh());
+
+  // 把清单里已有的颜色**先落盘再渲染**：`iconFor` 只拼路径、不同步读盘
+  // （渲染路径不能有 IO），文件不到位时那一行的竖线会短暂空着 —— 不报错，
+  // 只是看起来「颜色丢了」。这里在第一次 getChildren 之前把这一批补上，
+  // 落完再刷一次树，覆盖「补的过程本身花了时间」的那一小段。
+  // 失败只静默：最坏结果是竖线回落中性（与颜色非法同侧），不该阻断激活。
+  void store
+    .load()
+    .then((entries) =>
+      colorIcons.ensure(
+        entries.map((e) => e.color).filter((c): c is string => c !== undefined),
+      ),
+    )
+    .then(() => provider.refresh())
+    .catch(() => {
+      // 忽略：见上，图标退化成中性即可。
+    });
 
   const view = vscode.window.createTreeView('tmuxTerminals.list', {
     treeDataProvider: provider,
@@ -237,20 +265,29 @@ export function activate(context: vscode.ExtensionContext): void {
   void reconcileNow(); // 触发点之一：扩展激活
 
   // ---- 命令注册 ----
-  const item = (arg: unknown): EntryTreeItem | TaskTreeItem | undefined =>
-    arg instanceof EntryTreeItem || arg instanceof TaskTreeItem ? arg : undefined;
+  // 两种节点都可能进命令：二级（条目级操作）与三级（会话级操作）。**两者都
+  // 暴露 `entry`**，所以「条目级设置」那几项（profile / 模型 / 颜色 / 参与恢复
+  // / 复制 / 删除条目）不必分情况，统一取 `it.entry` 即可 —— 三级上的这些项
+  // 转发到所属条目，正是 spec §7.5 要的语义。
+  const item = (arg: unknown): EntryTreeItem | SessionTreeItem | undefined =>
+    arg instanceof EntryTreeItem || arg instanceof SessionTreeItem ? arg : undefined;
+
+  /** 会话级命令的守卫：只有三级才带槽，二级收到就什么都不做。 */
+  const sessionItem = (arg: unknown): SessionTreeItem | undefined =>
+    arg instanceof SessionTreeItem ? arg : undefined;
 
   const reg = (id: string, fn: (...a: any[]) => any) =>
     context.subscriptions.push(vscode.commands.registerCommand(id, fn));
 
   reg('tmuxTerminals.open', async (arg: unknown) => {
-    const it = item(arg);
+    const it = sessionItem(arg);
     if (it) {
       // 先清"刚完成待查看"标记再真正打开：用户点开就是"看到了"，
       // 图标应该立刻恢复，不用等下一轮 tmux 轮询。
-      tracker.markSeen(it.entry.id);
-      // 打开的是**会话**（v3）：命令参数此刻仍来自二级条目，取它的第一个槽。
-      await manager.openSession(it.entry, it.entry.sessions[0]);
+      // 键是**槽 id**：活动采样层内部就是 `sessionNameFor(id)`，喂条目 id 会
+      // 让这一行的绿点永远清不掉（且不报错）。
+      tracker.markSeen(it.slot.id);
+      await manager.openSession(it.entry, it.slot);
     }
   });
 
@@ -260,6 +297,64 @@ export function activate(context: vscode.ExtensionContext): void {
     batchProvider.refresh();
   });
 
+  // 一级行尾的「+」：文件夹不是实体，能做的只有把它的 cwd 当作新建条目的
+  // 默认值（判断 B）。预填**允许改** —— 用户在某个文件夹上点「+」之后想换
+  // 目录是常事，做成只读会逼他退出去用标题栏那个 +。
+  reg('tmuxTerminals.addInFolder', async (arg: unknown) => {
+    const cwd = arg instanceof FolderTreeItem ? arg.cwd : undefined;
+    await manager.addEntryInteractive(cwd);
+    provider.refresh();
+    batchProvider.refresh();
+  });
+
+  // 二级行尾的「+」：**零弹框**，只往该条目追加一个会话位（spec §7.4）。
+  // 刻意不自动打开终端：「+」是「加一个会话位」，不是「立刻起一个 claude」——
+  // 打开是紧接着点那一行的事，这样「+」没有任何副作用。
+  reg('tmuxTerminals.addSession', async (arg: unknown) => {
+    const it = arg instanceof EntryTreeItem ? arg : undefined;
+    if (it) await manager.addSessionInteractive(it.entry);
+    provider.refresh();
+    batchProvider.refresh();
+  });
+
+  // 三级行尾的「X」：只杀 tmux 进程，**槽与对话绑定原样保留**（不变量 7）。
+  // 这是「三级是接回会话的」能成立的前提：再点那一行就是 --resume 回同一条对话。
+  reg('tmuxTerminals.closeSession', async (arg: unknown) => {
+    const it = sessionItem(arg);
+    if (it) await manager.closeSession(it.entry, it.slot);
+    await poll();   // 会话没了 ⇒ 存活标记与图标必须跟着变
+  });
+
+  // 三级右键的「删除会话」：杀进程**并且**把槽连同绑定一起移除（判断 A）。
+  // 与 X 的差别只有这一处 —— 用户在上面误删整个终端条目的代价太大，所以三级
+  // 的破坏性动作只作用于这一个会话。
+  reg('tmuxTerminals.deleteSession', async (arg: unknown) => {
+    const it = sessionItem(arg);
+    if (it) await manager.deleteSession(it.entry, it.slot);
+    provider.refresh();
+    batchProvider.refresh();
+  });
+
+  // 颜色是**条目级**属性（二级行首那条竖线），三级上点它同样转发到所属条目。
+  reg('tmuxTerminals.setColor', async (arg: unknown) => {
+    const it = item(arg);
+    if (!it) return;
+    await manager.setColorInteractive(it.entry);
+    // 新颜色的 SVG 必须先落盘再刷新：图标路径是从 color 拼出来的、`iconFor`
+    // 刻意不读盘，文件还没写就刷新只会画出一个空图标，且不报任何错。
+    // 颜色值重新从 store 读，而不是用 `it.entry.color` —— 那个对象是渲染时的
+    // 快照，`setColorInteractive` 写盘之后它并没有被就地更新。
+    const fresh = (await store.load()).find((e) => e.id === it.entry.id);
+    if (fresh?.color !== undefined) await colorIcons.ensure([fresh.color]);
+    provider.refresh();
+    batchProvider.refresh();
+  });
+
+  // ---- 以下都是**条目级**命令 ----
+  // 三级菜单里也有其中几项（profile / 模型 / 颜色 / 参与恢复 / 复制），
+  // 语义是「转发到所属终端、其下所有会话一起变」（spec §7.5 / 不变量 6）。
+  // 统一取 `it.entry` 就自动满足了这一点：三级节点同时持有 slot 与 entry。
+  // 三级上**没有** edit —— 三级这一行显示的是任务名，不给它改名。
   reg('tmuxTerminals.edit', async (arg: unknown) => {
     const it = item(arg);
     if (it) await manager.editEntryInteractive(it.entry);
@@ -303,10 +398,11 @@ export function activate(context: vscode.ExtensionContext): void {
   //（setProfile 会重启会话，故需要 poll 刷新存活）。
   // 只改绑定，不动正在跑的会话 —— 因此不 poll、只是刷新 tooltip
   reg('tmuxTerminals.bindConversation', async (arg: unknown) => {
-    const it = item(arg);
-    // 绑定的主体是**会话槽**（v3）：命令参数此刻仍来自二级条目，取它的第一个槽
-    //（与 open 同侧；三级节点接好线后改为传那一个槽自己）。
-    if (it) await manager.bindConversationInteractive(it.entry, it.entry.sessions[0]);
+    // 绑定的主体是**会话槽**（v3），所以这条命令只挂在三级上。二级收不到它
+    // （菜单矩阵里已经没有二级），真收到了也什么都不做：绑定是会话级的属性，
+    // 二级上没有唯一答案，随便取第一个槽会改错对象。
+    const it = sessionItem(arg);
+    if (it) await manager.bindConversationInteractive(it.entry, it.slot);
     provider.refresh();
     batchProvider.refresh();
   });

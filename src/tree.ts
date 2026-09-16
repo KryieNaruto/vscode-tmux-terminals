@@ -3,14 +3,32 @@ import { commandFor } from './core/command';
 import { EntryActivity } from './core/activity';
 import { groupByCwd } from './core/grouping';
 import { reorderWithinGroup } from './core/reorder';
+import { sessionLabel } from './core/sessions';
 import { sessionNameFor } from './core/tmux';
 import { SessionSlot, TerminalEntry } from './core/types';
 
-/** profile 对应的徽标颜色。ccr=蓝（本地中转），direct=橙（官方直连）。 */
-function profileColor(entry: TerminalEntry): vscode.ThemeColor {
-  return new vscode.ThemeColor(
-    entry.profile === 'direct' ? 'charts.orange' : 'charts.blue',
-  );
+/** 二级行首那条竖线可接受的三种形态（自绘 SVG / 主题自适应对 / 退化图标）。 */
+export type EntryIconPath =
+  | vscode.Uri
+  | { light: vscode.Uri; dark: vscode.Uri }
+  | vscode.ThemeIcon;
+
+/**
+ * profile 的**纯文本**表示，显示在二级标题后面。
+ *
+ * ⚠ **这里刻意不是 codicon**：需求原文要的是「标题后面一个 codicon」，查证后
+ * 否决了（spec §6.2 / §13）。原因是 `TreeItem.description` **不支持 codicon 渲染**
+ * —— 它是纯右对齐文本，写 `'$(plug)'` 会**原样显示**这四个字符。要在标签里渲染
+ * codicon 只能用 `MarkdownString` 作 `label`，那是 **VS Code 1.106+** 的 API，
+ * 而本扩展的 `engines.vscode` 是 `^1.85.0`；用它就必须抬高下限，老版本用户会
+ * **完全装不上**（比「图标退化成文字」严重得多）。
+ *
+ * 信息一字不少：tooltip 里本来就写着同样的含义（见下面的 tooltip 构造）。
+ * 要改回图标是一处 3 行的改动（label 换 `MarkdownString({ supportThemeIcons: true })`
+ * + `engines` 抬到 `^1.106`），留给用户拍板。
+ */
+function profileText(entry: TerminalEntry): string {
+  return entry.profile === 'direct' ? '直连' : '中转';
 }
 
 /**
@@ -64,53 +82,115 @@ export class FolderTreeItem extends vscode.TreeItem {
 }
 
 /**
- * 二级节点：一个终端条目。
+ * 二级节点：一个终端条目（一份配置 + N 个会话槽）。
  *
- * 图标只体现「存活/死亡 + profile 颜色」，不再体现运行状态——运行状态的
- * 转圈/绿点图标现在挂在三级的 `TaskTreeItem` 上。有任务名时
- * `collapsibleState = Expanded`，可以展开看到那一级；没有任务名时
- * `None`，不产生一个空的可展开箭头。
+ * **它不再承载任何「打开终端」的动作**：点击二级 = 展开/折叠，打开下移到三级
+ * （三级才是会话，见 spec §3.3 第 1 条）。所以这里**没有 `command`** ——
+ * 留着它就会出现「点一下既展开又起了个 claude」这种二义行为；而二级上「打开
+ * 哪一个会话」本来就没有唯一答案，硬选一个（比如第一个槽）会在用户毫不知情的
+ * 情况下接错对话。
+ *
+ * 行首图标只承载**颜色**（用户挑的那条竖线），profile 只由标题后面的纯文本
+ * 表达 —— 同一个信息不该在两个地方用两种编码各说一遍（spec §6.3）。
  */
 export class EntryTreeItem extends vscode.TreeItem {
   constructor(
     public readonly entry: TerminalEntry,
-    public readonly alive: boolean,
-    /** 由 ActivityTracker 轮询得来的当前活动状态；未轮询到时为 undefined */
-    public readonly activity: EntryActivity | undefined,
-    /**
-     * 显示用的任务名：pane title 优先，回退到绑定对话的 aiTitle；'' = 不显示三级。
-     * 由 `EntryTreeProvider.taskNameFor` 算好传进来（不再各自去读
-     * activity.taskName —— 否则二级的 collapsibleState 会和三级是否真能
-     * 展开不一致）。
-     */
-    public readonly taskName: string,
+    /** 颜色竖线。由 `ColorIconCache.iconFor(entry.color)` 算好传进来。 */
+    iconPath: EntryIconPath,
   ) {
     super(
       entry.name,
-      taskName.length > 0
+      // 与 `sessions.length > 0` **严格一致**：绝不出现「看起来能展开、展开后
+      // 却是空的」（沿用 tree-hierarchy spec §8 不变量 1，见 spec §11.9）。
+      // 会话数为 0 时必须是 None，否则用户点开一个空箭头，只会以为扩展坏了。
+      entry.sessions.length > 0
         ? vscode.TreeItemCollapsibleState.Expanded
         : vscode.TreeItemCollapsibleState.None,
     );
-    this.id = entry.id;
-    this.contextValue = alive ? 'aliveSession' : 'deadSession';
-    this.description = alive ? undefined : '（无会话）';
+    // 加 `entry:` 前缀：迁移合成的槽 id 恒等于原条目 id（spec §5.1），
+    // 三级用 `session:<槽 id>`、二级若直接用 `entry.id`，两者会**撞 id** ——
+    // VS Code 的展开状态与选中态随即错位到别的行上，且不报任何错。
+    this.id = `entry:${entry.id}`;
+    this.contextValue = 'terminal';
+    this.description = profileText(entry);
     this.tooltip = new vscode.MarkdownString(
       [
         `**${entry.name}**`,
         '',
         `- 目录：\`${entry.cwd}\``,
-        `- profile：${entry.profile === 'direct' ? '🟠 direct（官方直连）' : '🔵 ccr（本地中转）'}`,
+        // profile 的文字含义必须写在 tooltip 里：标题后面那两个词（直连/中转）
+        // 不带颜色也没有图标，只靠那两个字认不出「官方直连」还是「本地中转」。
+        `- profile：${entry.profile === 'direct' ? 'direct（官方直连）' : 'ccr（本地中转）'}`,
         `- 模型：${entry.model && entry.model.length > 0 ? `\`${entry.model}\`` : '（profile 默认）'}`,
+        `- 颜色：${entry.color !== undefined ? `\`${entry.color}\`` : '（未设，中性竖线）'}`,
+        `- 会话：${entry.sessions.length} 个`,
         `- 基础命令：\`${commandFor(entry)}\``,
-        `- 对话：${conversationLabel(entry.sessions[0])}`,
-        `- 状态：${alive ? '🟢 会话存活，点击接回原进程' : '⚪ 无会话，点击重建并接回该对话'}`,
-        `- 任务：${taskName.length > 0 ? taskName : '（无）'} · ${activityLabel(activity)}`,
         `- 参与全部恢复：${entry.autoRestore ? '是' : '否'}`,
+        // 刻意**没有**「对话」一行：对话是会话级的，二级没有唯一答案 ——
+        // 写第一个槽的绑定会把「这一行代表的东西」表达错。那一行在三级的
+        // tooltip 里（每个槽各有各的绑定）。
       ].join('\n'),
     );
-    this.iconPath = alive
-      ? new vscode.ThemeIcon('circle-filled', profileColor(entry))
-      : new vscode.ThemeIcon('circle-outline', profileColor(entry));
+    this.iconPath = iconPath;
+  }
+}
+
+/**
+ * 三级节点：一个会话槽。**恒生成**（每个槽一行），不再有「有任务名才生成」
+ * 这回事 —— 那一行是「接回这个会话」的唯一入口，关掉会话之后它必须还在
+ * （标题回落「无会话」，槽与绑定一字未动，见 spec §7.3 / §8.2）。
+ *
+ * **同时暴露 `entry` 与 `slot`**：条目级的菜单项（profile / 模型 / 颜色 /
+ * 参与恢复 / 复制）要从三级转发到所属条目，而打开/关闭/删除会话要的是槽。
+ * 少暴露一个，`extension.ts` 就得回头去 store 里重查一遍。
+ *
+ * 图标按「存活 + 活动状态」四分支，**用中性色而不是 profile 色**：profile
+ * 已经由二级的纯文本表达（spec §6.3），同一个信息不该在两级各说一遍。
+ */
+export class SessionTreeItem extends vscode.TreeItem {
+  constructor(
+    public readonly entry: TerminalEntry,
+    public readonly slot: SessionSlot,
+    /** 该槽的 tmux 会话是否存活（由 setAlive 推来的会话名集合判定）。 */
+    public readonly alive: boolean,
+    /** 可能是 undefined —— 回退来的名字没有对应的本次采样状态。 */
+    public readonly activity: EntryActivity | undefined,
+    /** `label` 用它；空串回落「无会话」（见 core/sessions.ts 的 sessionLabel）。 */
+    public readonly taskName: string,
+    /** 任务名是哪来的，只用于 tooltip —— 三个来源的含义完全不同。 */
+    public readonly titleSource: 'pane' | 'fallback' | 'none',
+  ) {
+    super(sessionLabel(taskName), vscode.TreeItemCollapsibleState.None);
+    this.id = `session:${slot.id}`;
+    this.contextValue = alive ? 'sessionAlive' : 'sessionDead';
+    this.iconPath = !alive
+      ? // 会话不存在（进程没了 / 从未起来）：空心，中性色。
+        new vscode.ThemeIcon('circle-outline')
+      : activity?.state === 'running'
+        ? // 存活且 claude 正在干活：原生转圈动画。
+          new vscode.ThemeIcon('loading~spin')
+        : activity?.state === 'done-unseen'
+          ? // 存活、刚干完、用户还没看：实心绿点，直到用户点开这一行
+            // （ActivityTracker.markSeen 会清掉它）。
+            new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.green'))
+          : // 存活 + idle，**或 activity 为 undefined**（回退名字 / 这次没采到
+            // 样）—— 后者一并落进 idle 分支，**不新增状态**：有名字但当前空闲
+            // 是正常状态，taskName 不随 state 变化而清空（core/activity.ts）。
+            new vscode.ThemeIcon('circle-filled');
+    this.tooltip = new vscode.MarkdownString(
+      [
+        `**${entry.name}**`,
+        '',
+        `- 目录：\`${entry.cwd}\``,
+        `- profile：${entry.profile === 'direct' ? 'direct（官方直连）' : 'ccr（本地中转）'}`,
+        `- 模型：${entry.model && entry.model.length > 0 ? `\`${entry.model}\`` : '（profile 默认）'}`,
+        `- 对话：${conversationLabel(slot)}`,
+        `- 状态：${alive ? '🟢 会话存活，点击接回原进程' : '⚪ 无会话，点击重建并接回该对话'}`,
+        `- 任务名：${taskName.length > 0 ? taskName : '（无）'} · ${activityLabel(activity)}`,
+        `- 任务名的来源：${TITLE_SOURCE_TEXT[titleSource]}`,
+      ].join('\n'),
+    );
     this.command = {
       command: 'tmuxTerminals.open',
       title: '打开终端',
@@ -120,47 +200,17 @@ export class EntryTreeItem extends vscode.TreeItem {
 }
 
 /**
- * 三级节点：任务名。只在 `taskName` 非空时才会被创建
- * （由 `EntryTreeProvider.getChildren` 保证，见下）。
+ * 任务名三个来源的说明文字。
  *
- * **判据是 `taskName`，不是 `activity.taskName`。** 名字有两个来源：本次
- * 采样的 pane title，以及没有采样时从绑定对话的 aiTitle 回退来的名字。回退
- * 来的名字**没有**对应的本次采样状态，所以 `activity` 可以是 undefined ——
- * 这正是构造参数类型写成 `EntryActivity | undefined` 的原因。拿 activity
- * 判空，会让「有回退名字但这次没被采样」的条目凭空少一级。
- *
- * 图标按活动状态**四输入三出口**：running → 原生转圈动画；done-unseen →
- * 实心绿点（直到用户点开该节点，见 ActivityTracker.markSeen）；idle **与
- * activity 为 undefined**（回退名字 / 该条目这次没被采样）→ 实心 profile
- * 色点 —— 后两者一并落进 idle 分支，不新增状态（有任务名但当前空闲是正常
- * 状态，见 core/activity.ts 的说明——taskName 不随 state 变化而清空）。
+ * 写出来不是为了好看：**「为什么这一行显示的是这个名字」在界面上无法自证** ——
+ * pane title 是实时的（claude 换个任务就变），而绑定对话的 aiTitle 是**落盘
+ * 那一刻**的标题，可能已经很旧。不说清楚，用户会觉得「任务名怎么不更新了」。
  */
-export class TaskTreeItem extends vscode.TreeItem {
-  constructor(
-    public readonly entry: TerminalEntry,
-    /** 可能是 undefined —— 回退来的名字没有对应的本次采样状态。 */
-    public readonly activity: EntryActivity | undefined,
-    /** `label`/`id` 用它；图标仍按 `activity?.state` 三态，undefined 走 idle 分支。 */
-    public readonly taskName: string,
-  ) {
-    super(taskName, vscode.TreeItemCollapsibleState.None);
-    this.id = `task:${entry.id}`;
-    this.contextValue = 'task';
-    // 图标仍按活动状态三态。回退来的名字通常伴随 idle（或 activity 干脆是
-    // undefined：该条目没被采过样），两者一并落到 idle 分支，**不新增状态**。
-    this.iconPath =
-      activity?.state === 'running'
-        ? new vscode.ThemeIcon('loading~spin', profileColor(entry))
-        : activity?.state === 'done-unseen'
-          ? new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.green'))
-          : new vscode.ThemeIcon('circle-filled', profileColor(entry));
-    this.command = {
-      command: 'tmuxTerminals.open',
-      title: '打开终端',
-      arguments: [this],
-    };
-  }
-}
+const TITLE_SOURCE_TEXT: Record<'pane' | 'fallback' | 'none', string> = {
+  pane: 'claude 进程当前的 pane 标题（实时）',
+  fallback: '绑定对话里落盘的标题（进程没在跑时的回退，可能已过时）',
+  none: '（还没有名字）',
+};
 
 /** 清单为空时显示的一行，点击即新建。 */
 export class EmptyTreeItem extends vscode.TreeItem {
@@ -172,7 +222,7 @@ export class EmptyTreeItem extends vscode.TreeItem {
   }
 }
 
-export type TreeNode = FolderTreeItem | EntryTreeItem | TaskTreeItem | EmptyTreeItem;
+export type TreeNode = FolderTreeItem | EntryTreeItem | SessionTreeItem | EmptyTreeItem;
 
 export class EntryTreeProvider
   implements vscode.TreeDataProvider<TreeNode>, vscode.TreeDragAndDropController<TreeNode>
@@ -194,12 +244,16 @@ export class EntryTreeProvider
     /**
      * 活动状态的只读查询接口，由 extension.ts 传入真正的 ActivityTracker。
      * 用最小接口而不是具体类型，让 tree.ts 不必知道 ActivityTracker 的
-     * 轮询细节（与上面 store 参数同样的处理方式）。省略时所有条目的
-     * activity 都是 undefined（不生成三级节点，二级图标退回默认逻辑），
-     * 不影响既有调用方（比如批量面板用的是另一个 Provider，不受影响）。
+     * 轮询细节（与上面 store 参数同样的处理方式）。省略时所有会话的
+     * activity 都是 undefined（二级图标退回默认逻辑），不影响既有调用方
+     * （比如批量面板用的是另一个 Provider，不受影响）。
+     *
+     * ⚠ **入参是槽 id，不是条目 id**：采样层内部就是 `sessionNameFor(id)`，
+     * 喂条目 id 会让「同一终端下只有槽 id 恰好等于条目 id 的那一个」采到样，
+     * 其余会话的运行图标永远不转 —— 静默、且极难定位（spec §6.5）。
      */
     private readonly activity?: {
-      activityFor(entryId: string): EntryActivity | undefined;
+      activityFor(sessionId: string): EntryActivity | undefined;
     },
     /**
      * 任务名回退源：**同步读内存缓存，不发 IO、不触发观测**（观测统一由
@@ -208,13 +262,20 @@ export class EntryTreeProvider
      *
      * 除 `peek` 外还有一个**可选**的订阅入口：缓存后台真的写入一条新标题时
      * 会通知一次，provider 据此重刷整棵树 —— 标题是异步落地的，而这里是同步
-     * peek，两者之间没有它就没有任何交集：读到了名字树也不会重算，二级的
-     * `collapsibleState` 停在 `None`，第三级永远不出现。
-     * 声明成可选成员：没有订阅能力的实现（比如单测里的假 cache）照常可用。
+     * peek，两者之间没有它就没有任何交集：读到了名字树也不会重算，三级会一直
+     * 停在「无会话」上。声明成可选成员：没有订阅能力的实现（比如单测里的假
+     * cache）照常可用。
      */
     private readonly titleFallback?: {
       peek(conversationId: string | undefined): string | undefined;
       onDidChangeTitle?(listener: () => void): { dispose(): void };
+    },
+    /**
+     * 新增：二级行的颜色竖线。省略时退化为 `ThemeIcon('circle-outline')`
+     * —— 安全侧：图标虽然丢了颜色，但不会去碰一个不存在的文件路径。
+     */
+    private readonly colorIcons?: {
+      iconFor(color?: string): vscode.Uri | { light: vscode.Uri; dark: vscode.Uri };
     },
   ) {
     // 订阅只能在构造函数体里做：字段初始化器跑在参数属性赋值**之前**，
@@ -244,7 +305,9 @@ export class EntryTreeProvider
 
   /**
    * 传入的是一批 **tmux 会话名**（来自 `tmux ls`，形如 `tmuxterm-<id>`），
-   * 不是条目显示名 —— 会话名由条目 id 派生，见 core/tmux.ts 的 sessionNameFor。
+   * 不是条目显示名 —— 会话名由**槽** id 派生，见 core/tmux.ts 的 sessionNameFor。
+   * v3 下槽 id 与条目 id 不再恒等（只有迁移合成出来的槽才相等），所以这里
+   * 认得的是槽的会话名，二级只是按「其下有存活槽吗」间接体现。
    */
   setAlive(names: Set<string>): void {
     const changed =
@@ -258,25 +321,41 @@ export class EntryTreeProvider
   }
 
   /**
-   * 显示用的任务名：pane title（live，权威）→ 绑定对话的 aiTitle（回退）
-   * → ''（不显示第三级）。
+   * 某个槽的显示用任务名：pane title（live，权威）→ 绑定对话的 aiTitle（回退）
+   * → ''（渲染层回落成「无会话」）。
    *
    * **全都无从得知时返回空串** —— 不加灰色占位、不退化成
    * `~/.claude/sessions` 的 derived slug、不用首条用户消息：把「不知道」
-   * 伪装成「知道」是误导（spec §8 不变量 6）。
+   * 伪装成「知道」是误导（spec §8 不变量 6）。回落成「无会话」那一步在
+   * `sessionLabel`（渲染层）里做，本方法只回答「有没有名字」。
+   *
+   * 同时返回**名字的来源**（只给 tooltip 用）：pane title 是实时的，而绑定
+   * 对话的 aiTitle 是**落盘那一刻**的标题、可能已经很旧 —— 不说清楚，用户会
+   * 以为「任务名怎么不更新了」。两种来源合在一个方法里算，是因为它们的优先级
+   * 关系就是这一段 if/else，拆成两处迟早会各说各话。
    *
    * 纯读：`peek` 同步、不发 IO、不触发观测（观测统一由 extension.ts 驱动）。
    * 缓存**后来**才写入一条标题时，构造函数里那个订阅会 fire 一次 ——
-   * `getChildren` 重跑、本方法被重新求值，二级的 collapsibleState 随之从
-   * `None` 变成 `Expanded`，第三级自动出现。
+   * `getChildren` 重跑、本方法被重新求值，三级标题随之从「无会话」变成真名。
    */
-  private taskNameFor(entry: TerminalEntry): string {
-    const fromPane = this.activity?.activityFor(entry.id)?.taskName ?? '';
-    // 回退源取**该条目的第一个槽**的绑定：v3 的对话绑定在槽上，条目上已经没有
-    // 这个字段了。空槽的条目没有绑定可 peek，回退源自然是空串（不编造）。
-    return fromPane.length > 0
-      ? fromPane
-      : this.titleFallback?.peek(entry.sessions[0]?.conversationId) ?? '';
+  private taskNameFor(
+    slot: SessionSlot,
+  ): { name: string; source: 'pane' | 'fallback' | 'none' } {
+    const fromPane = this.activity?.activityFor(slot.id)?.taskName ?? '';
+    if (fromPane.length > 0) return { name: fromPane, source: 'pane' };
+    // 回退源取**该槽**的绑定：v3 的对话绑定在槽上，条目上已经没有这个字段了。
+    // 未绑定的槽（conversationId 为空）没有可 peek 的东西，回退源自然是空串。
+    const fromTitle = this.titleFallback?.peek(slot.conversationId) ?? '';
+    return fromTitle.length > 0
+      ? { name: fromTitle, source: 'fallback' }
+      : { name: '', source: 'none' };
+  }
+
+  /** 二级行首的图标：有 ColorIconCache 就用它的（竖线），否则退化主题图标。 */
+  private entryIcon(entry: TerminalEntry): EntryIconPath {
+    return this.colorIcons === undefined
+      ? new vscode.ThemeIcon('circle-outline')
+      : this.colorIcons.iconFor(entry.color);
   }
 
   async getChildren(element?: TreeNode): Promise<TreeNode[]> {
@@ -288,28 +367,24 @@ export class EntryTreeProvider
       );
     }
     if (element instanceof FolderTreeItem) {
-      return element.entries.map((e) => {
-        // 存活判据落在**槽**上：tmux 会话名由槽 id 派生（v3），而条目 id 只在
-        // v1/v2 迁移出来的槽上与槽 id 恰好相等 —— 拿条目 id 去凑一个会话名，
-        // 会在「槽 id 与条目 id 不同」的条目上查到一个毫不相干的 tmux 会话。
-        //
-        // 空槽的条目（`sessions: []`）一律判为「无会话」：它名下确实一个会话
-        // 都没有，这正是实情，不是降级。
-        const slot = e.sessions[0];
-        return new EntryTreeItem(
-          e,
-          slot !== undefined && this.alive.has(sessionNameFor(slot.id)),
-          this.activity?.activityFor(e.id),
-          this.taskNameFor(e),
-        );
-      });
+      return element.entries.map((e) => new EntryTreeItem(e, this.entryIcon(e)));
     }
     if (element instanceof EntryTreeItem) {
-      const activity = this.activity?.activityFor(element.entry.id);
-      // 有名字才生三级 —— 名字可能来自回退，所以判据是 taskName 而不是 activity
-      return element.taskName.length > 0
-        ? [new TaskTreeItem(element.entry, activity, element.taskName)]
-        : [];
+      // 三级**恒生成**（每个槽一行）：它是「接回这个会话」的唯一入口。
+      // 存活判据落在**槽**上：tmux 会话名由槽 id 派生（v3），而条目 id 只在
+      // v1/v2 迁移出来的槽上与槽 id 恰好相等 —— 拿条目 id 去凑一个会话名，
+      // 会在「槽 id 与条目 id 不同」的条目上查到一个毫不相干的 tmux 会话。
+      return element.entry.sessions.map((slot) => {
+        const title = this.taskNameFor(slot);
+        return new SessionTreeItem(
+          element.entry,
+          slot,
+          this.alive.has(sessionNameFor(slot.id)),
+          this.activity?.activityFor(slot.id),
+          title.name,
+          title.source,
+        );
+      });
     }
     return [];
   }

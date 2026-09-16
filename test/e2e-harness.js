@@ -92,6 +92,19 @@ class EventEmitter {
   dispose() { this.listeners.length = 0; }
 }
 class ThemeIcon { constructor(id, color) { this.id = id; this.color = color; } }
+// `tree.ts` 的 iconPath / `colorIcons.ts` 的落盘路径都要用它。
+// 只实现被测代码真正用到的那三个静态方法（file / joinPath / parse）——
+// 多写的部分不会被调用，却会让人误以为这里覆盖了整个 Uri API。
+class Uri {
+  constructor(p) { this.fsPath = p; this.path = p; this.scheme = 'file'; }
+  static file(p) { return new Uri(p); }
+  static joinPath(base, ...segs) {
+    const b = base && base.fsPath !== undefined ? base.fsPath : String(base);
+    return new Uri(path.join(b, ...segs));
+  }
+  static parse(s) { return new Uri(String(s).replace(/^file:\/\//, '')); }
+  toString() { return `file://${this.fsPath}`; }
+}
 class ThemeColor { constructor(id) { this.id = id; } }
 class MarkdownString { constructor(v) { this.value = v; } }
 class DataTransferItem {
@@ -115,6 +128,7 @@ const vscodeStub = {
   EventEmitter,
   ThemeIcon,
   ThemeColor,
+  Uri,
   MarkdownString,
   DataTransfer,
   DataTransferItem,
@@ -1517,8 +1531,13 @@ async function projectSnapshot() {
 
   console.log('\n=== 18. 三级树：getChildren 分层与拖拽范围收窄到同文件夹 ===');
   {
-    const { EntryTreeProvider, FolderTreeItem, EntryTreeItem, TaskTreeItem } =
+    const { EntryTreeProvider, FolderTreeItem, EntryTreeItem, SessionTreeItem } =
       require(path.join(ROOT, 'out/src/tree.js'));
+
+    // B-EMPTY 的槽数组是空的：三级不再「没名字就不生成」，所以「能展开却展
+    // 开为空」只剩这一种可能（sessions 为空），必须单独钉住（不变量 9）。
+    const emptySessions = mk('t-b2', 'B2', '/proj/b');
+    emptySessions.sessions = [];
 
     // 独立的一套假 store/activity，不复用外层那个巨大的 TerminalManager
     // 用例夹具——那份数据是为别的场景准备的，cwd 分布对本节没有意义。
@@ -1527,19 +1546,24 @@ async function projectSnapshot() {
         mk('t-a1', 'A1', '/proj/a'),
         mk('t-a2', 'A2', '/proj/a'),
         mk('t-b1', 'B1', '/proj/b'),
+        emptySessions,
       ],
       async load() { return this.entries.map((e) => ({ ...e })); },
       reorderCalls: [],
       async reorder(ids) { this.reorderCalls.push(ids); },
     };
     const activityByEntry = {
+      // 键是**槽 id**（三级恒生成后每一行都按槽 id 采样）——t-a1 的槽 id
+      // 就是条目 id（mk 的合成规则）。
       't-a1': { state: 'running', taskName: '编译' },
-      // t-a2、t-b1 没有 activity（undefined）——不应该生出三级节点
+      // t-a2 没有 activity（undefined）→ 三级照样生成，标题回落「无会话」
     };
     const treeActivity = {
       activityFor(id) { return activityByEntry[id]; },
     };
     const provider = new EntryTreeProvider(treeStore, treeActivity);
+    // 只让 t-a1 的槽活着：用来区分三级图标的「存活」与「不存在」两支。
+    provider.setAlive(new Set([S('t-a1')]));
 
     // ---- 一级：按 cwd 分两个文件夹 ----
     const folders = await provider.getChildren(undefined);
@@ -1548,26 +1572,60 @@ async function projectSnapshot() {
     const folderA = folders.find((f) => f.cwd === '/proj/a');
     const folderB = folders.find((f) => f.cwd === '/proj/b');
     chk('文件夹 A 下有 2 条', !!folderA && folderA.entries.length === 2);
-    chk('文件夹 B 下有 1 条', !!folderB && folderB.entries.length === 1);
+    chk('文件夹 B 下有 2 条（含一条 0 会话的）', !!folderB && folderB.entries.length === 2);
 
     // ---- 二级：展开文件夹 A 拿到条目 ----
     const entriesInA = await provider.getChildren(folderA);
     chk('二级节点都是 EntryTreeItem', entriesInA.every((n) => n instanceof EntryTreeItem));
     const a1Node = entriesInA.find((n) => n.entry.id === 't-a1');
     const a2Node = entriesInA.find((n) => n.entry.id === 't-a2');
-    chk('有任务名的条目 collapsibleState = Expanded (2)', a1Node.collapsibleState === 2,
+    chk('★ 二级 id 带 entry: 前缀（避免与同 id 的槽撞 id）', a1Node.id === 'entry:t-a1',
+      String(a1Node.id));
+    chk('★ 二级 contextValue = terminal', a1Node.contextValue === 'terminal',
+      String(a1Node.contextValue));
+    // 可折叠性只看**有没有槽**，与有没有任务名无关（不变量 9）：三级恒生成，
+    // 所以「有槽」永远意味着「展开后有东西」。
+    chk('有槽的条目 collapsibleState = Expanded (2)', a1Node.collapsibleState === 2,
       String(a1Node.collapsibleState));
-    chk('没有任务名的条目 collapsibleState = None (0)', a2Node.collapsibleState === 0,
-      String(a2Node.collapsibleState));
+    chk('★ 没有任务名但**有槽**的条目同样是 Expanded —— 三级恒生成',
+      a2Node.collapsibleState === 2, String(a2Node.collapsibleState));
+    chk('★ 二级 profile 用纯文本（description 不支持 codicon 渲染）',
+      a1Node.description === '中转', JSON.stringify(a1Node.description));
+    chk('★ 二级不再有 command（点击 = 展开/折叠，打开下移到三级）',
+      a1Node.command === undefined, JSON.stringify(a1Node.command && a1Node.command.command));
 
-    // ---- 三级：只有 a1 应该展开出任务名节点 ----
+    // ---- 三级：每个槽一行，恒生成 ----
     const a1Children = await provider.getChildren(a1Node);
-    chk('有任务名的条目展开出 1 个 TaskTreeItem', a1Children.length === 1 &&
-      a1Children[0] instanceof TaskTreeItem);
-    chk('TaskTreeItem 标签就是 taskName', a1Children[0].label === '编译');
+    chk('有任务名的条目展开出 1 个 SessionTreeItem（槽数 = 1）',
+      a1Children.length === 1 && a1Children[0] instanceof SessionTreeItem);
+    chk('三级标签就是 taskName', a1Children[0].label === '编译', String(a1Children[0].label));
+    chk('★ 三级 id 带 session: 前缀', a1Children[0].id === 'session:t-a1',
+      String(a1Children[0].id));
+    chk('存活槽 contextValue = sessionAlive', a1Children[0].contextValue === 'sessionAlive',
+      String(a1Children[0].contextValue));
+    chk('★ 存活 + running → 转圈图标', a1Children[0].iconPath.id === 'loading~spin',
+      String(a1Children[0].iconPath.id));
+    chk('★ 三级点击 = tmuxTerminals.open，参数是三级节点自己',
+      a1Children[0].command && a1Children[0].command.command === 'tmuxTerminals.open' &&
+      a1Children[0].command.arguments[0] === a1Children[0]);
+
     const a2Children = await provider.getChildren(a2Node);
-    chk('★ 没有任务名的条目绝不生成三级节点', a2Children.length === 0,
-      JSON.stringify(a2Children));
+    chk('★ 没有任务名的条目**照样**生成三级节点（回落「无会话」）',
+      a2Children.length === 1 && a2Children[0] instanceof SessionTreeItem,
+      JSON.stringify(a2Children.map((c) => c.label)));
+    chk('★ 标题回落「无会话」', a2Children[0].label === '无会话', String(a2Children[0].label));
+    chk('不存在的槽 contextValue = sessionDead', a2Children[0].contextValue === 'sessionDead',
+      String(a2Children[0].contextValue));
+    chk('不存在的槽 → 空心圈图标', a2Children[0].iconPath.id === 'circle-outline',
+      String(a2Children[0].iconPath.id));
+
+    // ---- 0 槽的条目：唯一一种「看起来能展开、展开是空的」的可能 ----
+    const entriesInB = await provider.getChildren(folderB);
+    const b2Node = entriesInB.find((n) => n.entry.id === 't-b2');
+    chk('★ 0 会话的条目 collapsibleState = None (0)（绝不出现空展开）',
+      b2Node.collapsibleState === 0, String(b2Node.collapsibleState));
+    chk('0 会话的条目确实没有任何子节点', (await provider.getChildren(b2Node)).length === 0);
+    const b1Node = entriesInB.find((n) => n.entry.id === 't-b1');
 
     // ---- 拖拽：同文件夹内允许，跨文件夹整体 no-op ----
     const dragSame = new DataTransfer();
@@ -1582,8 +1640,6 @@ async function projectSnapshot() {
       treeStore.reorderCalls[0].indexOf('t-b1') === 2, JSON.stringify(treeStore.reorderCalls[0]));
 
     treeStore.reorderCalls.length = 0;
-    const entriesInB = await provider.getChildren(folderB);
-    const b1Node = entriesInB[0];
     const dragCross = new DataTransfer();
     await provider.handleDrag([a1Node], dragCross);
     await provider.handleDrop(b1Node, dragCross); // 跨文件夹：a1(/proj/a) 拖到 b1(/proj/b) 上
@@ -1985,9 +2041,9 @@ async function projectSnapshot() {
     }
   }
 
-  console.log('\n=== 20. 任务名回退链：pane title → 绑定对话的 aiTitle → 不显示三级 ===');
+  console.log('\n=== 20. 任务名回退链：pane title → 绑定对话的 aiTitle → 「无会话」 ===');
   {
-    const { EntryTreeProvider, TaskTreeItem } = require(path.join(ROOT, 'out/src/tree.js'));
+    const { EntryTreeProvider, SessionTreeItem } = require(path.join(ROOT, 'out/src/tree.js'));
     const { TaskTitleCache } = require(path.join(ROOT, 'out/src/taskTitles.js'));
     const { taskNameFromTitle } = require(path.join(ROOT, 'out/src/core/tmux.js'));
 
@@ -2036,16 +2092,15 @@ async function projectSnapshot() {
     const peekIds = watchPeek(titles);
     const p1 = new EntryTreeProvider(storeFor(mk('t-title1', 'T1', BOUND_CWD, { conversationId: conv })), noName, titles);
     const node1 = (await p1.getChildren((await p1.getChildren(undefined))[0]))[0];
-    chk('20a ★ 三级回退到绑定对话的 aiTitle', node1.taskName === aiTitle, JSON.stringify(node1.taskName));
     chk('20a 二级 collapsibleState = Expanded (2)', node1.collapsibleState === 2, String(node1.collapsibleState));
     const third1 = await p1.getChildren(node1);
-    chk('20a 三级节点标签就是 aiTitle',
-      third1.length === 1 && third1[0] instanceof TaskTreeItem && third1[0].label === aiTitle,
+    chk('20a ★ 三级回退到绑定对话的 aiTitle',
+      third1.length === 1 && third1[0] instanceof SessionTreeItem && third1[0].label === aiTitle,
       JSON.stringify(third1.map((t) => t.label)));
     chk('20a ★ peek 的键集合全部从绑定对话 id 派生（不是条目 id / 会话名 / 显示名）',
       keysOk(peekIds, conv, 't-title1', 'T1'), JSON.stringify(peekIds));
 
-    // ---- 20b. transcript 里没有 aiTitle → 不生成三级 ----
+    // ---- 20b. transcript 里没有 aiTitle → 标题回落「无会话」（三级照样在）----
     const convEmpty = 'bbbbbbbb-0012-0000-0000-000000000000';
     await writeTranscript(convEmpty, BOUND_CWD, PROJECT, undefined, 10);
     const titles2 = new TaskTitleCache(HOME);
@@ -2054,10 +2109,14 @@ async function projectSnapshot() {
     const peekIds2 = watchPeek(titles2);
     const p2 = new EntryTreeProvider(storeFor(mk('t-title2', 'T2', BOUND_CWD, { conversationId: convEmpty })), noName, titles2);
     const node2 = (await p2.getChildren((await p2.getChildren(undefined))[0]))[0];
-    chk('20b ★ 都无从得知时 taskName 为空串（不用灰色占位/derived slug 冒充）',
-      node2.taskName === '', JSON.stringify(node2.taskName));
-    chk('20b 二级 collapsibleState = None (0)', node2.collapsibleState === 0, String(node2.collapsibleState));
-    chk('20b ★ 不生成三级节点', (await p2.getChildren(node2)).length === 0);
+    chk('20b 二级 collapsibleState = Expanded (2) —— 有槽就必然能展开出东西',
+      node2.collapsibleState === 2, String(node2.collapsibleState));
+    const third2 = await p2.getChildren(node2);
+    chk('20b ★ 都无从得知时标题回落「无会话」（不用灰色占位/derived slug 冒充）',
+      third2.length === 1 && third2[0].label === '无会话',
+      JSON.stringify(third2.map((t) => t.label)));
+    chk('20b ★ 这一行仍然在（它是把这个会话接回来的唯一入口）',
+      third2.length === 1 && third2[0] instanceof SessionTreeItem);
     chk('20b ★ 负例下 peek 的键集合同样从绑定对话 id 派生',
       keysOk(peekIds2, convEmpty, 't-title2', 'T2'), JSON.stringify(peekIds2));
 
@@ -2071,9 +2130,10 @@ async function projectSnapshot() {
       titles,
     );
     const node3 = (await p3.getChildren((await p3.getChildren(undefined))[0]))[0];
-    chk('20c ★ pane title 优先，三级显示原文', node3.taskName === shellTitle, JSON.stringify(node3.taskName));
+    chk('20c 二级 collapsibleState = Expanded (2)', node3.collapsibleState === 2,
+      String(node3.collapsibleState));
     const third3 = await p3.getChildren(node3);
-    chk('20c 三级节点标签是原文',
+    chk('20c ★ pane title 优先，三级显示原文',
       third3.length === 1 && third3[0].label === shellTitle, JSON.stringify(third3.map((t) => t.label)));
   }
 
@@ -2489,6 +2549,125 @@ async function projectSnapshot() {
     inputBoxAnswer = undefined;
     chk('29d ★ 三位简写展开成小写六位后落盘', fresh(id).color === '#aabbcc',
       String(fresh(id).color));
+  }
+
+  console.log('\n=== 30. 主树渲染：二级不再打开终端；颜色竖线真的落盘 ===');
+  {
+    const { EntryTreeProvider, EntryTreeItem, SessionTreeItem } =
+      require(path.join(ROOT, 'out/src/tree.js'));
+    const { ColorIconCache } = require(path.join(ROOT, 'out/src/colorIcons.js'));
+
+    // 落盘目录指到临时目录，**绝不写用户真实的 globalStorage**：
+    // 那会把测试产生的颜色 SVG 留在用户的编辑器里，而且卸载重装才会清掉。
+    const COLOR_DIR = '/tmp/tmuxterm-e2e-colors';
+    await fs.promises.rm(COLOR_DIR, { recursive: true, force: true });
+    const colorIcons = new ColorIconCache(COLOR_DIR, { fsPath: ROOT, path: ROOT });
+
+    // ---- 30a~30d. 二级不再打开终端 ----
+    // 二级的「打开」是**结构性移除**的（没有 command），不是运行时判掉的：
+    // VS Code 点击一行时只认 TreeItem.command，这里没有它就什么都不发生。
+    // 所以断言分两层：二级没有 command；渲染整棵树不产生任何 tmux 副作用。
+    const treeStore = {
+      entries: [
+        mk('t-open01', 'OPEN01', BOUND_CWD, { conversationId: CONV_ALIVE }),
+        { ...mk('t-open02', 'OPEN02', BOUND_CWD), color: '#aabbcc' },
+      ],
+      async load() { return this.entries.map((e) => ({ ...e })); },
+      async reorder() {},
+    };
+    const before = {
+      newSessions: calls.newSessions.length,
+      literals: calls.literals.length,
+      terminals: calls.terminals.length,
+    };
+    const p = new EntryTreeProvider(
+      treeStore,
+      // 键是**槽 id**：t-open01 的槽 id 就是条目 id（mk 的合成规则）。
+      { activityFor: (id) => (id === 't-open01' ? { state: 'running', taskName: '干活' } : undefined) },
+      undefined,
+      colorIcons,
+    );
+    const folder0 = (await p.getChildren(undefined))[0];          // BOUND_CWD 一个文件夹
+    const nodes = await p.getChildren(folder0);
+    const openNode = nodes.find((n) => n.entry.id === 't-open01');
+    const colorNode = nodes.find((n) => n.entry.id === 't-open02');
+    const openThird = (await p.getChildren(openNode))[0];
+
+    chk('30a ★ 二级没有 command（点击 = 展开/折叠，不再打开终端）',
+      openNode.command === undefined,
+      JSON.stringify(openNode.command && openNode.command.command));
+    chk('30b 二级仍然是 EntryTreeItem，三级是 SessionTreeItem',
+      openNode instanceof EntryTreeItem && openThird instanceof SessionTreeItem);
+    chk('30c 三级才有 command，且指向 tmuxTerminals.open',
+      !!openThird.command && openThird.command.command === 'tmuxTerminals.open',
+      JSON.stringify(openThird.command && openThird.command.command));
+    chk('30d ★ 渲染整棵树不产生任何 tmux 操作（没建会话、没打字、没开面板）',
+      calls.newSessions.length === before.newSessions &&
+      calls.literals.length === before.literals &&
+      calls.terminals.length === before.terminals,
+      `newSessions=${calls.newSessions.length - before.newSessions} ` +
+      `literals=${calls.literals.length - before.literals} ` +
+      `terminals=${calls.terminals.length - before.terminals}`);
+
+    // ---- 30e~30f. 二级图标 = 颜色竖线（不是主题色的点点）----
+    chk('30e ★ 未设颜色 → 中性竖线（light/dark 对，随扩展打包）',
+      !!openNode.iconPath && !!openNode.iconPath.light && !!openNode.iconPath.dark &&
+      openNode.iconPath.light.fsPath === colorIcons.neutral().light.fsPath,
+      JSON.stringify(openNode.iconPath && openNode.iconPath.fsPath));
+    chk('30f ★ 设了颜色 → iconPath 指到 <storage>/colors/<hex>.svg',
+      colorNode.iconPath && colorNode.iconPath.fsPath === path.join(COLOR_DIR, 'aabbcc.svg'),
+      String(colorNode.iconPath && colorNode.iconPath.fsPath));
+
+    // ---- 30g~30k. 颜色落盘（setColorInteractive 之后）----
+    const id = 'e2ecolor002';
+    ALL.push(id);
+    store.entries.push(mk(id, 'COLOR2', SCRATCH));
+    const mgr = newManager();
+    quickPickAnswer = '#12A594';   // 大写预设色：落盘的必须是归一化后的小写
+    await mgr.setColorInteractive(fresh(id));
+    quickPickAnswer = undefined;
+    chk('30g ★ setColorInteractive 后 entry.color 是归一化的小写 hex',
+      fresh(id).color === '#12a594', String(fresh(id).color));
+
+    await colorIcons.ensure([fresh(id).color]);
+    const svgFile = path.join(COLOR_DIR, '12a594.svg');
+    chk('30h ★ <storage>/colors/<hex>.svg 已落盘', fs.existsSync(svgFile), svgFile);
+    const svgText = fs.readFileSync(svgFile, 'utf8');
+    chk('30i ★ SVG 内容含该 hex 的**显式 fill**', svgText.includes('fill="#12a594"'), svgText);
+    chk('30j ★ SVG 绝不含 currentColor（mask 渲染下会整体透明）',
+      !svgText.includes('currentColor'), svgText);
+
+    // 幂等 + 非法值不落盘：ensure 会在每次 activate 对整份清单跑一遍，
+    // 无脑覆盖会把 mtime 刷成每次启动的时间；而「猜一个近似色」比不写更坏。
+    const dirList = (await fs.promises.readdir(COLOR_DIR)).sort();
+    await colorIcons.ensure(['#gggggg', '#12a594', '#12a594']);
+    chk('30k ★ 非法颜色不落任何文件，合法值幂等（目录内容一字不变）',
+      JSON.stringify((await fs.promises.readdir(COLOR_DIR)).sort()) === JSON.stringify(dirList) &&
+      !fs.existsSync(path.join(COLOR_DIR, 'gggggg.svg')),
+      JSON.stringify(dirList));
+
+    // ---- 30l~30n. 随包的两个中性竖线本身必须是可渲染的 ----
+    const neutral = colorIcons.neutral();
+    chk('30l 中性竖线指向随包的两个 SVG，且真实存在',
+      fs.existsSync(neutral.light.fsPath) && fs.existsSync(neutral.dark.fsPath),
+      `${neutral.light.fsPath} / ${neutral.dark.fsPath}`);
+    const lightSvg = fs.readFileSync(neutral.light.fsPath, 'utf8');
+    const darkSvg = fs.readFileSync(neutral.dark.fsPath, 'utf8');
+    chk('30m ★ 两个中性 SVG 都用显式 fill（light #6e6e6e / dark #c5c5c5）',
+      lightSvg.includes('fill="#6e6e6e"') && darkSvg.includes('fill="#c5c5c5"'),
+      `${lightSvg} | ${darkSvg}`);
+    chk('30n ★ 两个中性 SVG 都绝不含 currentColor',
+      !lightSvg.includes('currentColor') && !darkSvg.includes('currentColor'));
+    chk('30o 非法/未设颜色 → iconFor 回落中性（不拼一个永远不存在的路径）',
+      colorIcons.iconFor(undefined).light.fsPath === neutral.light.fsPath &&
+      colorIcons.iconFor('#zzz').light.fsPath === neutral.light.fsPath &&
+      colorIcons.iconFor('red').light.fsPath === neutral.light.fsPath);
+    chk('30p 大写/无 # 的输入也能解析到同一个文件（归一化是图标路径的唯一来源）',
+      colorIcons.iconFor('#AABBCC').fsPath === path.join(COLOR_DIR, 'aabbcc.svg') &&
+      colorIcons.iconFor('aabbcc').fsPath === path.join(COLOR_DIR, 'aabbcc.svg'),
+      String(colorIcons.iconFor('aabbcc').fsPath));
+
+    await fs.promises.rm(COLOR_DIR, { recursive: true, force: true });
   }
 
   console.log('\n=== 15. 清理 + 用户环境未被触碰 ===');
