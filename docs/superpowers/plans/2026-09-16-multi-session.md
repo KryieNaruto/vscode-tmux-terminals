@@ -155,8 +155,18 @@ e2e harness 与 401 条单测是这一次「没改坏」的证据。
 
 ### 文件
 - `src/terminalManager.ts`
+- `src/extension.ts`（**只改 `pollActivity` 一处**：它现在把**条目 id** 当键喂给
+  `tracker.poll`，而采样层已按**槽 id** 派生会话名。键必须与采样层同源，否则
+  同一终端的第 2 个会话**永远不会有运行图标** —— 静默、无测试能抓。其余
+  extension.ts 的改动属 Task 3）
 - `test/e2e-harness.js`（新增用例，SPEC §12.4 里**不需要 UI 的那几条**）
 - `test/activityTracker.test.ts`（键改成槽 id，SPEC §12.2）
+
+> **Task 1 留下的一处临时耦合，本 Task 要收掉**：Task 1 里新建/复制出的槽，
+> 其 `id` **借用了条目 id**（当时的理由是 extension.ts 被冻结、仍按条目 id
+> 派生会话名，两者必须指同一个会话）。本 Task 让 extension.ts 也走槽 id 之后，
+> 这层耦合不再需要 —— **新建与复制出来的槽一律用 `newId()`**（迁移合成的槽
+> 仍必须等于原条目 id，那是另一回事，SPEC §11.1，**不要动**）。
 
 ### 步骤
 
@@ -226,6 +236,71 @@ reconcile 与「选择要接回的对话」随之下移到槽。profile/模型/�
 
 X 只杀 tmux 进程、槽与对话绑定原样保留 —— 这是「三级是接回会话的」能
 成立的前提：再点那一行就是 --resume 回同一条对话。
+```
+
+---
+
+## Task 2b — 补两个洞：新槽的 `conversationId`、兜底 D 的占用判据
+
+Task 2 的实施暴露了 SPEC 的两处**自身缺陷**（都是多会话模型新引入的，
+不是实现写错）。两条都已在 SPEC 里改定：§7.4 与 §11.16。
+
+### 文件
+- `src/terminalManager.ts`（`addSessionInteractive` 一行 + `resolveLaunchSpec` 的 D 分支）
+- `test/core/*.test.ts`（若 D 的判据抽成了纯函数则补其单测）
+- `test/e2e-harness.js`（D 的两侧用例）
+
+### 步骤
+
+1. **`addSessionInteractive` 必须预分配 `conversationId`**（SPEC §7.4 的新正文）：
+
+   ```ts
+   await this.store.addSession(entry.id, {
+     id: newId(),
+     conversationId: newConversationId(),
+   });
+   ```
+   理由写在 SPEC §7.4：留空会让「+ 然后点开」落进未绑定路径 → 兜底 D
+   **静默 `--resume` 该 cwd 下 mtime 最新的对话**，而不是开一条新对话。
+   这与 `addEntryInteractive`（已预分配）必须是同一条路径。
+
+2. **兜底 D 增加判据 (b)：候选对话不得被任何槽占用**（SPEC §11.16）。
+   用现成的 `ownersOf`（`core/conversation.ts:283`）把所有条目的**所有槽**
+   摊平成 `BindingView[]`，取第一个**无主**候选；无主候选一个都没有时
+   **不启用 D**，退回弹框。**判据 (a)「该 cwd 下只有这一个条目」保留不动。**
+
+3. 测试：
+   - 新槽预分配的专项断言：`addSessionInteractive` 后槽的 `conversationId`
+     是**非空字符串**、且 `liveSessionId` 仍是 undefined。
+   - D 的**两侧**：① 候选无主 → 自动采用（原行为，不许回归）；
+     ② **候选已被同一终端的另一个槽绑着 → 绝不自动采用，必须弹框**
+     （这是本 Task 的核心回归，对应 SPEC §11.16 那条可达路径）。
+   - e2e 里「老条目 + 无主候选自动接回、不弹框」这条原用例必须仍然绿。
+
+### Expected
+
+- `npm test` 全绿且用例数 **> Task 2 结束时**的数字。
+- `npm run e2e` 全绿，断言数 **> 212**（新增 D 的占用用例 + 新槽预分配用例）。
+- `grep -n "addSessionInteractive" -A 6 src/terminalManager.ts` 里能看到
+  `conversationId: newConversationId()`。
+- **变异确认**：把判据 (b) 去掉（只看 (a)）→ 新增的「候选已被兄弟槽占用」
+  用例必须变红。贴出变红证据。
+
+### 提交
+
+```
+fix: 新会话槽预分配对话 id；兜底 D 不再采用已被占用的对话
+
+两处都是多会话模型自己引入的洞：
+
+1. 「+」新建的槽留空 conversationId，会让「点开」落进未绑定路径，被兜底 D
+   静默接上该 cwd 下 mtime 最新的对话 —— 而不是用户期待的新对话。
+   与 addEntryInteractive 对齐，一出生就分配一个「还没有 .jsonl」的 id。
+
+2. 兜底 D 原本靠「该 cwd 下只有这一个条目」排除竞争者，而多会话让竞争者
+   可以来自同一个条目：老条目的未绑定槽 + 同终端另一个正在写的槽，
+   D 会把两者接到同一条 .jsonl 上（两个 claude 同写一份，数据损坏级）。
+   补一条判据：候选必须无主（ownersOf），有主则退回弹框。
 ```
 
 ---
