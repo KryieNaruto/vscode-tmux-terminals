@@ -786,9 +786,19 @@ async removeSession(entryId: string, sessionId: string): Promise<void>;
 13. **拖拽排序语义不变**：仍只允许同 cwd 内的**条目**重排，跨文件夹整体
     no-op（`tree.ts` 的 `handleDrag`/`handleDrop` 逻辑与注释一字不改）。
     本轮**不给会话做拖拽排序**（未在需求内）。
-14. **`core/*.ts` 保持零 vscode 依赖、零 IO**（既有约定）：新增的
-    `core/sessions.ts`、`core/colors.ts`、`core/selection.ts` 必须能脱离
-    编辑器单测；vscode/fs 相关的一律放 `src/colorIcons.ts` 这类非 core 文件。
+14. **本轮新增的三个 `core/` 模块保持零 vscode 依赖、零 IO**：`core/sessions.ts`、
+    `core/colors.ts`、`core/selection.ts` 必须能脱离编辑器单测；vscode/fs 相关的
+    一律放 `src/colorIcons.ts` 这类非 core 文件。
+
+    > **措辞收紧（2026-09-16，独立验证暴露）**：本条原写作「`core/*.ts` 保持
+    > 零 vscode 依赖、零 IO」，容易被读成对**整个** `src/core/` 的通则 ——
+    > 验证时就是这么读的，于是 `core/store.ts` 的
+    > `import * as fs from 'fs/promises'`（**0.1.8 起就有**，`EntryStore` 本就是
+    > 持久化适配层）被判成「不满足」。
+    > **判据要分开**：`grep -rn "vscode" src/core/` 必须**无输出**（这条对本轮
+    > 整个 `core/` 成立，已验证）；而「零 IO」只约束本轮新增的那三个纯模块。
+    > 真正要防的是「把 vscode 拖进 core」—— 那会让这些模块无法脱离编辑器单测；
+    > 一个持久化适配层 import `fs/promises` 不在此列（`node:` 内建不影响单测）。
 15. **`reconcileBinding` 与 `core/reconcile.ts` 不改**：三分支（观测不到 →
     不动 / `live === liveSessionId` → 不动 / 否则两者都写）逐槽生效，
     手动改绑保护与空串守卫生效范围不变。（§8.1）
@@ -936,6 +946,17 @@ async removeSession(entryId: string, sessionId: string): Promise<void>;
 清掉；③ `deleteEntry` 改成不杀 tmux；④ `folderSelectionState` 里把空数组
 判成 `'all'`。
 
+#### 跑 harness 的两条操作纪律（2026-09-16 独立验证实测，都是踩过的坑）
+
+1. **必须独占运行，同一时刻只能有一个 e2e 实例。** harness 用固定的 scratch
+   目录、固定的 tmux 会话名前缀（`tmuxterm-e2e*`）与假 HOME，两个实例并发会
+   互相串扰，症状是**成片的前置条件失败**（「pane 前台是 claude」之类，实测
+   出现过 17 项）。看到成片前置条件失败时**先怀疑并发**，独占重跑一次再下结论。
+2. **裸跑 `node test/e2e-harness.js` 会读到陈旧的 `out/`。** 它自己不编译；
+   只有 `npm test` 与 `npm run e2e` 会在前面带一次 `npm run compile`。
+   做变异/复现时先 `npm run compile`，否则你验的是**上一次**编译的产物 ——
+   实测据此得到过两个与本次变异无关的失败，极易误判。
+
 ### 12.5 文档
 
 - `README.md`：`## 三个概念`（增「会话」）、`## 使用`、
@@ -974,3 +995,88 @@ async removeSession(entryId: string, sessionId: string): Promise<void>;
 
 （本节在实施完成后回填，记录与设计不符之处，沿用 v1 / v2 / tree-hierarchy /
 session-identity 的做法。）
+
+### 14.1 本设计自身的缺陷（实施中暴露，均已修，见各自提交）
+
+**这一批有个共同形状，值得单独记一笔：它们全是「v2 里成立、v3 里不成立」的
+隐含假设 ——「一个条目 = 一个行为主体，条目内部不会自己跟自己抢」。**
+该假设在 v2（一条目一会话）恒真，在 v3（一条目 N 会话）**无任何东西保证**，
+而依赖它的三处代码在失效时**全部是静默的**（不报错、不写日志、测试全绿）。
+落点已立成不变量 §11.17。
+
+| # | 缺陷 | 后果 | 修法 |
+|---|---|---|---|
+| 1 | §7.4 自相矛盾：既说「新槽无 `conversationId`」又给 `addSession(entry.id, {id})` | 「+ 然后点开」落进未绑定路径，被兜底 D **静默 `--resume`** 该 cwd 下 mtime 最新的对话，而不是开新对话 | 新槽一出生就分配一个「还没有 `.jsonl`」的 `conversationId`（与 `addEntryInteractive` 同路径） |
+| 2 | §11.16 的论证在多会话下失效：D 靠「该 cwd 下只有一个**条目**」排除竞争者，而竞争者可以来自**同一个条目** | 老条目的未绑定槽 + 同终端另一个正在写对话 C 的槽 → 点前者时判据 (a) 成立 → D 把两者接到同一条 `.jsonl` 上（**两个 claude 同写一份**） | 加判据 (b)：候选必须**无主**（`ownersOf`），有主则退回弹框 |
+| 3 | `pickConversation` 的归属判据仍按**条目 id** 摊平 + 按条目 id 跳过自己 | 同一终端的槽**彼此全被跳过** → 「已绑给「X」」标记与二次确认**静默消失** → 用户能把第二个槽绑到兄弟槽正在写的对话上 | 摊平与跳过自己都改用**槽 id**（判据 (b) 同款） |
+| 4 | §5.4 要求「`extension.ts` 两处都调」迁移备份，**派发时漏了这条** | `migrateAndBackupV2()` 只被测试直接调过，**生产路径从没接线** → 升级时不生成 `<file>.v2.bak`，用户拿不到「升级前的原文」备份 | 补接线（T6b）。⚠ 这一处**写文档时才被发现**：T6 按 SPEC 写「升级会生成 `.v2.bak`」，把实现缺口照了出来 |
+
+**第 4 条的元教训**：`manifest.test.ts` 里已有一条同型断言（「声明的配置项从未
+被读取」），本轮顺手补了一条「`EntryStore` 的每个迁移入口都必须在 `extension.ts`
+里有调用点」。**「防御性设施写好了却没人调用」是单元测试天然看不见的一类 bug**
+—— 方法本身被测得全绿，e2e 也直接调它，只有接线层断言抓得住。
+
+### 14.2 与设计的实施偏差
+
+| # | 偏差 | 理由 |
+|---|---|---|
+| 1 | **profile 用纯文本 `直连`/`中转`，不是需求原文的 codicon 小图标** | 查证结论：`TreeItem.description` 不支持 codicon（写 `'$(plug)'` 会原样显示）；在标签里渲染 codicon 需要 `MarkdownString` label，那是 VS Code **1.106+** API，而 `engines.vscode` 是 `^1.85.0` —— 用它必须抬高下限、老版本用户**完全装不上**，比「图标退化成文字」严重。改回图标是一处 3 行改动（见 §6.2 / §13）。**已列给用户复核。** |
+| 2 | 兜底 D 收紧后，老条目可能比今天**多弹一次选择框** | 判据 (b) 的直接代价：该 cwd 最新对话若已被别的槽绑着，D 不再自动采用。按本仓库一贯取舍（宁可多问一次，绝不猜）。见 §13。 |
+| 3 | T1 里 `src/extension.ts` 被迫改 1 行 | `openEntry` → `openSession` 改名后，`extension.ts:246` 是唯一调用点，不改编译不过。原计划以为「extension.ts 零改动」，那个前提只对 `conversationId` 的读取成立，对**改名**不成立。 |
+| 4 | T1 临时让「新建/复制的槽 id 借用条目 id」，T2 收掉改回 `newId()` | T1 里 `extension.ts` 被冻结、仍按条目 id 派生会话名，而 `tree.ts` 已改按槽 id —— 两者必须指同一个会话，否则复制品的活动图标永远不采样。T2 让 `extension.ts` 也走槽 id 后这层耦合不再需要。 |
+| 5 | T1 顺带修了 `ownersOf` 的调用点 | `TerminalEntry` 结构上仍满足 `BindingView`（`conversationId` 可选），所以**编译不报错**，但每个条目的 `conversationId` 都读到 `undefined` —— 「已绑给「X」」与二次确认**静默失效**。属缺陷 3 的同族。 |
+| 6 | T1 里 e2e 的三个假 store 补了 `updateSession`，且 6e 竞态用例的**延时注入从 `store.update` 挪到 `store.updateSession`** | 不补则 `writeBinding` 一进去就抛，症状伪装成「绑定没刷成」；钩子挂错方法则那一节**什么都没验**。 |
+| 7 | T3 里 e2e 第 18/20 节是**重写**而非「只加两条用例」 | 它们直接 import 被删的 `TaskTreeItem`、并断言「没有任务名 ⇒ 不生成三级」——后者正是本轮推翻的前提。重写后判别力只增不减（11 条退役断言的语义全部被更强的对应断言取代，详见提交 `b95715a`）。 |
+| 8 | T3 顺带把 `killSession` 的标题改成「关闭该终端下全部会话」 | SPEC §3.3 第 4 条与 §7.1 矩阵本就要求；命令 ID 未动，不破坏既有 keybinding。 |
+| 9 | T4 里 `BatchTreeItem` 的 `shortPath` 参数被删除 | 扁平列表没了，行描述改显示 profile；`shortLabels` 随之在生产代码里不再被调用，但**函数与其单测保留不删**（§13 取舍）。 |
+| 10 | T5 是**空提交**，已由主线撤销 | 覆盖度审计结论是「缺口 0」、无文件需要改，故 plan 给的提交无事可提。零 diff 的提交留在发布历史里是噪音。 |
+| 11 | 计划里 Task 5 的范围被改写 | 原写的「补齐 SPEC §12.4 用例」已被 Task 2/2b/2c/3/4 吸收完；改成「按 §12.1~§12.3 逐条审计覆盖度 + 审计『预期不改』的测试文件 + 补跑剩余三处变异」，更有价值。 |
+| 12 | 计划 Task 4 的 Expected 有一条笔误（`batchFolder` 要在 `package.json` 出现） | 命令 id 是 `batchToggleFolder`，**不含**子串 `batchFolder`。要命中只能改命令 id（违反 §7.1）或给它挂菜单项（打破 manifest 的 `viewItem` 恰等断言）。已在计划里订正。 |
+| 13 | §11.14 的措辞被收紧 | 原文「`core/*.ts` 保持零 vscode 依赖、零 IO」被独立验证读成对**整个** `src/core/` 的通则，于是 `core/store.ts` 的 `import fs`（**0.1.8 起就有**，`EntryStore` 本就是持久化适配层）被判「不满足」。判据已拆开：`vscode` 那半对整个 `core/` 成立；「零 IO」只约束本轮新增的三个纯模块。 |
+
+### 14.3 独立验证结论（2026-09-16）
+
+- 构建：`npm run compile` 零错误（`strict: true`）。
+- `npm test` → **489 passing / 0 failing**。
+- `npm run e2e` → **265 ✓ / 0 ✗**，独占运行、连跑两次一致。
+- 12 条承重不变量：11 条满足（附 文件:行号），1 条（§11.14 字面口径）为
+  **检查项措辞问题**，非代码缺陷 —— 见 14.2 第 13 条。
+- 7 条原始需求：逐条判定**已实现**。
+- 5 处变异全部让**具名断言**变红（M5 重现「归属判据退回条目 id」→ e2e 14 项
+  失败，含 `6g` 全部 4 条），证明这些断言真的在钉语义而非恒真。
+
+### 14.4 测试基建缺陷：harness 在中断路径上**必然**漏夹具
+
+**现象（实测踩了两次）**：e2e 被中断（进程被杀 / 工具超时 / 提前 abort）后，
+它建的夹具会话会**全部留在用户的 tmux server 上**。实测一次漏 19 个
+（`tmuxterm-e2e{alive001,dead0001,fresh001,legacy01,legacye1,legacyn1,lost0001,new0001,racea001,raceb001,share0001,shell001,sibslotb1,toctou001,conflict1,nobind01,resfail1,restart1,stale01,stale02,stale03}` 等），
+而同一台 server 上还跑着用户**真实的 11 个终端**（`tmuxterm-1942d99d7238` 等，
+均为 attached）。它们同前缀 `tmuxterm-`，所以「清理」这一步本身就有误伤风险。
+
+**根因（读代码确认）**：`test/e2e-harness.js`（2834 行）里
+
+- **`process.on(...)` 注册数 = 0** —— 没有任何 `exit` / `SIGINT` / `SIGTERM`
+  / `unhandledRejection` 兜底；
+- **没有 `cleanup()` 函数** —— 夹具销毁是**内联写在最后一节**（第 15 节「清理 +
+  用户环境未被触碰」）里的，之后才 `process.exit(fail ? 1 : 0)`（`:2829`）；
+- 于是**只要没跑到最后一节**（被杀、超时、崩溃、提前返回），夹具就一个都不会被清。
+
+**为什么值得修而不是只记一笔**：这个 harness 是**每次验证都要跑**的东西，
+而它跑在**用户真实的 tmux server** 上。每中断一次就往用户的 server 里丢一批
+垃圾会话，且与用户的真实会话同前缀 —— 清理时稍有不慎就会误杀用户正在用的终端
+（本仓库 `core/tmux.ts` 顶部那条「tmux 目标名默认做前缀匹配」的实测教训，
+在这里以另一种形式重现）。**一次性的补救是 `tmux kill-session -t '=tmuxterm-e2e…'`
+（必须带 `=`，否则前缀匹配可能命中无关会话）；结构性的补救是给 harness 加一个
+进程级兜底**（同步版 `execFileSync('tmux', ['kill-session', ...])`，只扫
+`^tmuxterm-e2e` 前缀的名字，在 `exit` 与 `SIGINT`/`SIGTERM` 上都挂一次）。
+
+> **清理时的安全判据**：只认 `^tmuxterm-e2e` 这一条前缀。用户真实会话的形态是
+> `tmuxterm-<12 位十六进制>`，**不会**命中该前缀（`e1558e3e6065` 以 `e1` 开头，
+> 不是 `e2e`）。清理后必须复核 `tmux ls` 只剩用户那批，且它们仍是 `attached`。
+
+### 14.5 遗留
+
+- **`pickConversation` 的归属判据只有 e2e 覆盖，没有单测**：`terminalManager.ts`
+  没有对应的 unit test，那扇门开在 e2e 一侧。覆盖是实的（M5 证明），
+  但若将来 `terminalManager` 要拆出纯函数，这是第一个该搬进 `core/` 的判据。
+- 三级不做拖拽排序（§13）；`shortLabels` 在生产代码里已无调用者（§13）。
