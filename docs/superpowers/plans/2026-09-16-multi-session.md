@@ -305,6 +305,64 @@ fix: 新会话槽预分配对话 id；兜底 D 不再采用已被占用的对话
 
 ---
 
+## Task 2c — 归属判据的第三处：`pickConversation` 也必须按槽 id 摊平
+
+Task 2b 修好了兜底 D，但它在 `pickConversation` 旁边留下了一句**与事实不符**的
+注释：「同一个终端下的多个槽绑的是不同对话，它们之间不存在『争同一条』」。
+**这句是错的** —— 没有任何东西阻止两个槽绑同一条对话（用户手动选就能做到）。
+按**条目 id** 摊平 + 按条目 id 跳过自己，会让兄弟槽**彼此全被跳过**，于是
+「已绑给「X」」标记与二次确认**静默消失**，用户可以把第二个槽绑到兄弟槽正在
+写的对话上（两个 claude 同写一条 `.jsonl`，正是 `ownersOf` 那套机制存在的
+唯一理由）。见 SPEC §11.17（本条新增的不变量）。
+
+### 文件
+- `src/terminalManager.ts`
+- `test/e2e-harness.js`
+
+### 步骤
+
+1. **`pickConversation` 摊平改用槽 id、跳过自己也用槽 id**：
+   - 视角：`{ id: slot.id, name: entry.name, conversationId: slot.conversationId }`
+     （`name` 仍是**终端名** —— 归属标签要显示的是它）
+   - `ownersOf(views, slot.id)`
+   - 因此 `pickConversation` 需要多一个 `slot` 参数（见下）
+2. **`bindConversationInteractive(entry, slot)`** 多一个槽参数并透传给
+   `pickConversation`。这次签名改动是 Task 3 的前置（Task 3 要在
+   `extension.ts` 里按三级节点传槽）。
+3. 顺手对齐一处文案：`killSession` 的模态按钮仍是 `杀掉`，而它的提示语已改成
+   「关闭该终端下全部会话」。把按钮与判断串一起改成 `关闭`，并同步更新
+   `test/e2e-harness.js` 里驱动它的 `modalAnswer`。**只改这个字符串，
+   §13 那节的断言（前缀安全）一条都不许动。**
+4. 测试（**核心回归**）：构造「条目 E 的槽 s1 绑着对话 C，用户为同条目的槽 s2
+   打开选择框」→ 断言
+   ① 候选列表里 **C 被标出「已绑给「E」」**（改前不会出现）；
+   ② 选中 C 时**弹出二次确认**，拒绝确认则**绑定未改动、什么都没启动**。
+
+### Expected
+- `npm test` 全绿、用例数不减。
+- `npm run e2e` 全绿、断言数 **> 221**。
+- `grep -n "ownersOf" -A 6 src/terminalManager.ts` 里，**两处**摊平都用
+  `s.id`/`slot.id` 作为视角 id（`e.id` 不再出现在摊平的 id 位上）。
+- **变异确认**：把 `pickConversation` 的视角 id 换回 `e.id`（条目 id）→
+  新增的 ①/② 用例必须变红。贴出证据后回退。
+
+### 提交
+
+```
+fix: 选择对话的归属判据按槽 id 摊平（兄弟槽也算法占用者）
+
+pickConversation 沿用「按条目 id 摊平 + 按条目 id 跳过自己」的写法，
+其隐含前提「一个条目内部不会自己跟自己抢」在 v2 成立、在 v3 不成立：
+同一个终端的两个槽可以争同一条对话。按条目跳过自己会让兄弟槽彼此
+全被跳过，于是「已绑给「X」」标记与二次确认静默消失 —— 用户能把第二个
+槽绑到兄弟槽正在写的 .jsonl 上，两个 claude 同写一份。
+
+同为「一个条目 = 一个行为主体」这个已被推翻的假设的第三处落点（前两处
+是兜底 D 与 addSessionInteractive 的 conversationId）。
+```
+
+---
+
 ## Task 3 — 主树渲染 + 颜色图标 + 命令/菜单接线
 
 **这一步必须整块落地**：`tree.ts` 的 `contextValue` 与 `package.json` 的
