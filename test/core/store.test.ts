@@ -360,6 +360,22 @@ describe('EntryStore.addSession', () => {
     await s.addSession('nope', { id: 'sx' });
     assert.strictEqual(fs.readFileSync(f, 'utf8'), before);
   });
+
+  it('★ 调用方预分配的 conversationId 原样落盘（「+」新建的槽一出生就带着它）', async () => {
+    const { s } = fileWith([{ id: 's1', order: 0 }]);
+    await s.addSession('e1', { id: 's2', conversationId: 'conv-new' });
+    const added = (await s.load())[0].sessions.find((x) => x.id === 's2');
+    assert.strictEqual(added?.conversationId, 'conv-new');
+  });
+
+  it('新槽上没有 liveSessionId —— 预分配的是「还没有 .jsonl」的 id，不是已观测值', async () => {
+    const { s } = fileWith([{ id: 's1', order: 0, liveSessionId: 'conv-observed' }]);
+    await s.addSession('e1', { id: 's2', conversationId: 'conv-new' });
+    const loaded = (await s.load())[0].sessions;
+    assert.strictEqual(loaded.find((x) => x.id === 's2')?.liveSessionId, undefined);
+    assert.strictEqual(loaded.find((x) => x.id === 's1')?.liveSessionId, 'conv-observed',
+      '既有槽的观测值不受影响');
+  });
 });
 
 describe('EntryStore.removeSession', () => {

@@ -296,6 +296,48 @@ describe('ownersOf —— 哪些对话已经被别的条目绑走', () => {
   });
 });
 
+describe('ownersOf 用在兜底 D 的占用判据上（SPEC §11.16）：摊平必须用**槽**视角', () => {
+  /**
+   * 把清单摊平成「一条槽一份视角」—— 与 resolveLaunchSpec 的兜底 D 同形。
+   * id 取**槽** id（不是条目 id）：ownersOf 的「跳过自己」只按传入的 selfId
+   * 生效，而 D 要的正是「同一个条目下的兄弟槽算占用者」。
+   */
+  const viewsOfSlots = (
+    entries: { id: string; name: string; sessions: { id: string; conversationId?: string }[] }[],
+  ) => entries.flatMap((e) =>
+    e.sessions.map((s) => ({ id: s.id, name: e.name, conversationId: s.conversationId })));
+
+  it('★ 兄弟槽绑着的对话算「有主」（否则 D 会让两个槽 --resume 同一条 .jsonl）', () => {
+    const owners = ownersOf(
+      viewsOfSlots([{
+        id: 'E', name: '终端',
+        sessions: [
+          { id: 's1' },                      // 要点开的、未绑定的老槽
+          { id: 's2', conversationId: 'C' },  // 兄弟槽正在写 C
+        ],
+      }]),
+      's1',
+    );
+    assert.strictEqual(owners.has('C'), true, '有主 → D 必须让位给选择框');
+    assert.strictEqual(owners.get('C'), '终端');
+  });
+
+  it('自己绑着的那条不算有主（selfId 是槽 id，不是条目 id）', () => {
+    const owners = ownersOf(
+      viewsOfSlots([{ id: 'E', name: '终端', sessions: [{ id: 's1', conversationId: 'C' }] }]),
+      's1',
+    );
+    assert.strictEqual(owners.has('C'), false);
+  });
+
+  it('★ 若按条目 id 摊平（pickConversation 那份写法），兄弟槽会被一并跳过 → 判据静默失效', () => {
+    // 记录这个坑：写成「条目 id 视角 + 条目 id 当 selfId」不会报错，
+    // 只会让 (b) 永远判「无主」，退回今天的行为。
+    const entryViews = [{ id: 'E', name: '终端', conversationId: 'C' }];
+    assert.strictEqual(ownersOf(entryViews, 'E').has('C'), false);
+  });
+});
+
 describe('formatCandidateWithOwner —— 选择框里标注归属', () => {
   it('没人绑过时与普通行完全一致', () => {
     assert.strictEqual(formatCandidateWithOwner(c()), formatCandidate(c()));
