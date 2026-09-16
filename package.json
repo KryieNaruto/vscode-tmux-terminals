@@ -153,6 +153,10 @@
       {
         "command": "tmuxTerminals.batchToggle",
         "title": "切换选中（内部）"
+      },
+      {
+        "command": "tmuxTerminals.batchToggleFolder",
+        "title": "切换文件夹选中（内部）"
       }
     ],
     "menus": {
@@ -268,6 +272,10 @@
       "commandPalette": [
         {
           "command": "tmuxTerminals.batchToggle",
+          "when": "false"
+        },
+        {
+          "command": "tmuxTerminals.batchToggleFolder",
           "when": "false"
         }
       ]
