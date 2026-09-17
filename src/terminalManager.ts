@@ -1035,10 +1035,18 @@ export class TerminalManager {
     return isClaudeCommand(await this.tmux.currentCommand(session));
   }
 
-  /** 拒绝执行并说明原因。绝不静默跳过、绝不盲发。 */
-  private refuse(entry: TerminalEntry, what: string): void {
+  /**
+   * 拒绝执行并说明原因。绝不静默跳过、绝不盲发。
+   *
+   * **必须点名 `slots`**：三级点击会转发到整个条目（spec §7.5），错误提示
+   * 若只报 `entry.name` 会让用户以为自己点错了对象——实测用户点的正是一个
+   * 健康的三级会话，却因为**兄弟**会话前台不是 claude 而看到「不是 claude」
+   * 的拒绝提示，非常困惑。点名第几个会话，才对得上用户实际点的是谁。
+   */
+  private refuse(entry: TerminalEntry, what: string, slots: SessionSlot[]): void {
+    const who = slots.map((s) => this.slotLabel(entry, s)).join('、');
     void vscode.window.showErrorMessage(
-      `「${entry.name}」当前前台进程不是 claude，已拒绝${what}。` +
+      `「${entry.name}」的${who}当前前台进程不是 claude，已拒绝${what}。` +
       `请先在该终端里退出正在运行的程序（或直接杀掉会话），再试。`,
     );
   }
@@ -1084,7 +1092,7 @@ export class TerminalManager {
       return false;
     }
     if (!(await this.canSendControl(session))) {
-      this.refuse(entry, '重启 claude');
+      this.refuse(entry, '重启 claude', [slot]);
       return false;
     }
 
@@ -1128,7 +1136,51 @@ export class TerminalManager {
    * 配置、提示下次启动生效。
    */
   /**
-   * 返回 false 表示被安全守卫拒绝，未改动配置；true 表示已成功应用。
+   * 把一批存活槽按「前台是不是 claude」分流。
+   *
+   * 这是本次修复的核心：过去 applyModel/applyProfile 对 `alive` 槽做的是
+   * 「任一个不合格就整体拒绝、一个都不改」的全有全无判断 —— 而 `alive`
+   * 只代表「tmux 会话还在」，不代表「claude 还在跑」（用户 `/exit`、崩溃都
+   * 会让会话活着但前台变回 bash）。三级点击按 spec §7.5 转发到整个条目，
+   * 于是「点的明明是健康的第 3 个会话，却因为兄弟会话的 bash 被整体拒绝」——
+   * 实测三个条目、每个都恰好一个槽已经退回 bash，导致这三个条目的切模型/切
+   * profile 100% 被拒绝。
+   *
+   * 修复后只**跳过**前台不是 claude 的槽（不碰它、不算失败），只处理真正在
+   * 跑 claude 的槽 —— spec §7.5「转发到整个条目」的语义不变，变的只是
+   * 「一个坏会话不再拖累其余健康会话」。
+   */
+  private async partitionByForeground(
+    alive: readonly SessionSlot[],
+  ): Promise<{ eligible: SessionSlot[]; skipped: SessionSlot[] }> {
+    const eligible: SessionSlot[] = [];
+    const skipped: SessionSlot[] = [];
+    for (const slot of alive) {
+      if (await this.canSendControl(sessionNameFor(slot.id))) {
+        eligible.push(slot);
+      } else {
+        skipped.push(slot);
+      }
+    }
+    return { eligible, skipped };
+  }
+
+  /**
+   * 有槽被跳过时告知用户「跳过了第几个、为什么」—— 不能只报 `entry.name`，
+   * 否则用户会以为整个操作对象搞错了（本次修复要解决的困惑正是这个）。
+   * 只在**确有**跳过时调用；全部健康时保持原有的安静成功，不额外弹窗。
+   */
+  private notifySkipped(entry: TerminalEntry, skipped: SessionSlot[], doneCount: number, what: string): void {
+    if (skipped.length === 0) return;
+    const who = skipped.map((s) => this.slotLabel(entry, s)).join('、');
+    void vscode.window.showInformationMessage(
+      `「${entry.name}」的${who}未在跑 claude，已跳过；其余 ${doneCount} 个会话已${what}。`,
+    );
+  }
+
+  /**
+   * 返回 false 表示被安全守卫拒绝，未改动配置；true 表示已成功应用
+   * （即使部分槽因未在跑 claude 而被跳过，只要至少有一个健康槽被处理）。
    * 注意「目标模型无法确定」（清空且读不到 profile 默认）**不是**失败：
    * 它照常落配置、返回 true，只是推迟到下次启动生效。
    * 与 restartClaude 一样用布尔回报结果，供批量套用据此统计
@@ -1159,15 +1211,6 @@ export class TerminalManager {
       return true;
     }
 
-    // 安全闸门对**每一个**存活槽都过一遍，且**都在发送之前**：只切一半会让
-    // 用户以为切好了，而实际上还有会话跑在旧模型上 —— 那种不一致比整体拒绝
-    // 更难排查。任一个不合格就整体拒绝、不改配置（与从前单会话时的语义一致）。
-    for (const slot of alive) {
-      if (!(await this.canSendControl(sessionNameFor(slot.id)))) {
-        this.refuse(entry, '切模型');
-        return false;
-      }
-    }
     // 控制字符会把一行 `/model x` 拆成两条输入：`sendLiteral` 不解释 `\n`，
     // 但终端把它当回车 —— 第二行会作为新的键盘输入打进活着的会话。模型名
     // 来自 settings.json，手改就可能带上换行。宁可拒绝，绝不盲发。
@@ -1177,12 +1220,24 @@ export class TerminalManager {
       );
       return false;
     }
-    for (const slot of alive) {
+
+    // 只对**前台确实是 claude** 的槽发 /model；bash 之类的跳过、不算失败。
+    const { eligible, skipped } = await this.partitionByForeground(alive);
+
+    // 一个健康槽都没有：与「全都不合格」等价，维持整体拒绝、不落配置 ——
+    // 这与「跳过一部分」不同，属于「整体确实做不了」。
+    if (eligible.length === 0) {
+      this.refuse(entry, '切模型', skipped);
+      return false;
+    }
+
+    for (const slot of eligible) {
       const session = sessionNameFor(slot.id);
       await this.tmux.sendLiteral(session, `/model ${target}`);
       await this.tmux.sendEnter(session);
     }
     await this.store.update(entry.id, { model: normalized });
+    this.notifySkipped(entry, skipped, eligible.length, '切模型');
     return true;
   }
 
@@ -1202,16 +1257,29 @@ export class TerminalManager {
    */
   /**
    * 返回 false 表示被安全守卫拒绝（或重启失败），未改动配置；true 表示
-   * 已切换成功。profile 未变时返回 true（无事可做，不算失败）。
+   * 已切换成功（即使部分槽因未在跑 claude 而被跳过，只要至少有一个健康槽
+   * 被处理）。profile 未变时返回 true（无事可做，不算失败）。
    */
   async applyProfile(entry: TerminalEntry, profile: Profile): Promise<boolean> {
     if (entry.profile === profile) return true;
     // 只有存活的槽需要重启；一个都没有就直接落配置。
     const alive = await this.aliveSlots(entry);
 
-    for (const slot of alive) {
+    // 只重启**前台确实是 claude** 的槽；bash 之类的跳过、不重启、不算失败 ——
+    // 与 applyModel 同一套分流逻辑（见 partitionByForeground 上的注释）。
+    const { eligible, skipped } = await this.partitionByForeground(alive);
+
+    // 一个健康槽都没有：与「全都不合格」等价，维持整体拒绝、不落配置。
+    if (alive.length > 0 && eligible.length === 0) {
+      this.refuse(entry, '切换直连/中转', skipped);
+      return false;
+    }
+
+    for (const slot of eligible) {
       const ok = await this.restartClaude(entry, slot, { ...entry, profile, model: undefined });
-      // 被拒绝时不动配置。**中途失败也整体不落配置**：已经重启过的槽接回的是
+      // 这里的失败是「真正尝试重启的健康槽自己失败了」（没绑定对话、重启后
+      // 没能等到 shell 等）——与「因前台不是 claude 而跳过」是两回事，不能
+      // 混在一起判断。**中途失败仍整体不落配置**：已经重启过的槽接回的是
       // 各自的对话、配置没变，还是旧 profile —— 与「什么都没发生」自洽；
       // 若这时落配置，树显示新 profile 而部分会话仍跑旧端点，反而对不上。
       if (!ok) return false;
@@ -1220,6 +1288,7 @@ export class TerminalManager {
     // model（ccr 命名空间，如 deepseek-*）残留 —— 启动命令会带着无效的
     // --model，冷启动随即失败。清空才与新 profile 的命名空间一致。
     await this.store.update(entry.id, { profile, model: undefined });
+    this.notifySkipped(entry, skipped, eligible.length, '切换到新 profile');
     return true;
   }
 
