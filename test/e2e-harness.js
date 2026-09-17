@@ -102,6 +102,20 @@ const calls = {
   quickPickShapeViolations: [], inputBoxes: [],
 };
 
+/**
+ * `activate()` 注册进来的命令处理器，键是命令 ID。
+ *
+ * **为什么必须捕获而不是丢弃**：在此之前这个 stub 的 `registerCommand` 是
+ * 空实现，于是「命令 ID → 哪个方法」这一层**从来没有被任何用例碰过** ——
+ * 所有用例都是直接调 `manager.xxx()`，命令那一层只是 package.json 与
+ * `extension.ts` 的静态一致性检查（test/manifest.test.ts）在管。而静态检查
+ * 只能证明「声明过的都注册了」，证明不了「注册的处理器没接错」：把二级 `+`
+ * 接到会问目录的那条路径上，静态检查照样全绿。§32 用真命令补上这一层。
+ */
+const registeredCommands = {};
+/** `createTreeView` 收到的选项，键是视图 id（§32 要从这里拿到真 provider）。 */
+const treeViews = {};
+
 // 让某一节可以控制下一个 modal / QuickPick / InputBox 弹窗的应答；
 // 三者默认都是 undefined（= 用户取消 / 没输入）。
 let modalAnswer;
@@ -194,6 +208,17 @@ const vscodeStub = {
     // openEntry 的候选面板守卫会读 window.terminals。它是可变数组：
     // 某一节可往里塞「陈旧面板」再清空（见第 11 节）。默认空。
     terminals: [],
+    // 只有 §32 会走到（它要真跑一次 activate()）。`extension.ts` 建完视图后
+    // 挂了 onDidChangeVisibility / onDidExpandElement / onDidCollapseElement
+    // 三个订阅，少一个 activate 就抛 —— 所以这里必须给全，哪怕测试用不上。
+    createTreeView(id, opts) {
+      treeViews[id] = opts;
+      const sub = () => ({ dispose() {} });
+      return {
+        dispose() {}, onDidChangeVisibility: sub, onDidExpandElement: sub,
+        onDidCollapseElement: sub,
+      };
+    },
     createTerminal(opts) {
       const t = {
         name: opts && opts.name,
@@ -254,7 +279,10 @@ const vscodeStub = {
     getConfiguration() { return { get: (_k, d) => d }; },
     onDidChangeConfiguration() { return { dispose() {} }; },
   },
-  commands: { registerCommand() { return { dispose() {} }; } },
+  commands: {
+    registerCommand(id, fn) { registeredCommands[id] = fn; return { dispose() {} }; },
+    executeCommand() { return Promise.resolve(); },
+  },
   Disposable: class { constructor(fn) { this.fn = fn; } dispose() { this.fn && this.fn(); } },
 };
 
@@ -2391,7 +2419,7 @@ async function projectSnapshot() {
       added.liveSessionId === undefined, String(added.liveSessionId));
   }
 
-  console.log('\n=== 25. 新建条目：带 1 个会话槽；一级 + 的 cwd 预填且可改（判断 B） ===');
+  console.log('\n=== 25. 新建条目（标题栏 +）：带 1 个会话槽；cwd 预填且可改 ===');
   {
     const CWD = '/tmp/tmuxterm-e2e-folder';
     store.entries.push(mk('e2ekeep0001', 'KEEP', SCRATCH));
@@ -2414,7 +2442,7 @@ async function projectSnapshot() {
     quickPickAnswer = undefined;
 
     const cwdPick = calls.quickPicks.find((q) => String(q.opts.title).startsWith('远程目录'));
-    chk('25a ★ 一级 + 把该文件夹的 cwd 当作**可改的**预填（placeHolder）',
+    chk('25a ★ 标题栏 + 把 cwd 当作**可改的**预填（placeHolder）—— 一级 + 不再走这条路，见 §32',
       !!cwdPick && cwdPick.opts.placeHolder === CWD,
       JSON.stringify(calls.quickPicks.map((q) => [q.opts.title, q.opts.placeHolder])));
 
@@ -2571,11 +2599,13 @@ async function projectSnapshot() {
 
     resetCalls();
     const mgr = newManager();
-    // 大写预设色：写进清单的必须是归一化后的小写
-    quickPickAnswer = '#46A758';
+    // 候选项现在是 `QuickPickItem`（每项带一个色块 iconPath），不再是裸字符串，
+    // 所以必须按 label 回选那一项：直接塞一个字符串进去，处理器读 `pick.label`
+    // 会拿到 undefined。label 就是归一化后的 hex（`colorChoices` 的契约）。
+    quickPickAnswer = (items) => items.find((i) => i.label === '#46a758');
     await mgr.setColorInteractive(fresh(id));
     quickPickAnswer = undefined;
-    chk('29a ★ 预设色以归一化的小写 hex 落盘', fresh(id).color === '#46a758',
+    chk('29a ★ 选中预设项 → 落盘的就是该项的 hex（归一化后的小写）', fresh(id).color === '#46a758',
       String(fresh(id).color));
 
     // 自定义：末项才是「自定义…」
@@ -2681,7 +2711,8 @@ async function projectSnapshot() {
     ALL.push(id);
     store.entries.push(mk(id, 'COLOR2', SCRATCH));
     const mgr = newManager();
-    quickPickAnswer = '#12A594';   // 大写预设色：落盘的必须是归一化后的小写
+    // 候选项是 QuickPickItem（见 §29a 的说明），按 label 回选那一项。
+    quickPickAnswer = (items) => items.find((i) => i.label === '#12a594');
     await mgr.setColorInteractive(fresh(id));
     quickPickAnswer = undefined;
     chk('30g ★ setColorInteractive 后 entry.color 是归一化的小写 hex',
@@ -2827,6 +2858,127 @@ async function projectSnapshot() {
           got.map((e) => e.id).sort().join(',') === 'b-a1,b-a3';
       })(),
       JSON.stringify(bp.entriesFor(bp.selectedIds()).map((e) => e.id)));
+  }
+
+  console.log('\n=== 32. 命令接线层：真 activate() + 真命令处理器 ===');
+  {
+    // 这一节补的是**唯一一处从没被覆盖过的层**：`extension.ts` 里
+    // `registerCommand(id, fn)` 那一步 —— 命令 ID 究竟接到了哪个方法上。
+    //
+    // 在此之前，全套用例（含 §24「二级 + 零弹框」）都是直接调 `manager.xxx()`，
+    // 命令那一层只由 `test/manifest.test.ts` 的静态一致性检查（「声明过的都
+    // 注册了、注册过的都声明了」）看着。而静态检查**证明不了接线接对了**：
+    // 把二级 `+` 接到 `addEntryInteractive`（会问目录）那条路径上，
+    // 静态检查照样全绿。用户实测报回来的「点 + 还在问工作路径」正是这一层
+    // 的症状，所以这一节必须跑**真命令**。
+    //
+    // 为什么不能只调 manager：命令 ID → 处理器的映射是在 `activate()` 里建立
+    // 的，跳过 activate 就等于把被测对象换成了别的东西。
+    const STORAGE = '/tmp/tmuxterm-e2e-ext-storage';
+    await fs.promises.rm(STORAGE, { recursive: true, force: true });
+    await fs.promises.mkdir(STORAGE, { recursive: true });
+
+    const { EntryStore: RealStore } = require(path.join(ROOT, 'out/src/core/store.js'));
+    const { PRESET_COLORS } = require(path.join(ROOT, 'out/src/core/colors.js'));
+    const ext = require(path.join(ROOT, 'out/src/extension.js'));
+
+    const context = {
+      subscriptions: [],
+      globalStorageUri: { fsPath: STORAGE, path: STORAGE, scheme: 'file' },
+      extensionUri: { fsPath: ROOT, path: ROOT, scheme: 'file' },
+    };
+    ext.activate(context);
+    await sleep(50); // activate 尾部那几处 `void ...` 是异步的，给它们一拍
+
+    const provider = treeViews['tmuxTerminals.list'].treeDataProvider;
+    // activate() 用的是**真 store**（落到 STORAGE 下的临时文件），与本节之外的
+    // 那些假 store 是两套东西，不能混着读。
+    const realStore = new RealStore(path.join(STORAGE, 'terminals.json'));
+    const FOLDER_CWD = '/tmp/tmuxterm-e2e-folder-cwd';
+    await realStore.append({
+      id: 'e2ewire0001', name: 'WIRE', cwd: FOLDER_CWD, profile: 'ccr', autoRestore: false,
+      color: '#12a594',
+      sessions: [{ id: 'e2ewireslot1', conversationId: 'cccccccc-0001-0000-0000-000000000000', order: 0 }],
+    });
+
+    const folders = await provider.getChildren();
+    const entries = await provider.getChildren(folders[0]);
+    const entryNode = entries.find((e) => e.entry.id === 'e2ewire0001');
+    chk('32a ★ 二级节点的 contextValue 是 terminal（inline + 靠它匹配 menu 的 when）',
+      !!entryNode && entryNode.contextValue === 'terminal',
+      String(entryNode && entryNode.contextValue));
+
+    // ---- 32b~32c. 二级 + = addSession：一点就建，不问任何问题 ----
+    resetCalls();
+    await registeredCommands['tmuxTerminals.addSession'](entryNode);
+    const wired = (await realStore.load()).find((e) => e.id === 'e2ewire0001');
+    chk('32b ★★ 二级 + 走的是零弹框路径：选择框 / 输入框 / 提示框一个都没弹',
+      calls.quickPicks.length === 0 && calls.inputBoxes.length === 0 &&
+      calls.messages.length === 0 && calls.warns.length === 0,
+      JSON.stringify({
+        q: calls.quickPicks.map((x) => x.opts.title), i: calls.inputBoxes.map((x) => x.title),
+        m: calls.messages.length, w: calls.warns.length,
+      }));
+    chk('32c 二级 + 真的加了一个会话槽', !!wired && wired.sessions.length === 2,
+      String(wired && wired.sessions.length));
+
+    // ---- 32d~32f. 一级 + = 在此目录新建终端：**不再问目录** ----
+    // 这一条钉的就是用户报的那个症状。cwd 来自一级那一行本身，再问一次
+    // 等于让用户回答一个界面上已经写着的答案。
+    resetCalls();
+    inputBoxAnswer = (opts) => (opts.title === '终端名称' ? 'INFOLDER' : undefined);
+    quickPickAnswer = (items, opts) => (String(opts.title).includes('全部恢复') ? '否' : undefined);
+    await registeredCommands['tmuxTerminals.addInFolder'](folders[0]);
+    inputBoxAnswer = undefined;
+    quickPickAnswer = undefined;
+
+    const askedCwd = calls.quickPicks.some((x) => String(x.opts.title).startsWith('远程目录')) ||
+      calls.inputBoxes.some((x) => String(x.title) === '远程目录');
+    chk('32d ★★ 一级 + 不再问工作路径（既没有「远程目录」选择框，也没有同名输入框）',
+      !askedCwd,
+      JSON.stringify({ q: calls.quickPicks.map((x) => x.opts.title), i: calls.inputBoxes.map((x) => x.title) }));
+
+    const created = (await realStore.load()).find((e) => e.name === 'INFOLDER');
+    chk('32e ★ 新建条目直接继承该文件夹那一行的 cwd（原样，不归一化也不展开 ~）',
+      !!created && created.cwd === folders[0].cwd,
+      JSON.stringify({ got: created && created.cwd, want: folders[0].cwd }));
+    chk('32f 新建条目仍然带 1 个会话槽', !!created && created.sessions.length === 1,
+      String(created && created.sessions.length));
+
+    // ---- 32g~32i. 设置颜色：色块真的进了 QuickPick，且文件先落盘 ----
+    resetCalls();
+    quickPickAnswer = undefined; // 取消掉，这一节只看候选项长什么样
+    await registeredCommands['tmuxTerminals.setColor'](entryNode);
+    quickPickAnswer = undefined;
+
+    const colorPick = calls.quickPicks.find((x) => String(x.opts.title).startsWith('为「'));
+    const items = (colorPick && colorPick.items) || [];
+    const swatchDir = path.join(STORAGE, 'colors');
+    const presets = items.filter((i) => String(i.label).startsWith('#'));
+    const marked = items.filter((i) => i.description === '当前');
+
+    chk('32g ★★ 预设项每一项都带 iconPath，指向 <storage>/colors/<hex>.swatch.svg',
+      presets.length === PRESET_COLORS.length &&
+      presets.every((i) => !!i.iconPath &&
+        i.iconPath.fsPath === path.join(swatchDir, `${String(i.label).slice(1)}.swatch.svg`)),
+      JSON.stringify(items.map((i) => [i.label, i.iconPath && i.iconPath.fsPath])));
+    chk('32h ★ 当前色有可辨识标记（description「当前」+ picked），且恰好一项',
+      marked.length === 1 && marked[0].label === '#12a594' && marked[0].picked === true,
+      JSON.stringify(marked.map((i) => i.label)));
+
+    const swatchFile = path.join(swatchDir, '12a594.swatch.svg');
+    const swatchText = fs.existsSync(swatchFile) ? fs.readFileSync(swatchFile, 'utf8') : '';
+    chk('32i ★ 色块 SVG 在弹框**之前**就落了盘，内容是显式 fill 的方块（无 currentColor）',
+      swatchText.includes('fill="#12a594"') && swatchText.includes('width="12"') &&
+      !swatchText.includes('currentColor'),
+      swatchText || '(文件不存在)');
+
+    // 把 activate() 建的东西收掉：它起了存活轮询与活动轮询两个定时器，
+    // 不收就会在后面的清理节里继续跑。
+    for (const d of context.subscriptions) {
+      try { d.dispose(); } catch { /* 单个失败不影响其余 */ }
+    }
+    await fs.promises.rm(STORAGE, { recursive: true, force: true });
   }
 
   console.log('\n=== 15. 清理 + 用户环境未被触碰 ===');

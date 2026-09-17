@@ -68,3 +68,69 @@ export function colorBarSvg(color: string): string {
     + `<rect x="7" y="2" width="2" height="12" rx="1" fill="${color}"/>`
     + '</svg>';
 }
+
+/**
+ * 色块图标（16×16）的 SVG 文本，给 QuickPick 的**每一项**用。
+ *
+ * 为什么不复用 `colorBarSvg`：这两个图形解决的是两个问题。竖线是「二级行首
+ * 的窄条」，只有 2px 宽 —— 放在 QuickPick 行首时小得几乎看不出颜色；而选颜色
+ * 这一步恰恰要让人**一眼比出几个颜色**，得是一个够大的填充方块。所以这里自己
+ * 画一个 12×12 的圆角方块（x/y 各留 2px 当内边距），而不是把竖线拉宽。
+ *
+ * **必须写死显式 fill**，与 `colorBarSvg` 同一条实测教训：**绝不用
+ * `fill="currentColor"`** —— VS Code 把图标当 CSS mask 渲染，currentColor 在
+ * 那里解析不出颜色，结果是「图标占了位置但整个透明」，且不报任何错。
+ *
+ * **必须再描一圈边**：纯色块没有边界，在浅色/深色主题下都可能与背景糊在一起
+ * —— 用户自定义一个接近白色或接近黑色的 hex 时尤其明显。描边保证「这一项有
+ * 颜色」这件事在任何主题下都看得见。描边色用**不透明**的灰（`#808080`）：8 位
+ * 带 alpha 的写法（如 `#80808080`）在图标里不保证被支持，别赌它。
+ *
+ * 入参**必须是 `normalizeHexColor` 的产物**：这里刻意不校验也不做转义，理由与
+ * `colorBarSvg` 完全相同 —— 绕开它直接调用，等于把清单文件的内容原样拼进 SVG
+ * 属性。
+ */
+export function colorSwatchSvg(color: string): string {
+  // x/y=2 + width/height=12：四周各留 2px，方块不贴边；rx=3 是 16px 画布上
+  // 「看得出圆角但仍是方块」的取法。
+  return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
+    + `<rect x="2" y="2" width="12" height="12" rx="3" fill="${color}" stroke="#808080" stroke-width="1"/>`
+    + '</svg>';
+}
+
+/** 调色板里的一项：给 QuickPick 渲染用的**纯数据**，不含任何 vscode 类型。 */
+export interface ColorChoice {
+  /** 归一化后的小写 `#rrggbb`，同时也是 QuickPickItem 的 label。 */
+  hex: string;
+  /** 是不是「这个条目当前已选的颜色」。 */
+  current: boolean;
+}
+
+/**
+ * 预设色 + 「当前色」的调色板模型。
+ *
+ * 为什么要有这个纯函数：QuickPick 的项列表要同时表达「8 个预设」和「用户此刻
+ * 用的是哪个」两件事，直接写在 UI 层就会牵进 vscode 类型、没法单测。这里只产出
+ * **纯数据**，由 UI 层负责把它包装成 QuickPickItem（图标用 `colorSwatchSvg`）。
+ *
+ * 入参 `current` 先过 `normalizeHexColor`，**非法值不抛错**：清单文件可能被手改
+ * 成垃圾值，那种情况下「当作没有当前色」照常列出 8 个预设即可 —— 选颜色这个动作
+ * 不该因为一个坏值而整个打不开。
+ *
+ * 顺序规则：当前色**本身就在预设里**时保持 `PRESET_COLORS` 的原顺序（否则每次
+ * 打开选单，列表顺序都会随当前色跳来跳去）；当前色**是自定义 hex** 时把它插到
+ * 最前面再跟 8 个预设，这样「我现在的颜色」永远在列表第一行、一眼可见。
+ */
+export function colorChoices(current?: string): ColorChoice[] {
+  const normalized = current === undefined ? undefined : normalizeHexColor(current);
+  if (normalized === undefined) {
+    return PRESET_COLORS.map((hex) => ({ hex, current: false }));
+  }
+  if (PRESET_COLORS.indexOf(normalized) !== -1) {
+    return PRESET_COLORS.map((hex) => ({ hex, current: hex === normalized }));
+  }
+  return [
+    { hex: normalized, current: true },
+    ...PRESET_COLORS.map((hex) => ({ hex, current: false })),
+  ];
+}
