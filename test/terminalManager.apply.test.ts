@@ -18,7 +18,9 @@ import { messages, resetVscodeMock } from './support/vscodeMock';
  * 三级会话（spec §7.5：三级转发到整个条目）。
  *
  * 修复后：跳过前台不是 claude 的槽（不算失败），只处理真正在跑 claude
- * 的槽；一个健康槽都没有时才维持整体拒绝。
+ * 的槽；一个健康槽都没有时（等价于「没有 claude 在跑」）直接落配置、
+ * 下次启动生效，不再整体拒绝——0.2.3 进一步把这条「整体拒绝」也纠正了
+ * （之前只是把「跳过部分」的语义做对，「全部跳过」时仍误判成整体拒绝）。
  */
 
 function tmpFile(): string {
@@ -105,7 +107,7 @@ describe('TerminalManager.applyModel —— 部分槽跳过、不再全有全无
     assert.match(info[0], /测试终端/);
   });
 
-  it('全部存活槽都不是 claude：维持整体拒绝，不落配置', async () => {
+  it('全部存活槽都不是 claude：等价于没有 claude 在跑，直接落配置、下次启动生效', async () => {
     const { mgr, tmux, store } = setup();
     const s1 = slot({ order: 0 });
     const s2 = slot({ order: 1 });
@@ -116,19 +118,20 @@ describe('TerminalManager.applyModel —— 部分槽跳过、不再全有全无
     tmux.addSession(sessionNameFor(s2.id), 'zsh');
 
     const ok = await mgr.applyModel(e, 'claude-3-5-sonnet');
-    assert.strictEqual(ok, false, '一个健康槽都没有 —— 与全部不合格等价，必须整体拒绝');
+    assert.strictEqual(ok, true, '一个健康槽都没有——跟会话压根不存在同侧处理，不再整体拒绝');
 
-    assert.strictEqual(tmux.sentLiterals.length, 0, '不应该给任何槽发送命令');
+    assert.strictEqual(tmux.sentLiterals.length, 0, '没有 claude 在跑，不应该给任何槽发送命令');
 
     const [reloaded] = await store.load();
-    assert.strictEqual(reloaded.model, undefined, '被拒绝时不落配置');
+    assert.strictEqual(reloaded.model, 'claude-3-5-sonnet', '纯配置变更，照常落盘');
 
-    const errs = errorMsgs();
-    assert.strictEqual(errs.length, 1);
-    assert.match(errs[0], /第 1 个会话/);
-    assert.match(errs[0], /第 2 个会话/);
-    assert.match(errs[0], /不是 claude/);
-    assert.match(errs[0], /已拒绝切模型/);
+    assert.strictEqual(errorMsgs().length, 0, '不再是拒绝，不应该有错误提示');
+    const info = infoMsgs();
+    assert.strictEqual(info.length, 1);
+    assert.match(info[0], /第 1 个会话/);
+    assert.match(info[0], /第 2 个会话/);
+    assert.match(info[0], /未在跑 claude/);
+    assert.match(info[0], /下次启动生效/);
   });
 
   it('全部存活槽都是 claude：照常全部处理，不产生「跳过」提示', async () => {
@@ -186,7 +189,7 @@ describe('TerminalManager.applyProfile —— 部分槽跳过、不再全有全�
     assert.match(info[0], /未在跑 claude/);
   });
 
-  it('全部存活槽都不是 claude：维持整体拒绝，不落配置', async () => {
+  it('全部存活槽都不是 claude：等价于没有 claude 在跑，直接落配置、下次启动生效', async () => {
     const { mgr, tmux, store } = setup();
     const s1 = slot({ order: 0, conversationId: 'conv-1' });
     const e = entry([s1], { profile: 'ccr' });
@@ -195,15 +198,20 @@ describe('TerminalManager.applyProfile —— 部分槽跳过、不再全有全�
     tmux.addSession(sessionNameFor(s1.id), 'bash');
 
     const ok = await mgr.applyProfile(e, 'direct');
-    assert.strictEqual(ok, false);
+    assert.strictEqual(ok, true, '一个健康槽都没有——跟会话压根不存在同侧处理，不再整体拒绝');
+
+    assert.strictEqual(tmux.sentLiterals.length, 0, '没有 claude 在跑，不应该给任何槽发送命令（不会走到重启）');
 
     const [reloaded] = await store.load();
-    assert.strictEqual(reloaded.profile, 'ccr', '被拒绝时不落配置');
+    assert.strictEqual(reloaded.profile, 'direct', '纯配置变更，照常落盘');
+    assert.strictEqual(reloaded.model, undefined);
 
-    const errs = errorMsgs();
-    assert.strictEqual(errs.length, 1);
-    assert.match(errs[0], /第 1 个会话/);
-    assert.match(errs[0], /已拒绝切换直连\/中转/);
+    assert.strictEqual(errorMsgs().length, 0, '不再是拒绝，不应该有错误提示');
+    const info = infoMsgs();
+    assert.strictEqual(info.length, 1);
+    assert.match(info[0], /第 1 个会话/);
+    assert.match(info[0], /未在跑 claude/);
+    assert.match(info[0], /下次启动生效/);
   });
 
   it('健康槽本身重启失败（未绑定对话）：这是真失败，不是跳过 —— 整体不落配置', async () => {
