@@ -22,7 +22,7 @@ import {
   ownersOf,
 } from './core/conversation';
 import { isClaudeCommand, resumeFailed } from './core/claude';
-import { PRESET_COLORS, normalizeHexColor } from './core/colors';
+import { PRESET_COLORS, colorChoices, normalizeHexColor } from './core/colors';
 import { readProfileConfig } from './claudeConfig';
 import { findConversations, listConversations } from './conversationFiles';
 import { LivenessSnapshot, liveSessionIn, readLiveness } from './liveSessions';
@@ -49,6 +49,20 @@ const RESUME_CHECK_INTERVAL_MS = 250;
 interface ConversationPickItem extends vscode.QuickPickItem {
   candidate?: ConversationCandidate;
   owner?: string;
+}
+
+/**
+ * 调色板 QuickPick 需要的**色块图标**能力。
+ *
+ * 声明成最小接口、而不是直接要 `ColorIconCache` 这个具体类：与本文件里
+ * `store` / `titles` 的处理方式一致 —— 本模块不该知道图标缓存在哪、
+ * 怎么落盘。省略 = 调色板不出色块（只剩 hex 文本，功能不残）。
+ */
+export interface ColorSwatchSource {
+  /** 只拼路径、不读盘。非法/空串 → undefined（没有图标，而不是一个错的图标）。 */
+  swatchFor(color: string): vscode.Uri | undefined;
+  /** 把一批颜色的图标落到磁盘（幂等）。**必须在弹框之前 await**。 */
+  ensure(colors: readonly string[]): Promise<void>;
 }
 
 export class TerminalManager {
@@ -115,6 +129,13 @@ export class TerminalManager {
      * 省略 = 不通知（单测与 e2e harness 直接 new 出 manager 时不受影响）。
      */
     private readonly onBindingsChanged?: () => void,
+    /**
+     * 调色板 QuickPick 的色块图标来源（`ColorIconCache` 结构上满足它）。
+     *
+     * 放在**最后**且可选：前面 4 个参数有多个调用方**按位置**传，插在中间
+     * 会让那些调用点静默错位。省略 = 调色板只有 hex 文本，选颜色照常可用。
+     */
+    private readonly colorSwatches?: ColorSwatchSource,
   ) {
     vscode.window.onDidCloseTerminal((t) => {
       this.busy.delete(t);
@@ -1282,11 +1303,13 @@ export class TerminalManager {
   // ---- 交互式增删改 ----
 
   /**
-   * 新建一个终端条目。标题栏的 `+` 与一级（文件夹）行上的 `+` 共用它。
+   * 新建一个终端条目，**会问目录**。标题栏那个 `+` 用它。
    *
-   * `defaultCwd` 来自一级那一行（那个文件夹的 cwd），只作为 `askCwd` 的预填
-   * **占位值**，用户照样可以改 —— 文件夹是 `groupByCwd` 按 cwd 自动生成的
-   * **虚拟**节点，它没有实体可依附，能做的只有「把它的 cwd 当成新建时的默认值」。
+   * `defaultCwd` 只作为 `askCwd` 的预填**占位值**，用户照样可以改 —— 这条路
+   * 上没有「已经写在界面上的答案」，目录必须问。
+   *
+   * 一级（文件夹）行上的 `+` **不走这里**：那一行本身就是那个 cwd，见
+   * `addEntryInFolderInteractive`。
    */
   async addEntryInteractive(defaultCwd?: string): Promise<void> {
     const all = await this.store.load();
@@ -1300,7 +1323,39 @@ export class TerminalManager {
     if (cwd === undefined) return;
     const autoRestore = await this.askAutoRestore(true);
     if (autoRestore === undefined) return;
+    await this.appendEntry(name, cwd, autoRestore);
+  }
 
+  /**
+   * 在某个**一级（文件夹）行**下新建终端：问名字 → 问是否参与恢复，
+   * **绝不问目录**。
+   *
+   * 那一行**本身就是那个 cwd**（`groupByCwd` 按 cwd 分组出来的虚拟节点）。
+   * 再弹一次目录框，等于让用户回答一个界面上已经写着、而且他就是冲着它点的
+   * 问题 —— 用户明确反馈过「点 + 还在问工作路径」。这条 `+` 的语义就是
+   * 「在这个目录下建一个终端」，目录不是可选项，是前提。
+   *
+   * 继承方式是**原样采用** `cwd`：不归一化、不展开 `~`。`cwd` 来自
+   * `FolderTreeItem`，本来就是清单里的原值 —— 归一化会让这一行分出来的条目
+   * 与清单里同目录的其它条目长出两种写法，`groupByCwd` 随后把它们分成两组。
+   */
+  async addEntryInFolderInteractive(cwd: string): Promise<void> {
+    const all = await this.store.load();
+    const name = await this.askName('', all.map((e) => e.name));
+    if (name === undefined) return;
+    const autoRestore = await this.askAutoRestore(true);
+    if (autoRestore === undefined) return;
+    await this.appendEntry(name, cwd, autoRestore);
+  }
+
+  /**
+   * 两个新建入口的**唯一落盘出口**（标题栏的 `+` 与一级行上的 `+`）。
+   *
+   * 抽出来是因为下面这段「槽必须怎么造」的规则一条都不能漏，而它有两个入口
+   * —— 复制一遍就会有一份先腐坏，症状（两个 claude 同写一条 .jsonl）与真正的
+   * 并发 bug 长得一样。
+   */
+  private async appendEntry(name: string, cwd: string, autoRestore: boolean): Promise<void> {
     // 新建条目**必须带 1 个空会话槽**，不是 0 个：0 槽的条目会显示成不可展开
     // 的一行、点了也没反应，比今天差 ——「建完点开就能用」与今天的体验必须一致。
     //
@@ -1509,26 +1564,61 @@ export class TerminalManager {
   /**
    * 设置二级行首那条竖线的颜色。
    *
-   * 调色板 = 8 个预设 + 末项「自定义…」，末项才走输入框。**两道闸**：
-   * `validateInput` 当场把非法值挡回去（用户能立刻改），返回后再
+   * 调色板 = `colorChoices` 给出的色项（8 个预设，当前色是自定义 hex 时它
+   * 插在首位）+ 末项「自定义…」，末项才走输入框。每一项带一个 `iconPath`
+   * 色块：8 个 `#rrggbb` 文本挨在一起时，人不比颜色本身快多少 —— 选颜色这
+   * 一步的价值就在「一眼比出几个颜色」，没有色块等于把这活推回给用户。
+   *
+   * **两道闸**：`validateInput` 当场把非法值挡回去（用户能立刻改），返回后再
    * `normalizeHexColor` 一次 —— 输入框那一关是给用户看的，这一关是给清单看
    * 的：**非法值绝不写进清单**，否则同一个颜色会有两种写法、图标还会落成两个
    * 文件，而且 `colorBarSvg` 拿到的就是脏数据。
    *
    * 本 Task 只做到「写 store」为止；把 SVG 落到 `<globalStorage>/colors/`
-   * 并刷新图标是渲染侧的事（`src/colorIcons.ts`）。
+   * 并刷新图标是渲染侧的事（`src/colorIcons.ts`）—— 除了下面那次 `ensure`：
+   * 色块必须在**弹框之前**就躺在盘上，见那里的注释。
    */
   async setColorInteractive(entry: TerminalEntry): Promise<void> {
     const CUSTOM = '$(pencil) 自定义…';
-    const pick = await vscode.window.showQuickPick([...PRESET_COLORS, CUSTOM], {
+
+    // **先落盘再弹框**，顺序反过来色块就全是空的：
+    //  - `swatchFor` 只拼路径、不同步读盘（弹框这条路径不能有 IO，同
+    //    `iconFor` 的纪律），文件没到位时 VS Code 只是不渲染那个图标 ——
+    //    不报错，看起来就是「这个功能没做」；
+    //  - 预设色**也必须** ensure：用户可能从没给任何条目设过颜色，那 8 个
+    //    色块一次都没被落过盘（`activate()` 只补清单里已存在的颜色）。
+    // 落盘失败不阻断（ensure 内部自己吞），最坏结果是这一项没色块。
+    const wanted = [...PRESET_COLORS, ...(entry.color === undefined ? [] : [entry.color])];
+    await this.colorSwatches?.ensure(wanted);
+
+    const customItem: vscode.QuickPickItem = { label: CUSTOM };
+    const items: vscode.QuickPickItem[] = colorChoices(entry.color).map((c) => {
+      // 刻意**不用展开**（`...({ label, iconPath, picked })`）拼这个对象：
+      // TypeScript 对展开进来的属性不做过量属性检查，往 VS Code 的 API 对象上
+      // 塞一个它不认识的字段（比如 proposed API）时 tsc 一声不吭 —— 本仓库
+      // 有过 `quickPickItemTooltip` 因此炸掉整个选择框的实测事故（见
+      // pickConversation 里同款注释）。逐字段赋值，多写一行换来 tsc 能拦住下一个。
+      const item: vscode.QuickPickItem = { label: c.hex };
+      const swatch = this.colorSwatches?.swatchFor(c.hex);
+      if (swatch !== undefined) item.iconPath = swatch;
+      if (c.current) {
+        item.description = '当前';
+        item.picked = true;
+      }
+      return item;
+    });
+
+    const pick = await vscode.window.showQuickPick([...items, customItem], {
       title: `为「${entry.name}」设置颜色`,
       placeHolder: entry.color ?? '（未设，中性竖线）',
     });
     if (pick === undefined) return;
 
     let color: string | undefined;
-    if (pick !== CUSTOM) {
-      color = normalizeHexColor(pick);
+    if (pick !== customItem) {
+      // label 就是归一化后的 hex（`colorChoices` 的契约），故这里取 label 再
+      // 过一次闸即与从前等价，不必也不该去反解析图标路径。
+      color = normalizeHexColor(pick.label);
       // 预设色本身就是归一化过的（colors.test.ts 钉着），走到这里为 undefined
       // 只可能是 PRESET_COLORS 被改坏了 —— 那时宁可什么都不做，也不写脏值。
       if (color === undefined) return;

@@ -62,7 +62,9 @@ export function activate(context: vscode.ExtensionContext): void {
   // 绑定回写 → 树上的三级任务名与 tooltip 的「对话」行都过期了，必须重算。
   // 从前靠 ActivityTracker 每 900ms 的无条件整树重建兜着，那个兜底已经去掉了
   // （改成只有真变化才通知），不接这一根就会停在旧值上。
-  const manager = new TerminalManager(store, tmux, titles, () => provider.refresh());
+  // 第 5 个参数是「设置颜色…」调色板的色块来源（同一个 colorIcons：色块与
+  // 二级行首那条竖线是同一批颜色、同一个目录下的两批文件）。
+  const manager = new TerminalManager(store, tmux, titles, () => provider.refresh(), colorIcons);
 
   // 把清单里已有的颜色**先落盘再渲染**：`iconFor` 只拼路径、不同步读盘
   // （渲染路径不能有 IO），文件不到位时那一行的竖线会短暂空着 —— 不报错，
@@ -324,12 +326,18 @@ export function activate(context: vscode.ExtensionContext): void {
     batchProvider.refresh();
   });
 
-  // 一级行尾的「+」：文件夹不是实体，能做的只有把它的 cwd 当作新建条目的
-  // 默认值（判断 B）。预填**允许改** —— 用户在某个文件夹上点「+」之后想换
-  // 目录是常事，做成只读会逼他退出去用标题栏那个 +。
+  // 一级行尾的「+」：这一行**本身就是那个 cwd**（文件夹是 groupByCwd 按 cwd
+  // 分出来的**虚拟**节点），所以它的语义是「在这个目录下建一个终端」—— 目录在
+  // 这里不是待选项而是前提，**不再问**（从前的「预填但允许改」已经废弃：用户
+  // 反馈过「点 + 还在问工作路径」）。
+  // 拿不到 FolderTreeItem 时退回完整流程：这时没有任何文件夹可继承，只能问
+  // 目录 —— 而这条命令的语义仍是「在这个目录下建」，只是那个目录无从得知。
   reg('tmuxTerminals.addInFolder', async (arg: unknown) => {
-    const cwd = arg instanceof FolderTreeItem ? arg.cwd : undefined;
-    await manager.addEntryInteractive(cwd);
+    if (arg instanceof FolderTreeItem) {
+      await manager.addEntryInFolderInteractive(arg.cwd);
+    } else {
+      await manager.addEntryInteractive();
+    }
     provider.refresh();
     batchProvider.refresh();
   });
