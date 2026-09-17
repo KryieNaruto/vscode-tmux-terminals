@@ -1541,7 +1541,7 @@ async function projectSnapshot() {
       `实际新终端数 ${calls.terminals.length}`);
   }
 
-  console.log('\n=== 14. applyModel 拒绝路径：前台不是 claude → 不发序列、不改配置 ===');
+  console.log('\n=== 14. applyModel：一个健康槽都没有（前台不是 claude）→ 不发序列、直接落配置（0.2.3） ===');
   {
     const s = S(ID_REFUSE);
     const { EntryStore } = require(path.join(ROOT, 'out/src/core/store.js'));
@@ -1553,7 +1553,8 @@ async function projectSnapshot() {
     });
     const entryRefuse = (await refuseStore.load()).find((e) => e.id === ID_REFUSE);
 
-    // 前台进程是 sleep（非 claude），模拟用户正在跑的非 claude 程序。
+    // 前台进程是 sleep（非 claude），模拟用户正在跑的非 claude 程序 ——
+    // 与「没有 claude 在跑」等价（0.2.3 起不再整体拒绝，直接落配置）。
     await run('tmux', ['new-session', '-d', '-s', s, 'sleep 600']);
     resetCalls();
 
@@ -1562,12 +1563,13 @@ async function projectSnapshot() {
     await mgr.applyModel(entryRefuse, 'some-model');
 
     const after = (await refuseStore.load()).find((e) => e.id === ID_REFUSE);
-    chk('★ 拒绝时未发送任何控制序列（/model 未打进 sleep 进程）',
+    chk('★ 没有 claude 在跑，未发送任何控制序列（/model 未打进 sleep 进程）',
       calls.literals.length === 0, JSON.stringify(calls.literals));
-    chk('★ 拒绝时未写配置（model 保持未设）', after.model === undefined,
+    chk('★ 纯配置变更，照常落盘（0.2.3 起不再整体拒绝）', after.model === 'some-model',
       `实际 model=${JSON.stringify(after.model)}`);
-    chk('拒绝已向用户呈现（error message 记录）',
-      calls.errors.some((m) => String(m).includes('不是 claude')), JSON.stringify(calls.errors));
+    chk('★ 不再是错误提示，而是「下次启动生效」的信息提示',
+      calls.errors.length === 0 && calls.messages.some((m) => String(m).includes('下次启动生效')),
+      `errors=${JSON.stringify(calls.errors)} messages=${JSON.stringify(calls.messages)}`);
 
     await fs.promises.rm(refuseFile, { force: true }).catch(() => {});
   }

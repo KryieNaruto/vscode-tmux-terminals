@@ -30,7 +30,27 @@ import { reconcileBinding } from './core/reconcile';
 import { EntryStore, newConversationId, newId } from './core/store';
 import { TmuxClient } from './tmuxClient';
 
-const SHELL_READY_TIMEOUT_MS = 3000;
+/**
+ * `restartClaude` 发完 `/exit` 后，等 pane 前台真的变回登录 shell 的预算。
+ *
+ * **0.2.3 排查记录**：用户批量切 profile 一次「4 会话、3 健康」的条目整体
+ * 失败，怀疑是这个预算被打穿——但当时机器正好在同时跑 npm test/e2e/编译。
+ * 实测排查（用假前台进程模拟 claude、真实系统负载 load average ~65-70/32
+ * 核）：单次「/exit → 轮询回到 shell」的**轮询开销本身**只有 10-25ms；就算
+ * 人为再叠加 32 路 `yes` 抢 CPU（近 3 倍超订阅），也只涨到 ~100-150ms。用
+ * 真实 `/usr/bin/claude`（非模拟）实测一次完整的 `/exit` 到回到 shell 约
+ * 1s（见 scratchpad 里的 probe 脚本与截屏记录）。也就是说 3000ms 原本已有
+ * 大约 2s 富余。
+ *
+ * 但 `applyProfile` 是**依次**（非并发）对每个健康槽调用 `restartClaude`，
+ * 各自独立吃满一份预算——一个条目挂的会话越多，只要有一个槽稍慢，整个批量
+ * 操作就会被判失败，多槽会放大小概率事件的复现率。且用户实测失败当时的
+ * 系统负载（真实跑着测试/编译）比本次排查用的合成负载更重、更偏 I/O。
+ * 综合两头：没有实锤的逻辑 bug，但把预算调宽是低风险的防御性改动——轮询
+ * 一旦就绪会立刻提前返回，调大只影响「等到多晚才放弃」，不影响正常路径的
+ * 实际耗时。故从 3000 提到 6000，翻倍吃掉排查里观察到的最坏抖动量级。
+ */
+const SHELL_READY_TIMEOUT_MS = 6000;
 
 /**
  * 发完 `--resume` 后盯 pane 的时长与间隔。claude 接不上时会立刻打印
@@ -1181,8 +1201,10 @@ export class TerminalManager {
   /**
    * 返回 false 表示被安全守卫拒绝，未改动配置；true 表示已成功应用
    * （即使部分槽因未在跑 claude 而被跳过，只要至少有一个健康槽被处理）。
-   * 注意「目标模型无法确定」（清空且读不到 profile 默认）**不是**失败：
-   * 它照常落配置、返回 true，只是推迟到下次启动生效。
+   * 注意「目标模型无法确定」（清空且读不到 profile 默认）以及「一个健康槽
+   * 都没有」（tmux 会话存在但前台全不是 claude，等价于压根没有 claude 在
+   * 跑）都**不是**失败：两者都照常落配置、返回 true，只是推迟到下次启动
+   * 生效 —— 唯一真正返回 false 的情形是目标模型名本身不合法（含换行符）。
    * 与 restartClaude 一样用布尔回报结果，供批量套用据此统计
    * 「成功/失败」，而非把拒绝当成功。
    */
@@ -1224,11 +1246,17 @@ export class TerminalManager {
     // 只对**前台确实是 claude** 的槽发 /model；bash 之类的跳过、不算失败。
     const { eligible, skipped } = await this.partitionByForeground(alive);
 
-    // 一个健康槽都没有：与「全都不合格」等价，维持整体拒绝、不落配置 ——
-    // 这与「跳过一部分」不同，属于「整体确实做不了」。
+    // 一个健康槽都没有（tmux 会话都在，但前台全不是 claude，比如用户早先
+    // 退出过 claude、留了个 bash）：跟 `alive.length === 0`（会话压根不存在）
+    // 同侧处理 —— 既然没有会话在跑 claude，就不存在「看起来还在用旧配置」的
+    // 假象要担心，直接落盘、下次这些会话重启时自然生效即可。不再整体拒绝。
     if (eligible.length === 0) {
-      this.refuse(entry, '切模型', skipped);
-      return false;
+      await this.store.update(entry.id, { model: normalized });
+      const who = skipped.map((s) => this.slotLabel(entry, s)).join('、');
+      void vscode.window.showInformationMessage(
+        `「${entry.name}」的${who}当前都未在跑 claude，已保存为「下次启动生效」。`,
+      );
+      return true;
     }
 
     for (const slot of eligible) {
@@ -1259,6 +1287,9 @@ export class TerminalManager {
    * 返回 false 表示被安全守卫拒绝（或重启失败），未改动配置；true 表示
    * 已切换成功（即使部分槽因未在跑 claude 而被跳过，只要至少有一个健康槽
    * 被处理）。profile 未变时返回 true（无事可做，不算失败）。
+   * 「一个健康槽都没有」（tmux 会话存在但前台全不是 claude）同样返回
+   * true：没有 claude 在跑就没有对话要接，直接落配置、下次启动生效，
+   * 与「会话压根不存在」同侧处理，不再整体拒绝。
    */
   async applyProfile(entry: TerminalEntry, profile: Profile): Promise<boolean> {
     if (entry.profile === profile) return true;
@@ -1269,10 +1300,17 @@ export class TerminalManager {
     // 与 applyModel 同一套分流逻辑（见 partitionByForeground 上的注释）。
     const { eligible, skipped } = await this.partitionByForeground(alive);
 
-    // 一个健康槽都没有：与「全都不合格」等价，维持整体拒绝、不落配置。
+    // 一个健康槽都没有（tmux 会话都在，但前台全不是 claude）：跟
+    // `alive.length === 0`（会话压根不存在）同侧处理 —— 没有 claude 在跑，
+    // 没有对话要接、也没有「看起来还在用旧配置」的假象要担心，直接落配置，
+    // 下次这些会话重启时自然生效。不再整体拒绝。
     if (alive.length > 0 && eligible.length === 0) {
-      this.refuse(entry, '切换直连/中转', skipped);
-      return false;
+      await this.store.update(entry.id, { profile, model: undefined });
+      const who = skipped.map((s) => this.slotLabel(entry, s)).join('、');
+      void vscode.window.showInformationMessage(
+        `「${entry.name}」的${who}当前都未在跑 claude，已保存为「下次启动生效」。`,
+      );
+      return true;
     }
 
     for (const slot of eligible) {
