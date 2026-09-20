@@ -1,6 +1,7 @@
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as vscode from 'vscode';
+import { panelNameFor } from './core/panels';
 import {
   discoverCandidates,
   displayPath,
@@ -182,9 +183,25 @@ export class TerminalManager {
    *
    * **只用于挑面板。** 命中不等于会话已恢复 —— 会话可能已死、也可能没有
    * 任何客户端附着。判据在 core/restore.ts。
+   *
+   * **按名兜底成立的前提是名字按槽唯一**（见 core/panels.ts#panelNameFor）：
+   * 名字是宿主重载后唯一的身份线索，撞名就等于两个槽共用一个身份。故下面
+   * 再加一道不变量守卫 —— 一个面板只应该属于一个槽。
    */
   private candidatePanel(session: string, name: string): vscode.Terminal | undefined {
-    return this.terminals.get(session) ?? vscode.window.terminals.find((t) => t.name === name);
+    const byMap = this.terminals.get(session);
+    if (byMap !== undefined) return byMap;
+    const byName = vscode.window.terminals.find((t) => t.name === name);
+    if (byName === undefined) return undefined;
+    // 不变量：一个面板只属于一个槽。同名终端若已经被映射给**别的** session，
+    // 说明这是别人的面板（历史上名字撞过、或清单被手改过）—— 宁可返回
+    // undefined 让上层走 new-attach **新建一个正确面板**，也绝不能把它
+    // show() 出来：那正是本 bug「看着正常、其实点错」的形态 ——
+    // decideOpen 见 present 即判 'show'，于是正确面板永远不会被建。
+    for (const [s, t] of this.terminals) {
+      if (t === byName && s !== session) return undefined;
+    }
+    return byName;
   }
 
   /**
@@ -859,7 +876,9 @@ export class TerminalManager {
     // isShellReady('') 恰好为 false，方向是对的。
     const paneCommand = sessionExists ? await this.tmux.currentCommand(session) : '';
 
-    const candidate = this.candidatePanel(session, entry.name);
+    // 面板名按**槽**唯一（见 core/panels.ts）：从候选到复用/新建，全流程都用
+    // 同一个名字算出来的结果，否则第 2 个槽起会认领到第 1 个槽的面板。
+    const candidate = this.candidatePanel(session, panelNameFor(entry, slot));
     const action = decideOpen(
       { exists: sessionExists, attached },
       {
@@ -891,7 +910,7 @@ export class TerminalManager {
         );
       } else {
         // 真的建不出来（tmux 不可用、cwd 不存在等）
-        const t = this.createOwnPanel(entry.name);
+        const t = this.createOwnPanel(panelNameFor(entry, slot));
         this.terminals.set(session, t);
         t.show();
         vscode.window.showErrorMessage(
@@ -914,10 +933,10 @@ export class TerminalManager {
       terminal = candidate;
     } else {
       try {
-        terminal = this.createOwnPanel(entry.name, cwd);
+        terminal = this.createOwnPanel(panelNameFor(entry, slot), cwd);
       } catch {
         vscode.window.showWarningMessage(`目录不存在，已在主目录打开：${cwd}`);
-        terminal = this.createOwnPanel(entry.name);
+        terminal = this.createOwnPanel(panelNameFor(entry, slot));
       }
     }
     this.terminals.set(session, terminal);
