@@ -25,12 +25,30 @@ const run = promisify(execFile);
  * 引用。shellQuote() 只用于「要塞进终端执行的命令行字符串」。
  */
 export class TmuxClient {
-  constructor(private readonly tmuxPath: string = 'tmux') {}
+  /**
+   * @param timeoutMs 每次 tmux 子进程调用的超时（毫秒）。
+   *
+   * **为什么必须要有这个超时：** 不带超时时，只要 tmux 客户端进程卡住一次，
+   * 这个 Promise 就**永不 settle**。而上层 extension.ts 的轮询（poll /
+   * pollActivity）用 inFlight 布尔闸门守卫重入 —— 一个永不 settle 的调用
+   * 会让闸门**永久卡在 true**，轮询从此静默停摆：不报错、不自愈，表象就是
+   * 任务名永远显示「无会话」、点条目/点 +/点恢复全都没反应。
+   *
+   * killSignal 用 SIGKILL 是刻意的：默认的 SIGTERM 可能被卡住的 tmux 客户端
+   * 忽略，那样超时本身也失效了；只有 SIGKILL 才能保证 Promise 一定 settle。
+   */
+  constructor(
+    private readonly tmuxPath: string = 'tmux',
+    private readonly timeoutMs: number = 5_000,
+  ) {}
 
   /** 列出所有会话名。tmux 无会话时退出码非 0，属正常，返回空数组。 */
   async listSessions(): Promise<string[]> {
     try {
-      const { stdout } = await run(this.tmuxPath, ['ls', '-F', '#{session_name}']);
+      const { stdout } = await run(this.tmuxPath, ['ls', '-F', '#{session_name}'], {
+        timeout: this.timeoutMs,
+        killSignal: 'SIGKILL',
+      });
       return parseSessionList(stdout);
     } catch {
       return [];
@@ -39,7 +57,10 @@ export class TmuxClient {
 
   async hasSession(name: string): Promise<boolean> {
     try {
-      await run(this.tmuxPath, ['has-session', '-t', sessionTarget(name)]);
+      await run(this.tmuxPath, ['has-session', '-t', sessionTarget(name)], {
+        timeout: this.timeoutMs,
+        killSignal: 'SIGKILL',
+      });
       return true;
     } catch {
       return false;
@@ -60,7 +81,10 @@ export class TmuxClient {
     try {
       const { stdout } = await run(this.tmuxPath, [
         'display-message', '-p', '-t', paneTarget(name), '#{session_attached}',
-      ]);
+      ], {
+        timeout: this.timeoutMs,
+        killSignal: 'SIGKILL',
+      });
       return parseAttachedCount(stdout);
     } catch {
       return null;
@@ -79,7 +103,10 @@ export class TmuxClient {
     try {
       const { stdout } = await run(this.tmuxPath, [
         'display-message', '-p', '-t', paneTarget(name), '#{pane_pid}',
-      ]);
+      ], {
+        timeout: this.timeoutMs,
+        killSignal: 'SIGKILL',
+      });
       return parsePid(stdout);
     } catch {
       return null;
@@ -88,7 +115,10 @@ export class TmuxClient {
 
   async killSession(name: string): Promise<void> {
     try {
-      await run(this.tmuxPath, ['kill-session', '-t', sessionTarget(name)]);
+      await run(this.tmuxPath, ['kill-session', '-t', sessionTarget(name)], {
+        timeout: this.timeoutMs,
+        killSignal: 'SIGKILL',
+      });
     } catch {
       // 会话本就不存在 —— 目标状态已达成，不算失败
     }
@@ -103,7 +133,10 @@ export class TmuxClient {
    */
   async detachClients(name: string): Promise<void> {
     try {
-      await run(this.tmuxPath, ['detach-client', '-s', sessionTarget(name)]);
+      await run(this.tmuxPath, ['detach-client', '-s', sessionTarget(name)], {
+        timeout: this.timeoutMs,
+        killSignal: 'SIGKILL',
+      });
     } catch {
       // 没有客户端附着 —— 目标状态已达成
     }
@@ -125,7 +158,10 @@ export class TmuxClient {
    */
   async newSession(name: string, cwd: string): Promise<boolean> {
     try {
-      await run(this.tmuxPath, ['new-session', '-d', '-s', name, '-c', cwd]);
+      await run(this.tmuxPath, ['new-session', '-d', '-s', name, '-c', cwd], {
+        timeout: this.timeoutMs,
+        killSignal: 'SIGKILL',
+      });
       return true;
     } catch {
       return false;
@@ -142,7 +178,10 @@ export class TmuxClient {
     try {
       const { stdout } = await run(this.tmuxPath, [
         'display-message', '-p', '-t', paneTarget(name), '#{pane_current_command}',
-      ]);
+      ], {
+        timeout: this.timeoutMs,
+        killSignal: 'SIGKILL',
+      });
       return stdout.trim();
     } catch {
       return '';
@@ -173,7 +212,10 @@ export class TmuxClient {
       const { stdout } = await run(this.tmuxPath, [
         'display-message', '-p', '-t', paneTarget(name),
         `#{pane_current_command}${PANE_SAMPLE_SEPARATOR}#{pane_title}`,
-      ]);
+      ], {
+        timeout: this.timeoutMs,
+        killSignal: 'SIGKILL',
+      });
       return parsePaneSample(stdout);
     } catch {
       return { ...UNKNOWN_PANE_SAMPLE };
@@ -191,7 +233,10 @@ export class TmuxClient {
     try {
       const { stdout } = await run(this.tmuxPath, [
         'capture-pane', '-p', '-t', paneTarget(name),
-      ]);
+      ], {
+        timeout: this.timeoutMs,
+        killSignal: 'SIGKILL',
+      });
       return stdout;
     } catch {
       return '';
@@ -200,11 +245,17 @@ export class TmuxClient {
 
   /** 以字面量模式发送文本（不解释键名，也不做 shell 引用）。 */
   async sendLiteral(name: string, text: string): Promise<void> {
-    await run(this.tmuxPath, ['send-keys', '-l', '-t', paneTarget(name), text]);
+    await run(this.tmuxPath, ['send-keys', '-l', '-t', paneTarget(name), text], {
+      timeout: this.timeoutMs,
+      killSignal: 'SIGKILL',
+    });
   }
 
   async sendEnter(name: string): Promise<void> {
-    await run(this.tmuxPath, ['send-keys', '-t', paneTarget(name), 'Enter']);
+    await run(this.tmuxPath, ['send-keys', '-t', paneTarget(name), 'Enter'], {
+      timeout: this.timeoutMs,
+      killSignal: 'SIGKILL',
+    });
   }
 
   /**

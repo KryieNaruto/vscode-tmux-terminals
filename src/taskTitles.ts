@@ -1,3 +1,6 @@
+import * as crypto from 'crypto';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import { TAIL_BYTES, findConversationFile, readTail } from './conversationFiles';
 import { parseAiTitle } from './core/conversation';
 
@@ -51,7 +54,20 @@ export interface TitleSource {
  *   把它当成「没有」缓存住会让第三级永远不出现；下次 prewarm 重试。
  * - 键 = conversationId：条目改绑后 peek 自然落到新键上 miss 并触发一次
  *   新 prewarm，旧键随容量逐出，不需要显式失效。
- * - 无持久化：进程退出即清空。
+ * - **持久化（可选）**：构造时给了 `persistPath` 才落盘 —— 每次成功写入后
+ *   把整份 cache 写出去（`persist`，fire-and-forget），启动时用 `restore()`
+ *   读回。省略 `persistPath` 就是原来的纯内存形态。
+ *
+ * **为什么要落盘。** 这个 VS Code 窗口的扩展宿主会被反复重建（实测一天十几
+ * 代），而缓存纯内存 —— 每重建一次就清零。回填只能靠 10 s 一轮的存活轮询，
+ * 且那轮轮询还被 `view.visible` 再闸一道：连接一抖就攒不起来，于是所有三级行
+ * 长期回落成「无会话」。落一份盘，宿主重建后 `restore()` 立刻读回标题，把
+ * 这个症状单独压掉（回填的时间线从「几轮轮询」缩到零）。
+ *
+ * **为什么恢复出来的旧标题是可接受的。** 它本来就是「可能已过时」的回退源
+ * —— 见 tree.ts 的 `TITLE_SOURCE_TEXT`，那里对这条来源的措辞本就带着不确定
+ * 性。真值永远由下一次 `prewarm`/`retryMissing` 读到的 transcript 覆盖；盘上
+ * 那份只负责「在新值读回来之前别显示成无会话」，过时不会造成任何持久错误。
  *
  * **「下次 prewarm」由 `retryMissing` 保证。** prewarm 的调用点全在
  * reconcile（点击 / ⟳ / 切 profile / 恢复 / 激活 / 展开 / 可见），清一色是
@@ -81,17 +97,58 @@ export class TaskTitleCache {
   private readonly listeners: TitleChangeListener[] = [];
   /** 本拍是否已经排了一次通知 —— coalesce 用，见 scheduleNotify。 */
   private notifyScheduled = false;
+  /** 本拍是否已经排了一次落盘 —— coalesce 用，见 persist。 */
+  private persistScheduled = false;
 
   /**
    * @param home 定位 `~/.claude/projects`；与 `TerminalManager.home()` 同源。
    * @param readTitle 读一条 transcript 尾部并取 aiTitle。省略时用默认实现
    *   （findConversationFile → readTail → parseAiTitle）。以参数注入是为了：
    *   单测注入假 reader 断言「读不到不缓存、下次 prewarm 重试」。
+   * @param persistPath 标题缓存的落盘路径；省略 = 不持久化（单测走这条）。
+   *   **构造函数零 IO** —— 读盘只在显式调用 `restore()` 时发生，因为现有单测
+   *   大量用 `'/nonexistent'` 之类路径构造，构造期一碰盘就会把它们弄脏。
    */
   constructor(
     private readonly home: string,
     private readonly readTitle?: (conversationId: string, cwd: string) => Promise<string | undefined>,
+    /** 标题缓存的落盘路径；省略 = 不持久化（单测走这条）。 */
+    private readonly persistPath?: string,
   ) {}
+
+  /**
+   * 从 `persistPath` 读回上次落盘的标题，塞进缓存。
+   *
+   * 宿主（扩展宿主进程）每次重建都会丢掉内存里的缓存，而回填要等轮询 +
+   * `view.visible` 两道闸，三级行因此长时间全回落成「无会话」。启动时读一次
+   * 盘就能立刻恢复，不必等任何轮询。
+   *
+   * **一切失败都静默**：文件不存在（首次启动）、JSON 解析失败、权限/IO 异常
+   * —— 恢复只是优化，没有它照旧从零预热，不该让调用方处理任何错误。
+   * 非法条目（值不是 string、或 trim 后为空）逐条丢弃，与前缀语义一致。
+   */
+  async restore(): Promise<void> {
+    if (this.persistPath === undefined) return;
+    try {
+      const raw = await fs.readFile(this.persistPath, 'utf8');
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof key !== 'string' || typeof value !== 'string') continue;
+        const trimmed = value.trim();
+        if (trimmed.length === 0) continue;
+        this.cache.set(key, trimmed);
+      }
+      // 恢复的条目也算进容量上限，逐出规则与正常写入完全一致（Map 头部最久未访问）
+      while (this.cache.size > MAX_ENTRIES) {
+        const oldest = this.cache.keys().next().value;
+        if (oldest === undefined) break;
+        this.cache.delete(oldest);
+      }
+    } catch {
+      // 文件不存在 / 解析失败 / 读盘异常 → 当作没有落盘，静默返回
+    }
+  }
 
   /** 同步读缓存。未缓存 / 传 undefined → undefined。渲染路径上唯一被调用的方法。 */
   peek(conversationId: string | undefined): string | undefined {
@@ -196,6 +253,43 @@ export class TaskTitleCache {
     });
   }
 
+  /**
+   * 落盘，**fire-and-forget**（调用点写 `void this.persist()`）。
+   *
+   * 与 `scheduleNotify` 同一套 coalescing：先让出一个 microtask 再把
+   * `persistScheduled` 清掉，于是同一拍内的后续写入看到标志直接返回 ——
+   * 10 条标题在同一拍里先后落地只落一次盘，而不是 10 次 fs 往返。
+   * 用 microtask 而不是 `setTimeout(0)`：写入本来就在微任务链上，microtask
+   * 不会引入新的宏任务时序，单测里 `await` 一次即可稳定观察到。
+   *
+   * **失败一律静默**：落盘只是「宿主重建后能提前恢复」的优化，写不成也不该
+   * 影响缓存本身或任何既有路径。序列化发生在 microtask 之后，拿到的必然是
+   * 那一刻的 cache 快照（只多不少）。
+   */
+  private async persist(): Promise<void> {
+    if (this.persistPath === undefined) return; // 不持久化模式
+    if (this.persistScheduled) return;
+    this.persistScheduled = true;
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    this.persistScheduled = false;
+    try {
+      await fs.mkdir(path.dirname(this.persistPath), { recursive: true });
+      // 原子写：先写唯一临时名再 rename，避免中途崩溃留下半份 JSON。
+      // 临时名必须每次唯一 —— 固定名在两次写交错时先完成者会把 tmp rename 走，
+      // 后完成者 rename 时源已不存在（ENOENT）。与 core/store.ts 的 save() 同源。
+      const tmp = `${this.persistPath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+      try {
+        await fs.writeFile(tmp, JSON.stringify(Object.fromEntries(this.cache)), 'utf8');
+        await fs.rename(tmp, this.persistPath);
+      } catch (err) {
+        await fs.rm(tmp, { force: true }).catch(() => {});
+        throw err;
+      }
+    } catch {
+      // 写盘失败 → 当作没落盘，下次写入再试；内存缓存不受任何影响
+    }
+  }
+
   private async load(conversationId: string, cwd: string): Promise<void> {
     try {
       const title = await this.read(conversationId, cwd);
@@ -215,6 +309,10 @@ export class TaskTitleCache {
         //   值」只可能出现在「先被容量逐出、再读回」，属罕见路径，不值得为
         //   它维护一份能扛逐出的历史值表 —— 那次多出来的一次整树重建无害。
         this.scheduleNotify();
+        // 落盘同样 fire-and-forget：**不能 await** —— 这条路径的尽头是
+        // 渲染（peek → 整树重建），写盘不该拖慢或阻塞它。persist 内部自己做
+        // 同拍 coalescing，也不抛（失败静默）。
+        void this.persist();
       }
       // 读不到 → 什么都不写，下次 prewarm 会重试
     } catch {

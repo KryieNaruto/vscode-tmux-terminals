@@ -11,6 +11,7 @@ import { TerminalManager } from './terminalManager';
 import { ActivityTracker } from './activityTracker';
 import { TaskTitleCache } from './taskTitles';
 import { sessionNameFor } from './core/tmux';
+import { Log } from './log';
 
 let pollTimer: NodeJS.Timeout | undefined;
 let activityTimer: NodeJS.Timeout | undefined;
@@ -20,7 +21,52 @@ let activityTimer: NodeJS.Timeout | undefined;
  * 用户不需要也不应该去调它。 */
 const ACTIVITY_POLL_INTERVAL_MS = 900;
 
-export function activate(context: vscode.ExtensionContext): void {
+/**
+ * 到点就 reject；原 promise 继续跑，只是不再被等。
+ *
+ * **为什么要有它**：轮询的闸门（`inFlight`）只在 promise settle 时才释放，
+ * 一次卡住的 tmux 调用会让闸门永久停在 true、轮询从此静默停摆 —— 表面看
+ * 「面板还活着但什么都不动」。加了这层超时，闸门最多被占住 `ms` 毫秒，
+ * 之后无论原调用是否回来都会照常释放。
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label}超时：${ms}ms 内未返回`)),
+      ms,
+    );
+  });
+  // 正常返回（或原 promise 先 reject）时要把这个定时器清掉，否则每拍都留下
+  // 一个悬着的定时器，白白吊住事件循环。
+  return Promise.race([p, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
+ * 把一个命令实参压成可读的「形状」。
+ *
+ * **为什么值得单独记**：`item(arg)` / `sessionItem(arg)` 用的是 `instanceof`，
+ * 判错时命令会**静默什么都不做**。只有把实参形状打出来，才分得出是
+ * 「命令压根没进来」还是「进来了但守卫没命中」。
+ */
+function describeArg(a: unknown): string {
+  if (a === undefined) return 'undefined';
+  if (typeof a === 'string') return 'string';
+  const name = (a as { constructor?: { name?: string } } | null)?.constructor?.name;
+  return name ?? 'object';
+}
+
+/**
+ * 真正的激活逻辑。**由文件末尾的 `activate()` 用 try/catch 包一层后调用**。
+ *
+ * 为什么要包这一层：`activate` 一旦抛异常，**所有命令都不会注册**，而树视图
+ * 已经建好了 —— 表现出来正是「面板看得见、点什么都没反应」，且完全静默。
+ * 包一层之后，异常会被记进日志并弹给用户，不再是无声失败。
+ */
+function activateInner(context: vscode.ExtensionContext, log: Log): void {
+  const activateStarted = Date.now();
   const cfg = () => vscode.workspace.getConfiguration('tmuxTerminals');
 
   const storageFile = (): string => {
@@ -31,6 +77,14 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   const tmux = new TmuxClient(cfg().get<string>('tmuxPath', 'tmux'));
+  // 先把**实际生效的配置**记下来：配置写错（典型是 tmuxPath 指错）时现在的
+  // 表现是「静默什么都没有」—— 没有任何一处会报错，只有把这几项打出来，
+  // 才分得清是「配置没读到」还是「读到了但命令全失败」。
+  log.info(
+    `生效配置：tmuxPath=${cfg().get<string>('tmuxPath', 'tmux')}` +
+    `，pollInterval=${cfg().get<number>('pollInterval', 10000)}` +
+    `，storageFile=${storageFile()}`,
+  );
   // 清单文件被覆盖前若发现它已损坏/不可解析，store 会先把原文另存为
   // `<file>.corrupt`。这里只负责把这件事告诉用户 —— 否则数据被抢救了
   // 却无人知晓，用户会以为条目"自己没了"。
@@ -43,7 +97,13 @@ export function activate(context: vscode.ExtensionContext): void {
   // 任务名回退源：**只有一个实例**，同时注入 provider（渲染时 peek）
   // 与 manager（reconcile 时 prewarm）。home 与 manager.home() 同源
   // （扩展进程里 os.homedir() 就是它）。
-  const titles = new TaskTitleCache(os.homedir());
+  // 第三个参数启用落盘：宿主重建后标题缓存清零会让三级行全回落「无会话」，
+  // 落一份盘、启动时 restore() 把这条回填时间线缩到零。
+  const titles = new TaskTitleCache(
+    os.homedir(),
+    undefined,
+    path.join(context.globalStorageUri.fsPath, 'task-titles.json'),
+  );
   // TmuxClient 已经有 paneSample(name) 方法（一次 display-message 同时取回
   // 前台进程名与 pane title），结构上满足 ActivityTracker 需要的最小接口，
   // 不需要额外适配。
@@ -81,6 +141,20 @@ export function activate(context: vscode.ExtensionContext): void {
     .then(() => provider.refresh())
     .catch(() => {
       // 忽略：见上，图标退化成中性即可。
+    });
+
+  // 宿主每次重建都会清空内存里的标题缓存，而回填要等轮询 + `view.visible`
+  // 两道闸 —— 攒不起来时三级行就长期全是「无会话」。restore() 把上次落盘的
+  // 标题立刻读回来，这条时间线缩到零。**必须放在 provider 之后**：恢复完要
+  // 刷新一次树。restore() 自己吞异常，这里的 catch 只是兜底。
+  void titles
+    .restore()
+    .then(() => {
+      provider.refresh();
+      log.info('标题缓存已从磁盘恢复');
+    })
+    .catch(() => {
+      // 忽略：restore() 内部已吞掉一切失败，这里只是兜底未处理 rejection。
     });
 
   const view = vscode.window.createTreeView('tmuxTerminals.list', {
@@ -144,48 +218,72 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // ---- 存活状态轮询 ----
   let inFlight = false;
+  // 成功路径只记**一行**（会话数/条目数/耗时），所以把这两个计数留在函数体
+  // 外面给外层用；计数本身不参与任何逻辑。
+  let lastPollSessions = 0;
+  let lastPollEntries = 0;
+
+  // 原轮询函数体**原样搬进来**：setAlive / store.load / reconcileAll /
+  // retryTitles 的调用顺序与参数都不变，只是外面套了一层超时与闸门管理。
+  const runPollBody = async () => {
+    const sessionList = await tmux.listSessions();
+    lastPollSessions = sessionList.length;
+    provider.setAlive(new Set(sessionList));
+    const entries = await store.load();
+    lastPollEntries = entries.length;
+    // 这一拍**还要观测并改绑**。`fresh` 首启（0.1.6）把「绑定天然可信」
+    // 这个前提推翻了：新建条目在出生时就预分配了一个 conversationId，可
+    // 裸 `claude` 实际开出来的是**另一条**会话 —— 预分配的那个成了幽灵。
+    // 绑定不再是写一次即定的事实，只能靠**周期性观测**（pane → 注册表）
+    // 纠回来。而原有的 reconcile 触发点全是用户动作，用户"新建完就一直
+    // 待在终端里提问、不碰侧边栏"是完全正常的用法，那时一个都不发 ——
+    // 绑定会永远停在幽灵 id 上，三级任务名也就永远出不来。
+    await manager.reconcileAll(entries); // 观测并改绑
+    // 顺序不能反：先 reconcileAll 把绑定改对，retryTitles 才有**正确的
+    // id** 可重试（否则它每 25 秒去重读一个永远不存在的文件）。
+    //
+    // 任务名缓存的低频重试就挂在这一拍上。
+    // **刻意不挂 900ms 的活动采样**：那一拍只关心 pane 前台状态，而这里
+    // 每次都要 tail-read 一个可能上 MB 的 transcript，跟着 900ms 跑是灾难。
+    // 挂在 poll 上也意味着它天然受同一个 `view.visible` 开关约束：面板
+    // 隐藏时这拍根本不跑 —— 没人看的时候不必重读。
+    //
+    // 读盘节奏按条目分成两种：**已存活但还没缓存到标题**的条目，光靠
+    // 这一拍里 reconcileAll 的 prewarm 就会重读 —— prewarm 只做
+    // `cache.has` / `pending.has` 两个早返回，**不查 RETRY_COOLDOWN_MS
+    // 那张冷却表**，所以对它们是实打实的**每 10 秒一次**，不是 25 秒。
+    // retryMissing 的 25 秒冷却仍然有效，但主要落在**会话已死**的条目上：
+    // reconcileAll 跳过不存活的条目，那条路径上没人替它刷新冷却表。
+    //
+    // 多出来的读盘代价可接受：重读走的是 `readTail`，只读 transcript 的
+    // **尾部窗口**（`TAIL_BYTES`，64 KB），不是整份文件；而**已经有标题
+    // 缓存**的条目会命中 prewarm 的第一个早返回，根本不读盘 —— 稳态下
+    // 没有任何额外读盘。
+    //
+    // 这一拍多跑的 reconcile 成本可接受：整批条目共用一份 `readLiveness`
+    // 快照（一次 `ps` + 一次注册表 readdir），不是按条目各查一遍；绑定已
+    // 收敛时 `reconcileBinding` 返回 `undefined`，`reconcileAll` 会
+    // `continue` —— **稳态下不写盘**。
+    manager.retryTitles(entries); // 补晚到的 aiTitle
+  };
+
   const poll = async () => {
     if (inFlight) return; // 上一轮还没回来就跳过，避免请求堆积
     inFlight = true;
+    const started = Date.now();
     try {
-      provider.setAlive(new Set(await tmux.listSessions()));
-      const entries = await store.load();
-      // 这一拍**还要观测并改绑**。`fresh` 首启（0.1.6）把「绑定天然可信」
-      // 这个前提推翻了：新建条目在出生时就预分配了一个 conversationId，可
-      // 裸 `claude` 实际开出来的是**另一条**会话 —— 预分配的那个成了幽灵。
-      // 绑定不再是写一次即定的事实，只能靠**周期性观测**（pane → 注册表）
-      // 纠回来。而原有的 reconcile 触发点全是用户动作，用户"新建完就一直
-      // 待在终端里提问、不碰侧边栏"是完全正常的用法，那时一个都不发 ——
-      // 绑定会永远停在幽灵 id 上，三级任务名也就永远出不来。
-      await manager.reconcileAll(entries); // 观测并改绑
-      // 顺序不能反：先 reconcileAll 把绑定改对，retryTitles 才有**正确的
-      // id** 可重试（否则它每 25 秒去重读一个永远不存在的文件）。
-      //
-      // 任务名缓存的低频重试就挂在这一拍上。
-      // **刻意不挂 900ms 的活动采样**：那一拍只关心 pane 前台状态，而这里
-      // 每次都要 tail-read 一个可能上 MB 的 transcript，跟着 900ms 跑是灾难。
-      // 挂在 poll 上也意味着它天然受同一个 `view.visible` 开关约束：面板
-      // 隐藏时这拍根本不跑 —— 没人看的时候不必重读。
-      //
-      // 读盘节奏按条目分成两种：**已存活但还没缓存到标题**的条目，光靠
-      // 这一拍里 reconcileAll 的 prewarm 就会重读 —— prewarm 只做
-      // `cache.has` / `pending.has` 两个早返回，**不查 RETRY_COOLDOWN_MS
-      // 那张冷却表**，所以对它们是实打实的**每 10 秒一次**，不是 25 秒。
-      // retryMissing 的 25 秒冷却仍然有效，但主要落在**会话已死**的条目上：
-      // reconcileAll 跳过不存活的条目，那条路径上没人替它刷新冷却表。
-      //
-      // 多出来的读盘代价可接受：重读走的是 `readTail`，只读 transcript 的
-      // **尾部窗口**（`TAIL_BYTES`，64 KB），不是整份文件；而**已经有标题
-      // 缓存**的条目会命中 prewarm 的第一个早返回，根本不读盘 —— 稳态下
-      // 没有任何额外读盘。
-      //
-      // 这一拍多跑的 reconcile 成本可接受：整批条目共用一份 `readLiveness`
-      // 快照（一次 `ps` + 一次注册表 readdir），不是按条目各查一遍；绑定已
-      // 收敛时 `reconcileBinding` 返回 `undefined`，`reconcileAll` 会
-      // `continue` —— **稳态下不写盘**。
-      manager.retryTitles(entries); // 补晚到的 aiTitle
+      // 超时值 15s：存活轮询默认 10s 一拍，要给正常一拍留足余量，同时必须
+      // **小于会让人以为是「卡死」的那个时长**。超时后 finally 仍会释放闸门，
+      // 不会像从前那样让一次卡住的调用把 inFlight 永久停在 true。
+      await withTimeout(runPollBody(), 15_000, '存活轮询');
+      log.info(
+        `存活轮询完成：会话 ${lastPollSessions} 个、条目 ${lastPollEntries} 条，` +
+        `耗时 ${Date.now() - started}ms`,
+      );
+    } catch (err) {
+      log.error(`存活轮询失败，耗时 ${Date.now() - started}ms`, err);
     } finally {
-      inFlight = false;
+      inFlight = false; // 一定释放：无论成功、失败还是超时
     }
   };
 
@@ -195,6 +293,14 @@ export function activate(context: vscode.ExtensionContext): void {
     const interval = cfg().get<number>('pollInterval', 10000);
     if (interval > 0 && view.visible) {
       pollTimer = setInterval(() => void poll(), interval);
+      log.info(`存活轮询已启动：间隔 ${interval}ms`);
+    } else {
+      // **关键诊断**：`view.visible` 若长期为 false，两个定时器都不会装，
+      // 采样永远攒不起来 —— 外表看就是「一直无会话」。
+      log.info(
+        `存活轮询未启动：pollInterval=${interval}（<=0 = 关闭）` +
+        `，view.visible=${view.visible}`,
+      );
     }
     void poll();
   };
@@ -203,29 +309,99 @@ export function activate(context: vscode.ExtensionContext): void {
   // 独立于上面的存活轮询：节奏快得多（900ms vs 默认 10s），且只在面板
   // 可见时跑——这是纯视觉效果，不可见时没有意义轮询，白白多发 tmux 命令。
   let activityInFlight = false;
+  let lastActivitySessions = 0;
+  let lastActivitySlots = 0;
+
+  /**
+   * 活动轮询成功日志的节流状态。
+   *
+   * **为什么不能每拍都写**：这一拍是 900ms 一拍（ACTIVITY_POLL_INTERVAL_MS），
+   * 一小时 ≈ 4000 拍 —— 每拍一行会把 Output 面板冲成废纸，真出问题时要找的
+   * 那几行正好被淹没。存活轮询是 10s 一拍，每拍一行没问题，那条路径保持不动。
+   *
+   * `activityTick` 每拍自增；`prevActivitySessions` / `prevActivitySlots` 是
+   * **上一拍**的计数快照 —— `lastActivitySessions` / `lastActivitySlots` 每拍
+   * 都被 runActivityPollBody 就地覆盖，不留快照就永远比不出「变了」。
+   */
+  let activityLoggedOnce = false;
+  let activityTick = 0;
+  let prevActivitySessions = 0;
+  let prevActivitySlots = 0;
+
+  /** 心跳间隔：900ms × 60 ≈ 54 秒一条，用来回答「轮询还活着吗」。 */
+  const ACTIVITY_LOG_HEARTBEAT_TICKS = 60;
+
+  /**
+   * 这一拍成功要不要写日志。三种情况之一才写：
+   *   1. 本拍计数与上一拍不同 —— 有变化才值得记；
+   *   2. 这是第一拍成功 —— 冷启动时要看得到它确实跑起来了；
+   *   3. 距离上次成功日志已过 60 拍（≈54 秒）—— 一条心跳。
+   * 都不满足就静默：900ms × 4000 行/小时会把面板冲爆。
+   */
+  const shouldLogActivity = (): boolean => {
+    activityTick += 1;
+    const first = !activityLoggedOnce;
+    const changed =
+      lastActivitySessions !== prevActivitySessions ||
+      lastActivitySlots !== prevActivitySlots;
+    const heartbeat = activityTick >= ACTIVITY_LOG_HEARTBEAT_TICKS;
+    // 先快照本拍计数，供下一拍比较。
+    prevActivitySessions = lastActivitySessions;
+    prevActivitySlots = lastActivitySlots;
+    if (!first && !changed && !heartbeat) return false;
+    // 写过一条就把心跳计时清零：心跳的语义是「距离上次成功日志」。
+    activityLoggedOnce = true;
+    activityTick = 0;
+    return true;
+  };
+
+  // 同上：原函数体原样搬进内部函数，只在外层补超时与闸门管理。
+  const runActivityPollBody = async () => {
+    // 闸门必须来自**权威的 tmux 查询**，不能用 provider.isAlive：后者由
+    // 10s 的存活轮询填充，而 poll() 有 inFlight 守卫 —— 激活时两个
+    // restart* 并发启动，pollActivity 刚跑时第一次 listSessions 还没回来，
+    // 于是第一轮 aliveIds 恒为空、一个条目都不采（实测症状）。
+    const sessionList = await tmux.listSessions();
+    lastActivitySessions = sessionList.length;
+    const sessions = new Set(sessionList);
+    provider.setAlive(sessions); // 顺带把树的存活标记推到最新（setAlive 只在变化时 fire）
+    const entries = await store.load();
+    // 键必须是**槽 id**：采样层内部就是 `sessionNameFor(id)`，而 v3 的 tmux
+    // 会话名由**槽** id 派生（一个终端挂 N 个槽 = N 个 tmux 会话）。
+    // 喂条目 id 的后果是：同一终端下只有「槽 id 恰好等于条目 id」的那一个
+    // （迁移出来的、或本 Task 之前新建的）能对上，第 2 个起的会话**永远**
+    // 采不到样 ⇒ 那一行的运行图标永远不转，且不报任何错 —— 静默、无测试能抓。
+    const aliveIds = entries
+      .flatMap((e) => e.sessions)
+      .filter((s) => sessions.has(sessionNameFor(s.id)))
+      .map((s) => s.id);
+    lastActivitySlots = aliveIds.length;
+    await tracker.poll(aliveIds);
+  };
+
   const pollActivity = async () => {
     if (activityInFlight) return;
     activityInFlight = true;
+    const started = Date.now();
     try {
-      // 闸门必须来自**权威的 tmux 查询**，不能用 provider.isAlive：后者由
-      // 10s 的存活轮询填充，而 poll() 有 inFlight 守卫 —— 激活时两个
-      // restart* 并发启动，pollActivity 刚跑时第一次 listSessions 还没回来，
-      // 于是第一轮 aliveIds 恒为空、一个条目都不采（实测症状）。
-      const sessions = new Set(await tmux.listSessions());
-      provider.setAlive(sessions); // 顺带把树的存活标记推到最新（setAlive 只在变化时 fire）
-      const entries = await store.load();
-      // 键必须是**槽 id**：采样层内部就是 `sessionNameFor(id)`，而 v3 的 tmux
-      // 会话名由**槽** id 派生（一个终端挂 N 个槽 = N 个 tmux 会话）。
-      // 喂条目 id 的后果是：同一终端下只有「槽 id 恰好等于条目 id」的那一个
-      // （迁移出来的、或本 Task 之前新建的）能对上，第 2 个起的会话**永远**
-      // 采不到样 ⇒ 那一行的运行图标永远不转，且不报任何错 —— 静默、无测试能抓。
-      const aliveIds = entries
-        .flatMap((e) => e.sessions)
-        .filter((s) => sessions.has(sessionNameFor(s.id)))
-        .map((s) => s.id);
-      await tracker.poll(aliveIds);
+      // 超时值 8s：活动轮询节奏是 900ms，正常一拍远快于此，给足余量；而它
+      // 又必须**小于会让人以为是「卡死」的那个时长**。超时即跳过本拍，
+      // finally 释放闸门，下一拍照常跑。
+      await withTimeout(runActivityPollBody(), 8_000, '活动轮询');
+      // 成功路径按 shouldLogActivity() 节流：900ms 一拍、每拍一行会把面板冲爆。
+      if (shouldLogActivity()) {
+        log.info(
+          `活动轮询完成：会话 ${lastActivitySessions} 个、采样槽 ${lastActivitySlots} 个，` +
+          `耗时 ${Date.now() - started}ms`,
+        );
+      }
+    } catch (err) {
+      log.warn(
+        `活动轮询失败/超时，跳过本拍，耗时 ${Date.now() - started}ms：` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
-      activityInFlight = false;
+      activityInFlight = false; // 一定释放：无论成功、失败还是超时
     }
   };
 
@@ -234,6 +410,10 @@ export function activate(context: vscode.ExtensionContext): void {
     activityTimer = undefined;
     if (view.visible) {
       activityTimer = setInterval(() => void pollActivity(), ACTIVITY_POLL_INTERVAL_MS);
+      log.info(`活动轮询已启动：间隔 ${ACTIVITY_POLL_INTERVAL_MS}ms`);
+    } else {
+      // 关键诊断：与 restartPolling 同理，visible=false 时这拍根本不装。
+      log.info(`活动轮询未启动：view.visible=${view.visible}`);
     }
     void pollActivity();
   };
@@ -266,6 +446,8 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     view.onDidChangeVisibility((e) => {
+      // 可见性是两个定时器启停的唯一开关，记下来才能对上「为什么没采样」。
+      log.info(`面板可见性变化：visible=${e.visible}`);
       restartPolling();
       restartActivityPolling();
       // 面板变为可见 = reconcile 的触发点之一。onDidExpandElement 单独用
@@ -281,7 +463,12 @@ export function activate(context: vscode.ExtensionContext): void {
     // 每秒跑一次，挂在那里等于引入一个隐式定时器。
     view.onDidExpandElement(() => void reconcileNow()),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('tmuxTerminals')) restartPolling();
+      // 两个轮询都要重启：只重启存活轮询的话，活动轮询会继续按旧节奏跑，
+      // 且面板可见性若因此变化也接不上 —— 视觉徽章会停在旧状态。
+      if (e.affectsConfiguration('tmuxTerminals')) {
+        restartPolling();
+        restartActivityPolling();
+      }
     }),
     tracker.onDidChange(() => provider.refresh()),
     new vscode.Disposable(() => {
@@ -305,8 +492,36 @@ export function activate(context: vscode.ExtensionContext): void {
   const sessionItem = (arg: unknown): SessionTreeItem | undefined =>
     arg instanceof SessionTreeItem ? arg : undefined;
 
-  const reg = (id: string, fn: (...a: any[]) => any) =>
-    context.subscriptions.push(vscode.commands.registerCommand(id, fn));
+  // 已注册命令条数：激活收尾要汇总，用来核对「注册⇒声明」清单是否齐全 ——
+  // 若 activate 在注册之前抛了，这个数就是 0，正好对上「点什么都没反应」。
+  let commandCount = 0;
+
+  const reg = (id: string, fn: (...a: any[]) => any): void => {
+    commandCount += 1;
+    // 每个命令都包一层观测：进入时记 id + **实参形状**，正常返回记耗时，
+    // 抛异常记 id + 耗时 + 异常并提示用户去哪看日志，然后原样 rethrow。
+    //
+    // 实参形状是这条日志的全部价值：`item(arg)` / `sessionItem(arg)` 用的是
+    // `instanceof`，判错时命令会**静默什么都不做** —— 只有把实参形状记下来，
+    // 才分辨得出「命令压根没进来」还是「进来了但守卫没命中」。
+    const wrapped = async (...a: any[]): Promise<any> => {
+      const started = Date.now();
+      log.info(`命令 ${id} 进入，实参形状=[${a.map(describeArg).join(', ')}]`);
+      try {
+        const result = await fn(...a);
+        log.info(`命令 ${id} 完成，耗时 ${Date.now() - started}ms`);
+        return result;
+      } catch (err) {
+        log.error(`命令 ${id} 失败，耗时 ${Date.now() - started}ms`, err);
+        void vscode.window.showErrorMessage(
+          `命令 ${id} 执行失败。详见「输出 → TMUX 终端」。`,
+        );
+        throw err;
+      }
+    };
+    // 返回值刻意丢弃（调用点都没有用）：reg 返回 void。
+    context.subscriptions.push(vscode.commands.registerCommand(id, wrapped));
+  };
 
   reg('tmuxTerminals.open', async (arg: unknown) => {
     const it = sessionItem(arg);
@@ -523,6 +738,38 @@ export function activate(context: vscode.ExtensionContext): void {
     await poll();
     provider.refresh();
   });
+
+  // 激活收尾汇总。**放在真正的最末尾**（而不是三行轮询启动之后）：命令是
+  // 在这之后才逐个注册的，只有到这里 commandCount 才是完整值 —— 它正是
+  // 「面板看得见但点不动」的核心判据（0 条 = activate 在注册前就抛了）。
+  // 配合 view.visible（决定两个定时器是否真装上）与总耗时，这一行足够判断
+  // 失效到底卡在注册、可见性还是耗时上。
+  log.info(
+    `激活完成：已注册命令 ${commandCount} 条` +
+    `，view.visible=${view.visible}` +
+    `，总耗时 ${Date.now() - activateStarted}ms`,
+  );
+}
+
+/**
+ * 扩展入口。**只负责把 activateInner 包进 try/catch** —— 见 activateInner
+ * 上方注释：它一旦抛异常，所有命令都不会注册，而树视图已经建好了，用户
+ * 看到的就是「面板看得见、点什么都没反应」且完全静默。这里把那种静默
+ * 变成一条日志 + 一个可见的错误提示，再原样抛出（让 VS Code 也记录一次）。
+ */
+export function activate(context: vscode.ExtensionContext): void {
+  const log = new Log();
+  context.subscriptions.push(log);
+  log.info('扩展激活开始');
+  try {
+    activateInner(context, log);
+  } catch (err) {
+    log.error('激活失败：所有命令都不会注册 —— 面板会「看得见但点不动」，就是这里', err);
+    void vscode.window.showErrorMessage(
+      '终端插件激活失败，所有按钮都会失效。详见「输出 → TMUX 终端」。',
+    );
+    throw err;
+  }
 }
 
 export function deactivate(): void {
