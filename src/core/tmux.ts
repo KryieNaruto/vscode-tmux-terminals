@@ -129,9 +129,17 @@ export const DEFAULT_TASK_TITLE = 'Claude Code';
 /**
  * pane title 前导字符是否是 claude 用来表示「正在运行」的旋转指示符。
  *
- * 实测：claude 把 pane title 设成 `<指示符> <文字>`。运行中前导字符在
- * Braille 点阵字符（U+2800–U+28FF）之间轮转（实测抓到 ⠐/⠂ 约每 1.5s
- * 切换一次）；空闲时固定为 ✳ 之类的普通符号，不在这个 Unicode 分区。
+ * **这只是老版本 claude 的兼容判据 —— 新版本 claude 的 title 不再轮转。**
+ * 2026-10-12 实测：22 个 `tmuxterm-*` 会话、30 秒内 13059 轮采样 / 287298 次
+ * 读取，pane title 首字符**恒为 `✳`(U+2733)，Braille 分区命中 0 次**；其中
+ * 确实在执行的（正在跑 subagent 的）也一样是 `✳`。所以本函数对新版本**永不
+ * 返回 true**，真正的「在运行」判据是 `activityTracker.ts` 里的 **pane 内容
+ * 差分**（窗口见那边导出的 ACTIVITY_WINDOW_MS）。
+ *
+ * 保留本函数与它的调用（`ActivityTracker.poll` 里作为 `running` 的 OR 一项）是
+ * 零成本的老版本兜底：旧版 claude 把 pane title 设成 `<指示符> <文字>`，运行中
+ * 前导字符在 Braille 点阵字符（U+2800–U+28FF）之间轮转（实测抓到 ⠐/⠂ 约每
+ * 1.5s 切换一次）；空闲时固定为 ✳ 之类的普通符号，不在这个 Unicode 分区。
  * 只认分区、不锁定具体字符，避免字符集变化就失效。
  */
 export function isRunningTitle(title: string): boolean {
@@ -167,7 +175,7 @@ export function taskNameFromTitle(title: string): string {
 }
 
 /**
- * 一次 `display-message` 里两个字段之间的分隔符。
+ * 一次 `display-message` 里四个字段之间的分隔符。
  *
  * **为什么不用控制字符（U+001F）—— 实测踩到的坑，勿改回去：** tmux 3.4 的
  * `display-message -p` 会把格式串里出现的控制字符**转义成八进制字面量**再输出：
@@ -177,48 +185,76 @@ export function taskNameFromTitle(title: string): string {
  *
  * **可打印的定串 token 反而安全**，靠两层保证：
  * 1. 它是 23 个字符的固定串，`pane_current_command`（进程 basename）不可能正好
- *    含它 —— 而它是**唯一**能破坏切分的字段：parsePaneSample 只按**第一个**分隔符
- *    切，标题是尾字段，即便自带同一个 token 也只伤到它自己那一段。
+ *    含它 —— 而它是**唯一**可能自带该 token 的字段：另两个字段（宽/高）是纯数字、
+ *    不可能含它，标题是尾字段。parsePaneSample 按**前三个**分隔符切，所以即便
+ *    命令字段被截短，也只是让 `isClaudeCommand` 判否 —— 方向是「不显示任务名」，
+ *    安全侧；标题自带 token 也只伤到它自己那一段。
  * 2. 实测 tmux 对可打印文本逐字节透传（中文、`|`、反斜杠都不动）。唯一会变的
  *    是 `#{…}` 形态的元字符（会被再展开一次、整段消失）—— 那是**改前就有**的行为
  *    （原 paneTitle 走同一条 display-message），与本次闸门无关。
  */
 export const PANE_SAMPLE_SEPARATOR = '__tmuxterm_field_sep__';
 
-/** 一次采样拆出的两个字段（见 TmuxClient.paneSample）。 */
+/** 一次采样拆出的四个字段（见 TmuxClient.paneSample）。 */
 export interface PaneSample {
   /** 前台进程名 `#{pane_current_command}`；'' 表示未知。 */
   foreground: string;
   /** pane 标题 `#{pane_title}`；'' 表示未知。 */
   title: string;
+  /** pane 宽度 `#{pane_width}`；0 表示未知。用于识别「内容变化其实是 resize 重排」。 */
+  width: number;
+  /** pane 高度 `#{pane_height}`；0 表示未知。用于识别「内容变化其实是 resize 重排」。 */
+  height: number;
 }
 
-/** 采样读不出任何东西时的值：两个字段都是「未知」。 */
-export const UNKNOWN_PANE_SAMPLE: PaneSample = { foreground: '', title: '' };
+/** 采样读不出任何东西时的值：四个字段都是「未知」。 */
+export const UNKNOWN_PANE_SAMPLE: PaneSample = { foreground: '', title: '', width: 0, height: 0 };
+
+/** 解析 pane 宽/高的一个字段：纯数字才取值，空串/非数字一律 0（未知），绝不给 NaN。 */
+function parseDimension(raw: string): number {
+  return /^\d+$/.test(raw) ? Number(raw) : 0;
+}
 
 /**
- * 解析 `#{pane_current_command}<PANE_SAMPLE_SEPARATOR>#{pane_title}` 的输出。
+ * 解析
+ * `#{pane_current_command}<SEP>#{pane_width}<SEP>#{pane_height}<SEP>#{pane_title}`。
  *
- * 一次 display-message 同时取回两个字段，是为了**不额外多起一个 tmux 进程**：
+ * 一次 display-message 同时取回四个字段，是为了**不额外多起一个 tmux 进程**：
  * 采样循环每 ≈900 ms 对每个条目跑一次（extension.ts 的
- * ACTIVITY_POLL_INTERVAL_MS），翻倍是这一层实打实的开销；何况两个字段本就来自
- * 同一个 pane 的同一瞬间，分开取还多一个「命令与标题不同步」的窗口。
+ * ACTIVITY_POLL_INTERVAL_MS），拆开是这一层实打实的开销；何况四个字段本就来自
+ * 同一个 pane 的同一瞬间，分开取还多一个「字段之间不同步」的窗口。尺寸也要一起
+ * 取，是因为 resize 会让 capture-pane 的输出**整体变化**，尺寸是识别「这轮内容
+ * 变化其实是重排、不是应用在跑」的唯一低成本信号。
  *
- * **只按第一个分隔符切。** 万一标题自带同一个 token，按第一个切时它留在标题
- * 那一段里、两个字段仍各归各位；命令字段被截短只会让 `isClaudeCommand` 判否
+ * **字段顺序把 `title` 放最后、宽度高度夹在中间。** 唯一的理由见
+ * PANE_SAMPLE_SEPARATOR 注释：title 是唯一可能自带该 token 的字段，放尾段才伤不到
+ * 前三个字段的切分；命令与宽/高（纯数字）都不可能含 token。
+ *
+ * **只按前三个分隔符切。** 万一标题自带同一个 token，按前三个切时它留在标题
+ * 那一段里、四个字段仍各归各位；命令字段被截短只会让 `isClaudeCommand` 判否
  * —— 方向是「不显示任务名」，安全侧。
  *
- * **畸形响应（没有分隔符、空输出）返回两个空串**，不抛错、也不把整串当标题：
- * 空输出正是 display-message 的 pane 目标写错时的形态（exit 0 + 空，见本文件
+ * **宽/高的 0 = 未知。** 空串/非数字一律给 0（不给 NaN），交给调用方判「几何不可信、
+ * 跳过 resize 判定」。
+ *
+ * **畸形响应（缺任一分隔符、空输出）返回四个字段全未知**，不抛错、也不把整串当
+ * 标题：空输出正是 display-message 的 pane 目标写错时的形态（exit 0 + 空，见本文件
  * 顶部注释），此时「未知」必须显式表达，由调用方按安全侧处理。
  */
 export function parsePaneSample(stdout: string): PaneSample {
   const text = stdout.trim();
-  const at = text.indexOf(PANE_SAMPLE_SEPARATOR);
-  if (at < 0) return { ...UNKNOWN_PANE_SAMPLE };
+  const sepLen = PANE_SAMPLE_SEPARATOR.length;
+  const i1 = text.indexOf(PANE_SAMPLE_SEPARATOR);
+  if (i1 < 0) return { ...UNKNOWN_PANE_SAMPLE };
+  const i2 = text.indexOf(PANE_SAMPLE_SEPARATOR, i1 + sepLen);
+  if (i2 < 0) return { ...UNKNOWN_PANE_SAMPLE };
+  const i3 = text.indexOf(PANE_SAMPLE_SEPARATOR, i2 + sepLen);
+  if (i3 < 0) return { ...UNKNOWN_PANE_SAMPLE };
   return {
-    foreground: text.slice(0, at).trim(),
-    title: text.slice(at + PANE_SAMPLE_SEPARATOR.length).trim(),
+    foreground: text.slice(0, i1).trim(),
+    width: parseDimension(text.slice(i1 + sepLen, i2).trim()),
+    height: parseDimension(text.slice(i2 + sepLen, i3).trim()),
+    title: text.slice(i3 + sepLen).trim(),
   };
 }
 

@@ -240,8 +240,13 @@ describe('parsePid —— 解析 `#{pane_pid}`', () => {
 });
 
 describe('parsePaneSample —— 一次 display-message 拆出前台命令与标题', () => {
-  const raw = (foreground: string, title: string): string =>
-    `${foreground}${PANE_SAMPLE_SEPARATOR}${title}`;
+  const raw = (
+    foreground: string,
+    width: string | number,
+    height: string | number,
+    title: string,
+  ): string =>
+    `${foreground}${PANE_SAMPLE_SEPARATOR}${width}${PANE_SAMPLE_SEPARATOR}${height}${PANE_SAMPLE_SEPARATOR}${title}`;
 
   it('分隔符是可打印定串（控制字符会被 tmux 转义成八进制字面量，见常量注释）', () => {
     assert.strictEqual(PANE_SAMPLE_SEPARATOR, '__tmuxterm_field_sep__');
@@ -251,37 +256,58 @@ describe('parsePaneSample —— 一次 display-message 拆出前台命令与标
     assert.ok(PANE_SAMPLE_SEPARATOR.length >= 8, '太短会撞上真进程名');
   });
 
-  it('拆出两个字段（并吃掉 tmux 输出末尾的换行）', () => {
-    assert.deepStrictEqual(parsePaneSample(raw('claude', '⠐ 编译内核') + '\n'),
-      { foreground: 'claude', title: '⠐ 编译内核' });
+  it('拆出四个字段（并吃掉 tmux 输出末尾的换行）', () => {
+    assert.deepStrictEqual(parsePaneSample(raw('claude', 231, 72, '⠐ 编译内核') + '\n'),
+      { foreground: 'claude', width: 231, height: 72, title: '⠐ 编译内核' });
+  });
+
+  it('★ 正常四段输入解析出正确的宽高（纯数字 → Number，不是字符串）', () => {
+    const sample = parsePaneSample(raw('claude', 200, 60, '⠐ 编译内核'));
+    assert.strictEqual(sample.width, 200);
+    assert.strictEqual(sample.height, 60);
+    assert.strictEqual(typeof sample.width, 'number');
+    assert.strictEqual(typeof sample.height, 'number');
   });
 
   it('任一侧为空串时另一侧仍各归各位', () => {
-    assert.deepStrictEqual(parsePaneSample(raw('bash', '')),
-      { foreground: 'bash', title: '' });
-    assert.deepStrictEqual(parsePaneSample(raw('', 'some title')),
-      { foreground: '', title: 'some title' });
+    assert.deepStrictEqual(parsePaneSample(raw('bash', 231, 72, '')),
+      { foreground: 'bash', width: 231, height: 72, title: '' });
+    assert.deepStrictEqual(parsePaneSample(raw('', 231, 72, 'some title')),
+      { foreground: '', width: 231, height: 72, title: 'some title' });
   });
 
-  it('★ 只按第一个分隔符切 —— 标题自带的同一个 token 也伤不到切分', () => {
-    // 纵深防御：能破坏切分的只有「命令字段里含分隔符」（标题是尾字段）。
-    // 按第一个切时，标题里多出来的 token 留在标题那一段里。
-    assert.deepStrictEqual(parsePaneSample(raw('claude', `a${PANE_SAMPLE_SEPARATOR}b`)),
-      { foreground: 'claude', title: `a${PANE_SAMPLE_SEPARATOR}b` });
+  it('★ 宽高非数字（空串 / abc）→ 0（未知），不是 NaN、也不抛错', () => {
+    // 空串/非数字一律 0，绝不给 NaN —— NaN 会污染下游所有比较，看似有值实则恒不等。
+    for (const [w, h] of [['', 'abc'], ['abc', ''], ['12x', '3.5']] as const) {
+      const sample = parsePaneSample(raw('claude', w, h, '任务'));
+      assert.strictEqual(sample.width, 0, `宽 "${w}" 应为 0`);
+      assert.strictEqual(sample.height, 0, `高 "${h}" 应为 0`);
+    }
   });
 
-  it('★ 畸形响应（空输出 / 没有分隔符）→ 两个空串，不抛错也不把整串当标题', () => {
+  it('★ 只按前三个分隔符切 —— 标题自带的同一个 token 也伤不到切分', () => {
+    // 纵深防御：能破坏切分的只有「命令字段里含分隔符」（宽/高是纯数字、标题是尾字段）。
+    // 按前三个切时，标题里多出来的 token 留在标题那一段里。
+    assert.deepStrictEqual(parsePaneSample(raw('claude', 231, 72, `a${PANE_SAMPLE_SEPARATOR}b`)),
+      { foreground: 'claude', width: 231, height: 72, title: `a${PANE_SAMPLE_SEPARATOR}b` });
+  });
+
+  it('★ 畸形响应（空输出 / 缺任一分隔符）→ 四个字段全未知，不抛错也不把整串当标题', () => {
     // 空输出正是 display-message 的 pane 目标写错时的形态（exit 0 + 空）。
     // 若把整串当标题，那段「未知」会被下游当成一个真标题显示出来。
-    for (const bad of ['', '\n', '   ', 'bash', 'claude']) {
-      assert.deepStrictEqual(parsePaneSample(bad), { foreground: '', title: '' },
-        `畸形输入 ${JSON.stringify(bad)} 应判为两个字段都未知`);
+    // 三段（缺最后一个分隔符）也要整个判未知 —— 不能把 `231` 当标题、也不能猜宽高。
+    const missingOneSep = `claude${PANE_SAMPLE_SEPARATOR}231${PANE_SAMPLE_SEPARATOR}72`;
+    for (const bad of ['', '\n', '   ', 'bash', 'claude', missingOneSep]) {
+      assert.deepStrictEqual(parsePaneSample(bad),
+        { foreground: '', width: 0, height: 0, title: '' },
+        `畸形输入 ${JSON.stringify(bad)} 应判为四个字段都未知`);
     }
   });
 });
 
 describe('taskNameFromSample —— pane 前台不是 claude 就不采信 pane title', () => {
-  const s = (foreground: string, title: string) => ({ foreground, title });
+  // 尺寸与任务名无关，这里给固定非零值让 PaneSample 成立（宽高不参与本 describe 的判定）。
+  const s = (foreground: string, title: string) => ({ foreground, title, width: 231, height: 72 });
 
   it('★ 前台不是 claude 时，shell 提示符形状的标题一律不算任务名', () => {
     // 本次新增的闸门，也是本任务的核心：claude 退出后 pane 前台变回 shell，
@@ -319,7 +345,7 @@ describe('taskNameFromSample —— pane 前台不是 claude 就不采信 pane t
   });
 
   it('★ 采样未知（畸形响应）→ 空串，不退化成显示什么', () => {
-    assert.strictEqual(taskNameFromSample({ foreground: '', title: '' }), '');
+    assert.strictEqual(taskNameFromSample({ foreground: '', title: '', width: 0, height: 0 }), '');
     // 未知前台 + 一段看似任务名的标题：不能因为「标题好看」就采信
     assert.strictEqual(taskNameFromSample(s('', '创建多引擎版 /ask 命令并统一')), '');
   });

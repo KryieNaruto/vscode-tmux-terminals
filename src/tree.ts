@@ -156,12 +156,17 @@ export class SessionTreeItem extends vscode.TreeItem {
     public readonly alive: boolean,
     /** 可能是 undefined —— 回退来的名字没有对应的本次采样状态。 */
     public readonly activity: EntryActivity | undefined,
-    /** `label` 用它；空串回落「无会话」（见 core/sessions.ts 的 sessionLabel）。 */
+    /**
+     * `label` 用它；空串按槽是否存活回落「未命名会话」/「无会话」
+     * （见 core/sessions.ts 的 sessionLabel）。
+     */
     public readonly taskName: string,
     /** 任务名是哪来的，只用于 tooltip —— 三个来源的含义完全不同。 */
     public readonly titleSource: 'pane' | 'fallback' | 'none',
   ) {
-    super(sessionLabel(taskName), vscode.TreeItemCollapsibleState.None);
+    // alive 是构造函数的形参，在 super() 这一行只能直接引用它，**不能**写
+    // this.alive（参数属性尚未赋值）。
+    super(sessionLabel(taskName, alive), vscode.TreeItemCollapsibleState.None);
     this.id = `session:${slot.id}`;
     this.contextValue = alive ? 'sessionAlive' : 'sessionDead';
     this.iconPath = !alive

@@ -94,4 +94,20 @@ describe('sessionLabel', () => {
   it('单字符任务名照样算有名字', () => {
     assert.strictEqual(sessionLabel('A'), 'A');
   });
+
+  it('★ 空任务名 + 槽存活 → 「未命名会话」（不是假话「无会话」）', () => {
+    // 槽存活但 claude 还没生成任务名时，pane title 是占位符 `✳ Claude Code`，
+    // 清洗成空串。此时显示「无会话」是假话 —— 实测有槽正在跑 subagent 却被
+    // 显示成「无会话」。存活改说「未命名会话」。
+    assert.strictEqual(sessionLabel('', true), '未命名会话');
+  });
+
+  it('★ 空任务名 + 槽不存活 → 「无会话」', () => {
+    assert.strictEqual(sessionLabel('', false), '无会话');
+  });
+
+  it('★ 有任务名时不受 alive 影响，原样返回', () => {
+    assert.strictEqual(sessionLabel('修复登录超时', true), '修复登录超时');
+    assert.strictEqual(sessionLabel('修复登录超时', false), '修复登录超时');
+  });
 });
