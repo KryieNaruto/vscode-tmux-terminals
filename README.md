@@ -68,11 +68,11 @@ profile / 模型上。
 
 ```bash
 npx @vscode/vsce package
-# 产出 vscode-tmux-terminals-0.2.0.vsix
+# 产出 vscode-tmux-terminals-0.2.8.vsix
 ```
 
 然后在远端窗口的扩展面板里选择「从 VSIX 安装」，挑上面那个
-`vscode-tmux-terminals-0.2.0.vsix`。
+`vscode-tmux-terminals-0.2.8.vsix`。
 
 > 本扩展声明了 `extensionKind: workspace`，必须运行在远端才能调用
 > 远端的 tmux。装在本地是无效的。

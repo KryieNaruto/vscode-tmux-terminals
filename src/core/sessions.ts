@@ -45,7 +45,7 @@ export function nextSessionOrder(slots: readonly SessionSlot[]): number {
 }
 
 /**
- * 三级节点的标题：有任务名就用它，没有就回落成「无会话」。
+ * 三级节点的标题：有任务名就用它，没有就按槽是否存活回落。
  *
  * **为什么回落而不是「不生成这一行」**：三级恒生成（每个槽一行）是这一版的
  * 前提 —— 「接回某个会话」需要一个永远点得到的落脚点。X 关掉会话之后槽还在、
@@ -53,10 +53,18 @@ export function nextSessionOrder(slots: readonly SessionSlot[]): number {
  * 回同一条对话。若按「没有名字就不生成」，关掉的那一行会整个消失，用户将
  * **没有任何入口**把它接回来。
  *
+ * **为什么不回落成空白/统一「无会话」，而要区分 alive：** 槽**存活**但 claude
+ * 还没生成任务名时，pane title 是占位符 `✳ Claude Code`，会被清洗成空串
+ * （见 core/tmux.ts 的 DEFAULT_TASK_TITLE）—— 此时显示「无会话」是**假话**：
+ * 实测有一个槽正在跑 subagent，却因为还没起任务名被显示成「无会话」。存活时改
+ * 显示「未命名会话」（实话：会话在、只是还没名字），未存活（tab 已关、tmux 进程
+ * 没了）仍然「无会话」。
+ *
  * **只判长度、不 trim**：任务名的两个来源（pane title / 绑定对话的 aiTitle）
  * 都已经各自做过清洗，这里再 trim 一次只可能把采集到的真实标题吃掉 —— 而
  * 症状是「明明有标题却显示无会话」，不报错。空白串是「有名字」，不是「没有」。
  */
-export function sessionLabel(taskName: string): string {
-  return taskName.length > 0 ? taskName : '无会话';
+export function sessionLabel(taskName: string, alive = false): string {
+  if (taskName.length > 0) return taskName;
+  return alive ? '未命名会话' : '无会话';
 }

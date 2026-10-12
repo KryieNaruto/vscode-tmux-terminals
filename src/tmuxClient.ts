@@ -189,29 +189,34 @@ export class TmuxClient {
   }
 
   /**
-   * 一次取回 pane 的前台进程名与标题：
-   * `#{pane_current_command}<PANE_SAMPLE_SEPARATOR>#{pane_title}`。
+   * 一次取回 pane 的四个字段：
+   * `#{pane_current_command}<SEP>#{pane_width}<SEP>#{pane_height}<SEP>#{pane_title}`。
    *
-   * **必须一次调用取两个字段，不能拆成两次 display-message。** 这是
+   * **必须一次调用取四个字段，不能拆成多次 display-message。** 这是
    * `ActivityTracker` 每 ≈900 ms 对每个条目跑一次的采样路径
    * （extension.ts 的 ACTIVITY_POLL_INTERVAL_MS），拆开等于让这层的 tmux
-   * 进程数翻倍；而且两个字段本就来自同一个 pane 的同一瞬间，分开取还多一个
-   * 「命令与标题不同步」的窗口。
+   * 进程数翻几倍；而且这些字段本就来自同一个 pane 的同一瞬间，分开取还多一个
+   * 「字段之间不同步」的窗口。
+   *
+   * **尺寸为什么也一起取：** resize 会让 capture-pane 的输出整体变化（tmux 把同名
+   * 尺寸的 pane 一起重排），单看内容差分会把一次窗口 resize 误判成「所有会话都在
+   * 跑」。尺寸是识别这种重排的**唯一低成本信号**——它跟命令/title 走同一条
+   * display-message，零额外 tmux 进程；拆出去单独取就正是上面要避免的翻倍。
    *
    * 分隔符与解析见 core/tmux.ts 的 PANE_SAMPLE_SEPARATOR / parsePaneSample。
    * 前台进程名喂 isClaudeCommand 决定「要不要采信 pane title」，标题喂
    * isRunningTitle / taskNameFromTitle（claude 把它编码成
-   * `<指示符> <任务名>`）。
+   * `<指示符> <任务名>`），宽/高喂 ActivityTracker 的 resize 静默期。
    *
    * 目标同样必须走 paneTarget（带冒号），漏写时 tmux 静默返回空（exit 0），
-   * parsePaneSample 对空输出给回「两个字段都未知」—— 未知名不进任务名，
-   * 方向安全。
+   * parsePaneSample 对空输出给回「四个字段都未知」—— 未知名不进任务名、
+   * 未知几何（0）不进 resize 判定，方向安全。
    */
   async paneSample(name: string): Promise<PaneSample> {
     try {
       const { stdout } = await run(this.tmuxPath, [
         'display-message', '-p', '-t', paneTarget(name),
-        `#{pane_current_command}${PANE_SAMPLE_SEPARATOR}#{pane_title}`,
+        `#{pane_current_command}${PANE_SAMPLE_SEPARATOR}#{pane_width}${PANE_SAMPLE_SEPARATOR}#{pane_height}${PANE_SAMPLE_SEPARATOR}#{pane_title}`,
       ], {
         timeout: this.timeoutMs,
         killSignal: 'SIGKILL',

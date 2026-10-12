@@ -5,7 +5,7 @@ import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { TmuxClient } from '../src/tmuxClient';
-import { taskNameFromSample } from '../src/core/tmux';
+import { taskNameFromSample, UNKNOWN_PANE_SAMPLE } from '../src/core/tmux';
 
 const run = promisify(execFile);
 const client = new TmuxClient('tmux');
@@ -89,19 +89,25 @@ describe('TmuxClient（集成，需要本机有 tmux）', function () {
   });
 
   describe('paneSample —— 一次调用取回前台命令与标题（任务名闸门的输入）', () => {
-    it('一次 display-message 同时取回两个字段', async () => {
+    it('一次 display-message 同时取回四个字段', async () => {
       await run('tmux', ['new-session', '-d', '-s', A]);
       assert.strictEqual(await client.waitForShell(A, 3000), true);
       await run('tmux', ['select-pane', '-t', `=${A}:`, '-T', 'PANESAMPLE 探针']);
       const s = await client.paneSample(A);
-      assert.deepStrictEqual(s, { foreground: 'bash', title: 'PANESAMPLE 探针' });
+      // 前台命令与标题是严格等值：它们才是本用例要钉的东西。
+      assert.deepStrictEqual({ foreground: s.foreground, title: s.title },
+        { foreground: 'bash', title: 'PANESAMPLE 探针' });
+      // 宽高由运行环境的真实 pane 决定，不能写死具体数值（否则换终端尺寸必红）；
+      // 只断言它们可信可用。
+      assert.ok(s.width > 0 && s.height > 0,
+        `真实 pane 的宽高应为正数，实际 width=${s.width} height=${s.height}`);
     });
 
-    it('关键：会话不存在时返回两个空串（未知），不是把整串当标题', async () => {
+    it('关键：会话不存在时返回四个空字段（未知），不是把整串当标题', async () => {
       // display-message 目标写错/会话不存在时 tmux 是 exit 0 + 空输出，
       // 静默失败。此时「未知」必须显式表达，否则下游会把空当成一个真标题。
       assert.deepStrictEqual(await client.paneSample('tmuxterm-cafebabe'),
-        { foreground: '', title: '' });
+        UNKNOWN_PANE_SAMPLE);
     });
 
     it('★ 前台换成非 claude 进程后，采样真的反映出来（闸门端到端）', async () => {
@@ -161,7 +167,7 @@ describe('TmuxClient（集成，需要本机有 tmux）', function () {
     const calls = async (): Promise<string[]> =>
       (await fs.readFile(log, 'utf8')).split('\n').filter((l) => l.trim().length > 0);
 
-    it('★ 一次 paneSample 恰好一个 tmux 进程，且这一次就把两个字段都取了', async () => {
+    it('★ 一次 paneSample 恰好一个 tmux 进程，且这一次就把四个字段都取了', async () => {
       await run('tmux', ['new-session', '-d', '-s', A]);
       assert.strictEqual(await client.waitForShell(A, 3000), true);
       await run('tmux', ['select-pane', '-t', `=${A}:`, '-T', 'ONE-CALL 探针']);
@@ -178,8 +184,12 @@ describe('TmuxClient（集成，需要本机有 tmux）', function () {
       assert.ok(
         lines[0].includes('#{pane_current_command}') && lines[0].includes('#{pane_title}'),
         `那一次调用必须同时取两个字段，实际：${lines[0]}`);
-      // 一次调用确实把两个字段都带回来了（值也要对，免得「一次调用但只取一个字段」蒙混）
-      assert.deepStrictEqual(s, { foreground: 'bash', title: 'ONE-CALL 探针' });
+      // 一次调用确实把四个字段都带回来了（值也要对，免得「一次调用但只取一个字段」蒙混）。
+      // 前台命令与标题严格等值；宽高由运行环境的真实 pane 决定，只断言可信可用。
+      assert.deepStrictEqual({ foreground: s.foreground, title: s.title },
+        { foreground: 'bash', title: 'ONE-CALL 探针' });
+      assert.ok(s.width > 0 && s.height > 0,
+        `真实 pane 的宽高应为正数，实际 width=${s.width} height=${s.height}`);
 
       // 计数器自证：再来一次就应多一行。壳要是根本没记，上面那条会先红 —— 这条
       // 用来证明「1 行」确实是「1 个进程」而不是「壳没工作」。
