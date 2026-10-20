@@ -189,10 +189,10 @@ export class TmuxClient {
   }
 
   /**
-   * 一次取回 pane 的四个字段：
-   * `#{pane_current_command}<SEP>#{pane_width}<SEP>#{pane_height}<SEP>#{pane_title}`。
+   * 一次取回 pane 的五个字段：
+   * `#{pane_current_command}<SEP>#{pane_width}<SEP>#{pane_height}<SEP>#{cursor_y}<SEP>#{pane_title}`。
    *
-   * **必须一次调用取四个字段，不能拆成多次 display-message。** 这是
+   * **必须一次调用取五个字段，不能拆成多次 display-message。** 这是
    * `ActivityTracker` 每 ≈900 ms 对每个条目跑一次的采样路径
    * （extension.ts 的 ACTIVITY_POLL_INTERVAL_MS），拆开等于让这层的 tmux
    * 进程数翻几倍；而且这些字段本就来自同一个 pane 的同一瞬间，分开取还多一个
@@ -206,17 +206,20 @@ export class TmuxClient {
    * 分隔符与解析见 core/tmux.ts 的 PANE_SAMPLE_SEPARATOR / parsePaneSample。
    * 前台进程名喂 isClaudeCommand 决定「要不要采信 pane title」，标题喂
    * isRunningTitle / taskNameFromTitle（claude 把它编码成
-   * `<指示符> <任务名>`），宽/高喂 ActivityTracker 的 resize 静默期。
+   * `<指示符> <任务名>`），宽/高喂 ActivityTracker 的 resize 静默期，光标行
+   * （`#{cursor_y}`）喂 ActivityTracker 的「打字不算活动」判定 —— 注意那是**原始
+   * 屏幕行号**，要先经 core/tmux.ts 的 cursorRowAfterStrip 映射到 strip 后的行号
+   * （见那边 poll 里的 JSDoc）。
    *
    * 目标同样必须走 paneTarget（带冒号），漏写时 tmux 静默返回空（exit 0），
-   * parsePaneSample 对空输出给回「四个字段都未知」—— 未知名不进任务名、
-   * 未知几何（0）不进 resize 判定，方向安全。
+   * parsePaneSample 对空输出给回「五个字段都未知」—— 未知名不进任务名、
+   * 未知几何（0）不进 resize 判定、未知光标行（-1）不进打字判定，方向安全。
    */
   async paneSample(name: string): Promise<PaneSample> {
     try {
       const { stdout } = await run(this.tmuxPath, [
         'display-message', '-p', '-t', paneTarget(name),
-        `#{pane_current_command}${PANE_SAMPLE_SEPARATOR}#{pane_width}${PANE_SAMPLE_SEPARATOR}#{pane_height}${PANE_SAMPLE_SEPARATOR}#{pane_title}`,
+        `#{pane_current_command}${PANE_SAMPLE_SEPARATOR}#{pane_width}${PANE_SAMPLE_SEPARATOR}#{pane_height}${PANE_SAMPLE_SEPARATOR}#{cursor_y}${PANE_SAMPLE_SEPARATOR}#{pane_title}`,
       ], {
         timeout: this.timeoutMs,
         killSignal: 'SIGKILL',

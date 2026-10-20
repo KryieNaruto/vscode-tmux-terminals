@@ -377,6 +377,20 @@ function activateInner(context: vscode.ExtensionContext, log: Log): void {
       .map((s) => s.id);
     lastActivitySlots = aliveIds.length;
     await tracker.poll(aliveIds);
+
+    // 用户正看着的那个终端 = 已经看过，白点不该亮。**必须放在 poll 之后**：
+    // 本拍先把状态推成 done-unseen，这里再立刻清掉；反过来的话要等下一拍
+    // （最多 900ms）才清，用户会看到一次多余的亮起。
+    //
+    // 判据取「窗口有焦点 **且** 该终端是活动终端」两条 —— 只有这两条同时成立
+    // 才算"在看"：用户切去别的窗口时不该继续静默（那时没在看），面板被别的
+    // 终端占用时也不该（活动终端是另一个）。代价：终端面板可见但没被选中时
+    // 不静默，只会多亮一次，不会漏掉真信号。
+    const activeTerminal = vscode.window.activeTerminal;
+    if (vscode.window.state.focused && activeTerminal !== undefined) {
+      const seenSlotId = manager.slotIdForTerminal(activeTerminal);
+      if (seenSlotId !== undefined) tracker.markSeen(seenSlotId);
+    }
   };
 
   const pollActivity = async () => {
@@ -530,6 +544,8 @@ function activateInner(context: vscode.ExtensionContext, log: Log): void {
       // 图标应该立刻恢复，不用等下一轮 tmux 轮询。
       // 键是**槽 id**：活动采样层内部就是 `sessionNameFor(id)`，喂条目 id 会
       // 让这一行的绿点永远清不掉（且不报错）。
+      // 点开这一下会让 TUI 重绘，先把它按重排静默掉，否则 5 秒后刚看过的终端反而变绿。
+      tracker.opened(it.slot.id);
       tracker.markSeen(it.slot.id);
       await manager.openSession(it.entry, it.slot);
     }

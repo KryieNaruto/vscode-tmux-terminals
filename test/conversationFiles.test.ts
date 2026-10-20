@@ -6,6 +6,7 @@ import {
   findConversationFile,
   findConversations,
   listConversations,
+  readFirstMessage,
   readTail,
 } from '../src/conversationFiles';
 import { candidatesForCwd, parseAiTitle } from '../src/core/conversation';
@@ -281,5 +282,46 @@ describe('findConversationFile —— 按 id + cwd 精确定位文件（供尾�
     const file = await findConversationFile(home, UUID, '/a/b');
     const tail = await readTail(file!, 64 * 1024);
     assert.strictEqual(tail, line({ type: 'attachment', cwd: '/a/b' }));
+  });
+});
+
+describe('readFirstMessage —— 读头部取首条真实用户消息（标题的次选来源）', () => {
+  const homes: string[] = [];
+  const mk = async (files: Record<string, string>) => {
+    const h = await makeHome(files);
+    homes.push(h);
+    return h;
+  };
+  after(async () => {
+    for (const h of homes) await fs.rm(h, { recursive: true, force: true });
+  });
+
+  it('★ 头部先是 /clear 的合成包裹、后面才是真实提问 → 取真实那条，不取包裹文本', async () => {
+    const home = await mk({
+      [`-ssd-foo/${UUID}.jsonl`]: [
+        line({ type: 'attachment', cwd: '/ssd/foo' }),
+        userLine('<command-name>/clear</command-name>', '/ssd/foo'),
+        userLine('把那个 bug 修了', '/ssd/foo'),
+      ].join('\n'),
+    });
+    const file = path.join(home, '.claude', 'projects', '-ssd-foo', `${UUID}.jsonl`);
+    assert.strictEqual(await readFirstMessage(file), '把那个 bug 修了');
+  });
+
+  it('整条会话只有 /clear（没有任何真实用户消息）→ undefined，绝不编造', async () => {
+    const home = await mk({
+      [`-ssd-foo/${UUID}.jsonl`]: [
+        line({ type: 'attachment', cwd: '/ssd/foo' }),
+        userLine('<command-name>/clear</command-name>', '/ssd/foo'),
+      ].join('\n'),
+    });
+    const file = path.join(home, '.claude', 'projects', '-ssd-foo', `${UUID}.jsonl`);
+    assert.strictEqual(await readFirstMessage(file), undefined);
+  });
+
+  it('文件不存在 → undefined，不抛（读盘失败即这条来源不存在）', async () => {
+    const home = await mk({});
+    const file = path.join(home, '.claude', 'projects', '-ssd-foo', `${UUID}.jsonl`);
+    assert.strictEqual(await readFirstMessage(file), undefined);
   });
 });

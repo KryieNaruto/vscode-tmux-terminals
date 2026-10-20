@@ -104,6 +104,29 @@ export async function readTail(file: string, bytes: number): Promise<string> {
 }
 
 /**
+ * 读一条对话的**首条真实用户消息**（跳过 `/clear` 之类合成包裹的命令回显），
+ * 只读文件头部 HEAD_BYTES。
+ *
+ * **为什么要它**：首条输入是斜杠命令的会话（比如用户按 `/clear` 开新任务），
+ * claude **永不生成** ai-title —— 本机实测 12/12 条这类 transcript 里 ai-title
+ * 出现 0 次，于是这些槽没有名字可显示。首条用户消息是唯一还能给出人话的来源，
+ * 而且它就是用户自己敲的字，不算「把不知道伪装成知道」。
+ *
+ * 注意【两套窗口不要混】：`ai-title` 是**追加**记录、必须读尾部；首条用户消息
+ * 一定在头部。两者各读各的文件窗口。
+ *
+ * 找不到文件 / 读不到 / 没有真实用户消息（比如整条会话只有一条 `/clear`）
+ * → undefined，**绝不编造**。
+ */
+export async function readFirstMessage(file: string): Promise<string | undefined> {
+  try {
+    return parseConversationHead(await readHead(file, HEAD_BYTES)).firstMessage;
+  } catch {
+    return undefined; // 文件读不到 = 这条来源不存在
+  }
+}
+
+/**
  * 按 id + cwd 精确定位会话文件，返回它的**绝对路径**。
  *
  * 与 findConversations 有意重复一部分（都在 projects 下 readdir + 读头部）：

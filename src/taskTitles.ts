@@ -1,7 +1,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { TAIL_BYTES, findConversationFile, readTail } from './conversationFiles';
+import { TAIL_BYTES, findConversationFile, readFirstMessage, readTail } from './conversationFiles';
 import { parseAiTitle } from './core/conversation';
 
 /** 缓存条目上限（超出按最久未访问逐出）—— 只为防条目数异常增长时无界占内存。 */
@@ -57,6 +57,10 @@ export interface TitleSource {
  * - **持久化（可选）**：构造时给了 `persistPath` 才落盘 —— 每次成功写入后
  *   把整份 cache 写出去（`persist`，fire-and-forget），启动时用 `restore()`
  *   读回。省略 `persistPath` 就是原来的纯内存形态。
+ * - **两个来源，按优先级**：先 aiTitle（`readTail` + `parseAiTitle`），读不到才用
+ *   首条真实用户消息（`readFirstMessage`，走 `parseConversationHead`，会剥掉
+ *   `/clear` 这类合成包裹）。首条输入是斜杠命令的会话 claude 永不生成 aiTitle，
+ *   只有第二条来源能给出人话。两条都读不到才不缓存（下次 prewarm 重试）。
  *
  * **为什么要落盘。** 这个 VS Code 窗口的扩展宿主会被反复重建（实测一天十几
  * 代），而缓存纯内存 —— 每重建一次就清零。回填只能靠 10 s 一轮的存活轮询，
@@ -103,8 +107,10 @@ export class TaskTitleCache {
   /**
    * @param home 定位 `~/.claude/projects`；与 `TerminalManager.home()` 同源。
    * @param readTitle 读一条 transcript 尾部并取 aiTitle。省略时用默认实现
-   *   （findConversationFile → readTail → parseAiTitle）。以参数注入是为了：
+   *   （findConversationFile → readTail → parseAiTitle，读不到 aiTitle 再退到
+   *   readFirstMessage 取首条真实用户消息）。以参数注入是为了：
    *   单测注入假 reader 断言「读不到不缓存、下次 prewarm 重试」。
+   *   **注入它就完全接管** —— 两个来源都不走，返回值直接当读盘结果。
    * @param persistPath 标题缓存的落盘路径；省略 = 不持久化（单测走这条）。
    *   **构造函数零 IO** —— 读盘只在显式调用 `restore()` 时发生，因为现有单测
    *   大量用 `'/nonexistent'` 之类路径构造，构造期一碰盘就会把它们弄脏。
@@ -326,6 +332,12 @@ export class TaskTitleCache {
     if (this.readTitle !== undefined) return this.readTitle(conversationId, cwd);
     const file = await findConversationFile(this.home, conversationId, cwd);
     if (file === undefined) return undefined;
-    return parseAiTitle(await readTail(file, TAIL_BYTES));
+    const aiTitle = parseAiTitle(await readTail(file, TAIL_BYTES));
+    if (aiTitle !== undefined) return aiTitle;
+    // 次选来源：**首条真实用户消息**。首条输入是斜杠命令（/clear）的会话 claude
+    // 永不生成 aiTitle（实测 12/12 条 transcript 里 ai-title 出现 0 次），没有
+    // 这条兜底，那些三级行只能永远显示「未命名会话」。顺序不能反：aiTitle 是
+    // claude 自己概括的标题，首条消息只是用户的原始输入。
+    return readFirstMessage(file);
   }
 }

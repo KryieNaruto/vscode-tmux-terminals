@@ -11,7 +11,7 @@ import {
   validateName,
 } from './core/paths';
 import { decideOpen } from './core/restore';
-import { isShellReady, sessionNameFor, shellQuote } from './core/tmux';
+import { SESSION_PREFIX, isShellReady, sessionNameFor, shellQuote } from './core/tmux';
 import { Profile, SessionSlot, TerminalEntry } from './core/types';
 import { LaunchSpec, conversationCommand } from './core/command';
 import {
@@ -175,6 +175,22 @@ export class TerminalManager {
     vscode.window.onDidEndTerminalShellExecution?.((e) => {
       this.busy.delete(e.terminal);
     });
+  }
+
+  /**
+   * 反查：这个终端面板属于哪个**会话槽 id**。
+   *
+   * 键是 tmux 会话名（`tmuxterm-<槽 id>`），调用方要的是槽 id，故在这里剥前缀。
+   * 命中不了（面板不是本扩展建的、或还没进 Map）一律返回 undefined —— 调用方
+   * 拿不到就什么都不做，绝不能猜一个槽 id 出来。
+   */
+  slotIdForTerminal(terminal: vscode.Terminal): string | undefined {
+    for (const [session, t] of this.terminals) {
+      if (t === terminal && session.startsWith(SESSION_PREFIX)) {
+        return session.slice(SESSION_PREFIX.length);
+      }
+    }
+    return undefined;
   }
 
   /**

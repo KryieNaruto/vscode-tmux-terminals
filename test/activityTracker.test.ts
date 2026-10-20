@@ -19,7 +19,7 @@ const SLOT_ENT2 = 'ent2'; // 终端 ENT 的第 2 个槽
  * 采样里的 pane 尺寸。绝大多数用例尺寸恒定不变（不触发 resize 静默期），
  * 语义与加尺寸字段之前完全一致；resize 用例自己另给尺寸。
  */
-const GEOM = { width: 231, height: 72 };
+const GEOM = { width: 231, height: 72, cursorY: 5 };
 
 /**
  * 只给标题的假 reader：前台固定是 `claude`。
@@ -54,16 +54,22 @@ function fakeSampler(samples: Record<string, PaneSample>): PaneSampleReader {
 }
 
 /**
- * 只给 pane **内容**的假 reader：title 恒为空。
+ * 只给 pane **内容**的假 reader：默认 foreground=claude、title 恒为空、尺寸/光标取 GEOM。
  *
  * 专门考「内容差分」这条新判据 —— 新版本 claude 的 pane title 首字符恒为 ✳
  * （Braille 零命中，见 core/tmux.ts 的 isRunningTitle），title 什么都说明不了，
  * 所以这里把它钉成空串，让 running 只能由内容变化推出来。
+ *
+ * `sample` 可选覆盖整个采样（缺省即 claude + GEOM 的等价形态）：「打字不算活动」
+ * 那组用例要单独控制 cursorY / foreground，直接传一个自定义 sample 即可。
  */
-function contentReader(contents: Record<string, string>): PaneSampleReader {
+function contentReader(
+  contents: Record<string, string>,
+  sample: PaneSample = { foreground: 'claude', title: '', ...GEOM },
+): PaneSampleReader {
   return {
     async paneSample(): Promise<PaneSample> {
-      return { foreground: 'claude', title: '', ...GEOM };
+      return sample;
     },
     async capturePane(session: string): Promise<string> {
       return contents[session] ?? '';
@@ -392,6 +398,117 @@ describe('ActivityTracker.poll：pane 内容差分（新版本 claude 的 title 
   });
 });
 
+describe('ActivityTracker.poll：装饰行自跳不算活动（回归：绿点不能凭装饰行冒出）', () => {
+  it('★ 内容只在装饰行上变化 ⇒ 不判 running、状态不变成 done-unseen', async () => {
+    // 回归 2026-10-13 实测的误报：claude TUI 底部两类「自己会跳动的装饰行」
+    // （`% context used` 与 `🧠 … │ 💰 …`）只要有后台 agent 烧 token 就会跳。
+    // 若差分前不剔除它们，已经看过的白点会莫名其妙变绿。
+    // 这里窗口传 0（零 sleep、可确定复现）：变化只能由「亲眼看到对话区变化」给出。
+    const dialog = '对话区: 正在分析问题';
+    const contents: Record<string, string> = {
+      'tmuxterm-a1': [dialog, '🧠 1.0k/200.0k 1% │ 💰 $1.00', '10% context used'].join('\n'),
+    };
+    const tracker = new ActivityTracker(contentReader(contents), 0);
+    await tracker.poll([SLOT_A1]); // 首次观测 → idle
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle');
+
+    // 第二轮：对话区一字未动，只有两行装饰行自跳（这正是误报的触发条件）
+    contents['tmuxterm-a1'] = [dialog, '🧠 2.0k/200.0k 2% │ 💰 $2.00', '11% context used'].join('\n');
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle',
+      '只有装饰行变了：不判 running，也不该变成 done-unseen');
+
+    // —— 反向对照（没有它，删掉修复这条测试也会绿）——
+    // 第三轮：对话区**真的**多出/变了一行 → 这一次必须判 running。
+    contents['tmuxterm-a1'] = ['对话区: 已得出结论', '🧠 2.0k/200.0k 2% │ 💰 $2.00', '11% context used'].join('\n');
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running',
+      '对话区真的变了：必须判 running（证明剔除没有把真信号一起吞掉）');
+  });
+
+  it('★ 端到端复现：只有输入行 + 模式行在切，不判 running；对话区真变了才 running', async () => {
+    // 回归 2026-10-13 残余假绿：空闲会话 tmuxterm-010db8e2f02c 的 19:02:11，
+    // 只有输入行（sL68）和模式行（sL70）在来回切，两行都不匹配旧正则 →
+    // 被当成对话区有新内容 → running → 5 秒后落成绿色「刚完成」。
+    // 窗口传 0（零 sleep、可确定复现）：running 只能由「亲眼看到对话区变化」给出。
+    const contents: Record<string, string> = {
+      'tmuxterm-a1': [
+        '对话区第一行',
+        '❯ 改成浮层居中，组合区放到行中间 30%',
+        '────────────────────',
+        '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent',
+        '对话区第二行',
+      ].join('\n'),
+    };
+    const tracker = new ActivityTracker(contentReader(contents), 0);
+    await tracker.poll([SLOT_A1]); // 首次观测 → idle
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle');
+
+    // 第 2 拍：只把输入行 + 模式行切成 19:02:11 那对形态，其它字节全不变
+    contents['tmuxterm-a1'] = [
+      '对话区第一行',
+      '❯ 你',
+      '────────────────────',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+      '对话区第二行',
+    ].join('\n');
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle',
+      '只有输入行 / 模式行在切：不判 running，也不该变成 done-unseen');
+
+    // —— 反向对照（没有它，删掉修复这条测试也会绿）——
+    // 第 3 拍：改一行**真**对话内容 → 这一次必须判 running。
+    contents['tmuxterm-a1'] = [
+      '对话区第一行',
+      '❯ 你',
+      '────────────────────',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+      '对话区第二行，已得出结论',
+    ].join('\n');
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running',
+      '对话区真的变了：必须判 running（证明剔除没有把真信号一起吞掉）');
+  });
+});
+
+describe('ActivityTracker.poll：右下角状态提示行自跳不算活动（回归：老终端不能凭它变绿）', () => {
+  it('★ 提示行「出现 → 又变回空行」两拍都不判 running；只有改一行普通对话行才 running', async () => {
+    // 实测形态（pane 第 24 行，右对齐、左侧一大片空白）：它自己出现、2 秒后又自己
+    // 变回空行 ——   20:46:01 L24 "" → "                    Auto-updating…"
+    //               20:46:03 L24 "…Auto-updating…" → ""
+    // 5 秒静默后落成绿点，用户看到「已看过的老终端白点莫名其妙变绿」。
+    // 这一行的另一态是**同一位置的空行**：删行治不了（错位），必须清空成空行。
+    // 窗口传 0（零 sleep、可确定复现）：running 只能由「本轮亲眼看到内容变化」给出。
+    const hint = '                    Auto-updating…'; // 右对齐提示行
+    const contents: Record<string, string> = {
+      'tmuxterm-a1': ['对话区第一行', '', '对话区第二行'].join('\n'), // 起手是空行那一态
+    };
+    const tracker = new ActivityTracker(contentReader(contents), 0);
+    await tracker.poll([SLOT_A1]); // 首次观测 → idle
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle');
+
+    // 第 2 拍：提示行出现（其余行一字不动）⇒ 清空后与上一拍逐字节相等 ⇒ 不判 running。
+    // 去掉清空那一步，这一拍内容真的变了 ⇒ running ⇒ 本断言红。
+    contents['tmuxterm-a1'] = ['对话区第一行', hint, '对话区第二行'].join('\n');
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle',
+      '提示行出现不算活动：不能被判 running、也不该变成 done-unseen');
+
+    // 第 3 拍：提示行又变回空行 ⇒ 仍不判 running。
+    contents['tmuxterm-a1'] = ['对话区第一行', '', '对话区第二行'].join('\n');
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle',
+      '提示行变回空行也不算活动');
+
+    // —— 反向对照（没有它，删掉修复这条测试也可能绿）——
+    // 改一行**普通对话行** ⇒ 必须判 running（证明清空没有把真信号一起吞掉）。
+    contents['tmuxterm-a1'] = ['对话区第一行', '对话区第三行', '对话区第二行'].join('\n');
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running',
+      '真对话内容变了：必须判 running');
+  });
+});
+
 describe('ActivityTracker.poll：pane resize 不是活动（回归）', () => {
   /**
    * 尺寸与内容都可在轮次之间改写（按 `tmuxterm-<id>` 键）。
@@ -405,7 +522,8 @@ describe('ActivityTracker.poll：pane resize 不是活动（回归）', () => {
   ): PaneSampleReader {
     return {
       async paneSample(session: string): Promise<PaneSample> {
-        return { foreground: 'claude', title: '', ...(geom[session] ?? GEOM) };
+        // 先展 GEOM 补齐 cursorY（本 describe 只改宽/高），再用本槽的几何覆盖宽/高。
+        return { foreground: 'claude', title: '', ...GEOM, ...(geom[session] ?? {}) };
       },
       async capturePane(session: string): Promise<string> {
         return contents[session] ?? '';
@@ -493,5 +611,355 @@ describe('ActivityTracker.poll：pane resize 不是活动（回归）', () => {
     geom['tmuxterm-a1'] = { width: 180, height: 50 };
     await tracker.poll([SLOT_A1]);
     assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle', '拖拽第 2 拍仍不判运行');
+  });
+
+  it('★ 重绘持续超过 resizeSettleMs：静默期自延长，整个重绘期间都不判 running', async () => {
+    // 真实场景：点开一个已存在的终端，tmux 以 VS Code 面板尺寸 attach → pane 整体
+    // 重排；claude TUI 收到 SIGWINCH 后重绘整个转录区，这个重绘**持续远超**
+    // resizeSettleMs。若静默期不随内容变化自延长，重绘会在静默期结束后继续变内容
+    // → 被判成 running → 5 秒后转成绿色「已完成未查看」（窗口重载时一片老终端集体变绿）。
+    // 这里把静默期压到 50ms、上限放到 1000ms：每约 30ms 换一次内容（< 50ms 静默期），
+    // 静默期被逐轮顺延，整个重绘过程都该判否。
+    const geom: Record<string, { width: number; height: number }> = {
+      'tmuxterm-a1': { width: 231, height: 72 },
+    };
+    const contents: Record<string, string> = { 'tmuxterm-a1': 'A' };
+    const tracker = new ActivityTracker(geomReader(geom, contents), 0, 50, 1000);
+    await tracker.poll([SLOT_A1]); // 基线 A / 231x72 → idle
+
+    // 尺寸变 → 进入静默期（同时内容也变，是重排）
+    contents['tmuxterm-a1'] = 'B';
+    geom['tmuxterm-a1'] = { width: 200, height: 60 };
+    await tracker.poll([SLOT_A1]);
+
+    // 之后每隔约 30ms 换一次内容、连换 4 次：重绘仍在继续，静默期应被自延长
+    for (let i = 0; i < 4; i++) {
+      await new Promise((r) => setTimeout(r, 30));
+      contents['tmuxterm-a1'] = `重绘帧 ${i}`;
+      await tracker.poll([SLOT_A1]);
+      assert.notStrictEqual(tracker.activityFor(SLOT_A1)?.state, 'running',
+        `重绘第 ${i + 1} 帧仍在静默期内，不该判 running`);
+    }
+  });
+
+  it('★ 静默期自延长会被上限截断（删掉 settleMaxMs 这条判据，本用例必须变红）', async () => {
+    // 上限的意义：没有它，紧接一次重排启动的长任务会把静默期无限顺延下去，
+    // 那个槽永远不判 running（表现为「该转圈的永远不转圈」）。
+    // 这里**故意**让换内容的间隔（25ms）小于静默期（60ms）——静默期每轮都被顺延、
+    // 自延长一直想续，唯一能让它结束的就是上限（140ms）。若上限被删掉，settling
+    // 恒为真、running 永不出现，下面这个循环会空转到 20 轮耗尽而断言失败。
+    const geom: Record<string, { width: number; height: number }> = {
+      'tmuxterm-a1': { width: 231, height: 72 },
+    };
+    const contents: Record<string, string> = { 'tmuxterm-a1': 'A' };
+    const tracker = new ActivityTracker(geomReader(geom, contents), 0, 60, 140);
+    await tracker.poll([SLOT_A1]); // 基线 A / 231x72 → idle
+
+    contents['tmuxterm-a1'] = 'B';
+    geom['tmuxterm-a1'] = { width: 200, height: 60 };
+    await tracker.poll([SLOT_A1]); // 尺寸变 → 进入静默期（settleStartAt = 此刻）
+
+    // 重绘一直在继续：每 25ms 换一次内容，最多观测 20 轮（≈500ms，远超 140ms 上限）。
+    // 上限一生效，这一轮的变化就该被判成 running。
+    let firstRunningAt = -1;
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 25));
+      contents['tmuxterm-a1'] = `重绘帧 ${i}`;
+      await tracker.poll([SLOT_A1]);
+      if (tracker.activityFor(SLOT_A1)?.state === 'running') {
+        firstRunningAt = i;
+        break;
+      }
+    }
+    assert.ok(
+      firstRunningAt >= 0,
+      '静默期自延长必须被 settleMaxMs 截断，否则该槽永远不判 running（该转圈的不转圈）',
+    );
+  });
+
+  it('★ settleMaxMs 传 0 ⇒ 自延长被关掉（退回「静默期只在 resizeSettleMs 内有效」的旧行为）', async () => {
+    // 这是 JSDoc 对 settleMaxMs=0 的承诺，也是「上限」这条判据的另一种反向压法：
+    // 上限恒过期 ⇒ 静默期内不再顺延，间隔一旦超过 resizeSettleMs 就照常判 running。
+    const geom: Record<string, { width: number; height: number }> = {
+      'tmuxterm-a1': { width: 231, height: 72 },
+    };
+    const contents: Record<string, string> = { 'tmuxterm-a1': 'A' };
+    const tracker = new ActivityTracker(geomReader(geom, contents), 0, 50, 0);
+    await tracker.poll([SLOT_A1]); // 基线 A / 231x72 → idle
+
+    contents['tmuxterm-a1'] = 'B';
+    geom['tmuxterm-a1'] = { width: 200, height: 60 };
+    await tracker.poll([SLOT_A1]); // 尺寸变 → 本应进入静默期，但上限为 0
+
+    await new Promise((r) => setTimeout(r, 30)); // 静默期 50ms 还没过
+    contents['tmuxterm-a1'] = 'C';
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(
+      tracker.activityFor(SLOT_A1)?.state,
+      'running',
+      'settleMaxMs=0 时静默期不自延长，静默期内的变化照常判 running',
+    );
+  });
+
+  it('★ 静默期外的内容变化照旧立即判 running（自延长没有把普通判定弄坏）', async () => {
+    // 自延长只在静默期内生效；尺寸从头到尾不变、根本没进静默期的槽，内容一变
+    // 就该立刻判 running —— 防止 `!settling` 用错位置、把普通判定一起判否。
+    const geom: Record<string, { width: number; height: number }> = {
+      'tmuxterm-a1': { width: 231, height: 72 },
+    };
+    const contents: Record<string, string> = { 'tmuxterm-a1': 'A' };
+    const tracker = new ActivityTracker(geomReader(geom, contents), 0, 50, 1000);
+    await tracker.poll([SLOT_A1]); // 基线 A / 231x72 → idle
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle');
+
+    contents['tmuxterm-a1'] = 'B'; // 尺寸不变、没触发静默期
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running',
+      '没进静默期的槽，内容一变就判 running');
+  });
+});
+
+describe('还有未完成的后台工作时不算「已完成」', () => {
+  it('★ 内容静止但仍有等待中的后台 agent ⇒ 一直 running，不落成 done-unseen', async () => {
+    // 实测两个反复假绿的会话快照 100% 都带 `✻ Waiting for 1 background agent
+    // to finish`：这一轮还没结束（在等后台 agent），但 pane 完全静止、不重绘。
+    // 窗口传 0（零 sleep）：跑不跑只能由「等待行」给出，不靠窗口照亮。
+    const content = [
+      '对话区: 正在分析问题',
+      '✻ Waiting for 1 background agent to finish',
+    ].join('\n');
+    const contents: Record<string, string> = { 'tmuxterm-a1': content };
+    const tracker = new ActivityTracker(contentReader(contents), 0);
+
+    await tracker.poll([SLOT_A1]); // 首次观测：等待行把这一轮点亮 → running
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running');
+
+    // 再连续 poll 同一份**逐字节相同**的静止内容 3 次：没有等待行就会 5 秒(窗口=0
+    // 即立即)落成 done-unseen —— 有等待行则必须一直 running。
+    for (let i = 0; i < 3; i++) {
+      await tracker.poll([SLOT_A1]);
+      assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running',
+        `第 ${i + 1} 轮静止内容仍带等待行，必须还是 running`);
+    }
+  });
+
+  it('★ 反向对照：等待行消失后，同样的静止内容会落成 done-unseen', async () => {
+    // 证明上一条真在测「等待行」这个变量，而不是「窗口为 0 就恒 running」。
+    const contents: Record<string, string> = {
+      'tmuxterm-a1': ['对话区: 正在分析问题', '✻ Waiting for 1 background agent to finish'].join('\n'),
+    };
+    const tracker = new ActivityTracker(contentReader(contents), 0);
+
+    await tracker.poll([SLOT_A1]); // 含等待行 → running
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running');
+
+    // 去掉等待行：内容变了 ⇒ 这一轮 justChanged → running
+    contents['tmuxterm-a1'] = '对话区: 正在分析问题';
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running');
+
+    // 原样重复这份去掉等待行的内容：没有变化、也没有等待行 ⇒ 落成 done-unseen
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'done-unseen',
+      '等待行没了且内容静止 ⇒ 正常走窗口判定，落成 done-unseen');
+  });
+
+  it('等待行一直在、但对话区新增了一行 ⇒ 仍然 running', async () => {
+    const contents: Record<string, string> = {
+      'tmuxterm-a1': ['对话区第一行', '✻ Waiting for 1 background agent to finish'].join('\n'),
+    };
+    const tracker = new ActivityTracker(contentReader(contents), 0);
+    await tracker.poll([SLOT_A1]);
+
+    contents['tmuxterm-a1'] =
+      ['对话区第一行', '对话区第二行', '✻ Waiting for 1 background agent to finish'].join('\n');
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running');
+  });
+});
+
+describe('ActivityTracker.opened：点开终端那一下的重绘不算活动（回归）', () => {
+  it('★ 点开一个正在跑的槽：静默期内不能落成绿点（任务仍在执行）', async () => {
+    // 实测复现（2026-10-19）：槽已 running，用户点开它 → 静默期开始 →
+    // 5 秒后（活动窗口过期）状态被落成 done-unseen，而 pane 里任务还在跑；
+    // 要等 10 秒静默期上限到期才恢复 running。用户看到的就是「任务在执行，
+    // 有时候不转圈了」。
+    // activityWindowMs 传 0：排除「5 秒窗口」这条兜底，让断言只依赖状态机本身。
+    const contents: Record<string, string> = { 'tmuxterm-a1': 'A' };
+    const tracker = new ActivityTracker(contentReader(contents), 0);
+    await tracker.poll([SLOT_A1]); // 首次观测 → idle
+    contents['tmuxterm-a1'] = 'B';
+    await tracker.poll([SLOT_A1]); // 内容真的在变 → running
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running');
+
+    tracker.opened(SLOT_A1); // 用户点开这个正在跑的槽
+    contents['tmuxterm-a1'] = 'C'; // 重绘 + 任务自身仍在输出
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running',
+      '静默期只该挡住「重绘算活动」，不该把正在跑的槽判成刚完成（旧实现下这里是 done-unseen）');
+
+    contents['tmuxterm-a1'] = 'D'; // 再来一拍，仍无「最近 5 秒变过」兜底
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running',
+      '静默期内的连续输出也不能把它推成 done-unseen');
+  });
+
+  it('★ 点开后 pane 重绘（内容变、尺寸不变）⇒ 不判 running，5 秒后也不变绿', async () => {
+    // 点开侧边栏里的终端会让 pty 收到 focus，claude TUI 随即重绘一次（实测一个
+    // 三周前停下的旧终端，被点开那一刻 pane 内容前后各变 1 行、尺寸没变）。
+    // 不静默的话这一下重绘会把槽判成 running，紧接着 5 秒后落成绿点 —— 用户刚
+    // 看过的那一个反而变绿。opened() 把它按 resize 重排静默掉，性质相同不另造机制。
+    // 窗口传 0：running 只能由「本轮亲眼看到变化」给出，否则窗口本身会把重绘
+    // 照亮、让断言失真。
+    const contents: Record<string, string> = { 'tmuxterm-a1': 'A' };
+    const tracker = new ActivityTracker(contentReader(contents), 0);
+    tracker.opened(SLOT_A1);
+    await tracker.poll([SLOT_A1]); // 首次观测 A → idle
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle');
+
+    contents['tmuxterm-a1'] = 'B'; // 点开触发的重绘：内容变了，尺寸没变
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle',
+      '点开那一下的重绘不是活动，不能判 running');
+  });
+
+  it('★ 静默期会结束（防「把静默期做成永久静默」）：过 resizeSettleMs 后照常判 running', async () => {
+    // 这一点是 opened() 承诺的代价的反面：它只让转圈**最多晚 settleMaxMs**（这里
+    // 压到 resizeSettleMs=40），不是永久屏蔽。用真 sleep 越过静默期，静默期内
+    // 的变化被吸收、出静默期后内容再变必须立刻判 running。
+    const contents: Record<string, string> = { 'tmuxterm-a1': 'A' };
+    const tracker = new ActivityTracker(contentReader(contents), 0, 40);
+    tracker.opened(SLOT_A1);
+    await tracker.poll([SLOT_A1]); // 首次观测 A → idle
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle');
+
+    contents['tmuxterm-a1'] = 'B'; // 静默期内的变化：只刷基线，不算活动
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle',
+      '静默期内的变化被吸收，不判 running');
+
+    await new Promise((r) => setTimeout(r, 120)); // > resizeSettleMs(40)：静默期已过
+    contents['tmuxterm-a1'] = 'C'; // 应用真的在动
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running',
+      '静默只是延迟不是永久屏蔽 —— 出静默期后内容再变应判 running');
+  });
+
+  it('★ 静默期内连续变化都被吸收（重绘 + 自己回退），之后基线已对齐', async () => {
+    // 点开触发的重绘不是一次性的：TUI 重绘整个转录区、随后自己回退到稳定形态，
+    // 静默期内这些变化都只刷新基线、不产生活动判定；最后一次回退后的内容再采
+    // 一拍一字不变，说明基线已对齐到最终内容，不会补报假变化、更不会变绿。
+    const contents: Record<string, string> = { 'tmuxterm-a1': 'A' };
+    const tracker = new ActivityTracker(contentReader(contents), 0); // 默认静默期
+    tracker.opened(SLOT_A1);
+    await tracker.poll([SLOT_A1]); // 首次观测 A → idle
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle');
+
+    contents['tmuxterm-a1'] = 'B'; // 重绘
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle', '重绘那一拍不判 running');
+
+    contents['tmuxterm-a1'] = 'A'; // 自己回退到重绘前
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle', '回退那一拍也不判 running');
+
+    await tracker.poll([SLOT_A1]); // 回退后的内容再采一拍，一字不变
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle',
+      '基线已对齐：不会补报假变化，也不会落成 done-unseen');
+  });
+});
+
+describe('ActivityTracker.poll：用户在输入框里打字不算活动（回归：绿点不能被打字点亮）', () => {
+  // 判别器（实测 2026-10-13）：claude 生成时每秒跳动的忙碌行**从不**落在光标行
+  // （忙碌 81 次变化命中 0 次）；用户打字时变化的恰好就是光标行（空闲 32 次里 31 次）。
+  // 所以「本轮变化的行**全部**落在光标行」判为「用户在打字」，不刷新活动时间戳。
+  // 窗口传 0（零 sleep、可确定复现）：running 只能由「本轮亲眼看到非光标行变化」给出。
+  //
+  // 夹具内容与 GEOM.cursorY 对齐：行号 0 基，光标停在第 5 行。
+
+  const CURSOR = 5; // = GEOM.cursorY
+  const baseline = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5', 'L6'].join('\n');
+  const replaceRow = (content: string, row: number, text: string): string =>
+    content.split('\n').map((l, i) => (i === row ? text : l)).join('\n');
+
+  it('★ 只改光标行（模拟敲一个字符）⇒ 不判活动，状态保持 idle（不是绿点）', async () => {
+    const contents: Record<string, string> = { 'tmuxterm-a1': baseline };
+    const tracker = new ActivityTracker(contentReader(contents), 0);
+    await tracker.poll([SLOT_A1]); // 基线 → idle
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle');
+
+    // 第 2 轮：只在光标行（行 5）末尾多敲一个字符，行长变长
+    contents['tmuxterm-a1'] = replaceRow(baseline, CURSOR, 'L5x');
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle',
+      '只有光标行在变 ⇒ 用户在打字，不算活动，不能点亮绿点');
+  });
+
+  it('★ 反向对照：非光标行发生同样幅度的改动 ⇒ 判 running（真活动没被一起吞掉）', async () => {
+    const contents: Record<string, string> = { 'tmuxterm-a1': baseline };
+    const tracker = new ActivityTracker(contentReader(contents), 0);
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle');
+
+    contents['tmuxterm-a1'] = replaceRow(baseline, 2, 'L2x'); // 改的是行 2（非光标行）
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running',
+      '改的是非光标行 ⇒ 是应用在输出，必须判 running');
+  });
+
+  it('★ 光标未知（cursorY = -1）⇒ 不抑制，只改一行照样判 running（宁可多判不可漏判）', async () => {
+    const contents: Record<string, string> = { 'tmuxterm-a1': baseline };
+    const tracker = new ActivityTracker(
+      contentReader(contents, { foreground: 'claude', title: '', width: 231, height: 72, cursorY: -1 }),
+      0,
+    );
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle');
+
+    contents['tmuxterm-a1'] = replaceRow(baseline, CURSOR, 'L5x');
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running',
+      '光标未知时不能把变化误判成打字 ⇒ 该判活动就判活动');
+  });
+
+  it('★ 前台不是 claude（bash）⇒ 闸门生效，只改光标行照样判 running', async () => {
+    const contents: Record<string, string> = { 'tmuxterm-a1': baseline };
+    const tracker = new ActivityTracker(
+      contentReader(contents, { foreground: 'bash', title: '', width: 231, height: 72, cursorY: CURSOR }),
+      0,
+    );
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle');
+
+    contents['tmuxterm-a1'] = replaceRow(baseline, CURSOR, 'L5x');
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'running',
+      '纯 shell 的输出顺着光标行往下写，这条抑制只对 claude 前台生效');
+  });
+
+  it('★ 光标之上有被删行 ⇒ 映射后才比较（回归：拿原始行号硬比会恒不触发）', async () => {
+    // 复现 2026-10-13 的正例形态：cursor_y=5、光标之上 2 行被 strip 删掉，
+    // 光标行在 strip 后是 index 3。若拿原始行号 5 去比 strip 改动行 [3]，永远不等 ⇒
+    // 打字被误判成活动（这正是上一版的错）。经 cursorRowAfterStrip 映射成 3 后 ==>
+    // 3===3 ⇒ 不判活动。
+    const rawContent = [
+      'L0',                             // 0
+      '🧠 1.0k/200.0k 1% │ 💰 $1.00',   // 1 状态行 → 删
+      'L2',                             // 2
+      '────────────────────',           // 3 边框 → 删
+      'L4',                             // 4
+      'L5',                             // 5 ← 光标（原始行号）
+      'L6',                             // 6
+    ].join('\n');
+    const contents: Record<string, string> = { 'tmuxterm-a1': rawContent };
+    const tracker = new ActivityTracker(contentReader(contents), 0);
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle');
+
+    // 第 2 轮：只改原始第 5 行（光标行）；strip 后该变化落在 index 3
+    contents['tmuxterm-a1'] = replaceRow(rawContent, CURSOR, 'L5x');
+    await tracker.poll([SLOT_A1]);
+    assert.strictEqual(tracker.activityFor(SLOT_A1)?.state, 'idle',
+      '光标行变化经映射后应判为打字，不能被原始行号硬比掉');
   });
 });

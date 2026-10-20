@@ -213,7 +213,7 @@ export class SessionTreeItem extends vscode.TreeItem {
  */
 const TITLE_SOURCE_TEXT: Record<'pane' | 'fallback' | 'none', string> = {
   pane: 'claude 进程当前的 pane 标题（实时）',
-  fallback: '绑定对话里落盘的标题（进程没在跑时的回退，可能已过时）',
+  fallback: '绑定对话里的标题（claude 落盘的标题，没有标题时用它里面用户的第一句话；可能已过时）',
   none: '（还没有名字）',
 };
 
@@ -330,9 +330,21 @@ export class EntryTreeProvider
    * → ''（渲染层回落成「无会话」）。
    *
    * **全都无从得知时返回空串** —— 不加灰色占位、不退化成
-   * `~/.claude/sessions` 的 derived slug、不用首条用户消息：把「不知道」
-   * 伪装成「知道」是误导（spec §8 不变量 6）。回落成「无会话」那一步在
+   * `~/.claude/sessions` 的 derived slug。回落成「无会话」那一步在
    * `sessionLabel`（渲染层）里做，本方法只回答「有没有名字」。
+   *
+   * **关于第二来源（2026-10-14 推翻旧的不变量 6）**：这里的「回退」在
+   * `TaskTitleCache` 内部其实有两条 —— claude 落盘的 aiTitle，和读不到标题时
+   * 用户自己敲的第一句话（见 taskTitles.ts 的 `read()`）。旧注释说过「不用首条
+   * 用户消息」，理由是别把「不知道」伪装成「知道」；但实测首条输入是斜杠命令
+   * （用户按 `/clear` 开新任务）的会话 claude **永不生成** aiTitle（12/12 条
+   * transcript 里 ai-title 出现 0 次），照旧规则这些行只能永远空着。用户自己的
+   * 第一句话不是伪装：它是真实来源，只是不如概括过的标题干净。真正该守的那条
+   * 底线没变 —— **不许编名字**（比如拿目录名或时间戳凑一个）。
+   *
+   * 本方法**不区分**这两条来源，都算 `'fallback'`（tooltip 里合称「绑定对话
+   * 里的标题」）；要在渲染层分开，得先把来源从缓存里透出来，现阶段没有别的
+   * 消费方需要它。
    *
    * 同时返回**名字的来源**（只给 tooltip 用）：pane title 是实时的，而绑定
    * 对话的 aiTitle 是**落盘那一刻**的标题、可能已经很旧 —— 不说清楚，用户会

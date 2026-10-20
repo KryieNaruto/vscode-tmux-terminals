@@ -211,16 +211,67 @@ describe('TaskTitleCache —— 默认 reader 链路', () => {
     assert.strictEqual(titles.peek(UUID), undefined);
   });
 
-  it('transcript 里没有 ai-title 记录 → undefined', async () => {
+  it('★ 两个来源都没有（无 ai-title、也没有真实用户消息）→ undefined', async () => {
+    // 注意：单有「没有 ai-title」**不再**等于 undefined —— 第二来源会退到首条
+    // 真实用户消息上（见下面的端到端用例）。要拿到 undefined，必须两条都没有，
+    // 所以这里的 user 记录是 /clear 的合成包裹（会被 parseConversationHead 剥掉）。
     const home = await mk({
       [`-work-proj/${UUID}.jsonl`]: JSON.stringify({
-        type: 'user', cwd: '/work/proj', message: { role: 'user', content: 'hi' },
+        type: 'user', isSidechain: false, cwd: '/work/proj',
+        message: { role: 'user', content: '<command-name>/clear</command-name>' },
       }),
     });
     const titles = new TaskTitleCache(home);
     titles.prewarm(UUID, '/work/proj');
     await settle();
     assert.strictEqual(titles.peek(UUID), undefined);
+  });
+
+  it('★ 没有 aiTitle 时用首条真实用户消息（首条是 /clear 的会话）', async () => {
+    const text = [
+      JSON.stringify({ type: 'mode', sessionId: UUID }),
+      JSON.stringify({ type: 'attachment', cwd: '/ssd/foo' }),
+      JSON.stringify({
+        type: 'user', isSidechain: false, cwd: '/ssd/foo',
+        message: { role: 'user', content: '<command-name>/clear</command-name>' },
+      }),
+      JSON.stringify({
+        type: 'user', isSidechain: false, cwd: '/ssd/foo',
+        message: { role: 'user', content: '把那个 bug 修了' },
+      }),
+    ].join('\n');
+    // ★ 这份 fixture 里**一条 ai-title 记录都没有** —— 因此下面 peek 拿到值
+    //   只可能来自本次新增的第二来源（首条真实用户消息）。删掉 read() 里的
+    //   readFirstMessage 兜底，本用例必红；不写这句，用例可能退化成空断言
+    //   （peek 拿到值会被误以为来自 aiTitle 链路）。
+    assert.ok(!text.includes('ai-title'), 'fixture 必须不含 ai-title，否则证明不了第二来源');
+
+    const home = await mk({ [`-ssd-foo/${UUID}.jsonl`]: text });
+    const titles = new TaskTitleCache(home);
+    titles.prewarm(UUID, '/ssd/foo');
+    await settle();
+    assert.strictEqual(titles.peek(UUID), '把那个 bug 修了');
+  });
+
+  it('★ 有 aiTitle 时优先用它，而不是首条真实用户消息', async () => {
+    const home = await mk({
+      [`-ssd-foo/${UUID}.jsonl`]: [
+        JSON.stringify({ type: 'mode', sessionId: UUID }),
+        JSON.stringify({ type: 'attachment', cwd: '/ssd/foo' }),
+        JSON.stringify({
+          type: 'user', isSidechain: false, cwd: '/ssd/foo',
+          message: { role: 'user', content: '<command-name>/clear</command-name>' },
+        }),
+        JSON.stringify({
+          type: 'user', isSidechain: false, cwd: '/ssd/foo',
+          message: { role: 'user', content: '把那个 bug 修了' },
+        }),
+        JSON.stringify({ type: 'ai-title', sessionId: UUID, aiTitle: 'claude 起的名' }),
+      ].join('\n'),
+    });
+    const titles = new TaskTitleCache(home);
+    titles.prewarm(UUID, '/ssd/foo');
+    assert.strictEqual(await waitHit(titles, UUID), 'claude 起的名');
   });
 });
 
