@@ -15,7 +15,12 @@ export function commandFor(entry: TerminalEntry): string {
   const model = entry.model && entry.model.length > 0
     ? ` --model ${shellQuote(entry.model)}`
     : '';
-  return `${exe} --dangerously-skip-permissions${model}`;
+  // society 角色条目带身份注入：CLAUDE.md 埋在 cwd 的 `.society/` 子目录里，
+  // claude 启动只加载 cwd 向上的 CLAUDE.md，不会读它，故显式注入。
+  const systemPrompt = entry.systemPromptFile
+    ? ` --append-system-prompt-file ${shellQuote(entry.systemPromptFile)}`
+    : '';
+  return `${exe} --dangerously-skip-permissions${systemPrompt}${model}`;
 }
 
 /**

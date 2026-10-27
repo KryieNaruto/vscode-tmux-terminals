@@ -212,7 +212,7 @@ describe('package.json 清单一致性', () => {
    * `tree.ts` 会让它整个漏网。
    */
   it('代码里设置的 viewItem 值都在菜单 when 中使用（避免写了永不生效的 contextValue）', () => {
-    const sources = ['tree.ts', 'batchTree.ts'].map((f) =>
+    const sources = ['tree.ts', 'batchTree.ts', 'societyTree.ts'].map((f) =>
       fs.readFileSync(path.join(repoRoot, 'src', f), 'utf8'),
     );
     const setValues = sources.flatMap((src) =>
@@ -246,16 +246,16 @@ describe('package.json 清单一致性', () => {
     ].map((m) => m[1]);
     assert.deepStrictEqual(
       [...new Set(usedInMenus)].sort(),
-      ['folder', 'sessionAlive', 'sessionDead', 'terminal'],
+      ['folder', 'sessionAlive', 'sessionDead', 'society', 'societyRole', 'terminal'],
       `菜单引用的 viewItem 集合与预期不符（实际：${JSON.stringify([...new Set(usedInMenus)])}）`,
     );
   });
 
-  it('两个 view 同属 tmuxTerminals 容器', () => {
+  it('三个 view 同属 tmuxTerminals 容器', () => {
     const containerIds = (contributes.viewsContainers?.activitybar ?? []).map((c: any) => c.id);
     assert.ok(containerIds.includes('tmuxTerminals'));
     const views = contributes.views?.tmuxTerminals ?? [];
-    for (const viewId of ['tmuxTerminals.list', 'tmuxTerminals.batch']) {
+    for (const viewId of ['tmuxTerminals.list', 'tmuxTerminals.batch', 'tmuxTerminals.society']) {
       assert.ok(views.some((v: any) => v.id === viewId), `缺少 view ${viewId}`);
     }
   });

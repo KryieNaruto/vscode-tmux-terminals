@@ -5,3 +5,4 @@ dist/
 .vscode-test/
 *.log
 .DS_Store
+resources/katex/

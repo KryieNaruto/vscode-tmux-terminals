@@ -80,6 +80,9 @@ function condense(text: string, max: number = FIRST_MESSAGE_MAX): string {
  *   （`/clear` 会给出这三个，`command-args` 常为空）；
  * - `local-command-stdout` —— 命令的输出回显。
  *
+ * 另外两类同样是合成注入：`task-notification` 是子代理完成通知，
+ * `system-reminder` 是系统提醒注入 —— 都不是用户敲的字。
+ *
  * 今后若实测到别的同类包裹标签，往这里加即可 —— 判据只有一个：**剥掉它之后
  * 不该剩下用户的话**。
  */
@@ -89,7 +92,23 @@ const SYNTHETIC_TAGS = [
   'command-name',
   'command-message',
   'command-args',
+  'task-notification',
+  'system-reminder',
 ] as const;
+
+/**
+ * Skill 工具注入的说明前缀。它同样是一条 user 消息，但不是用户敲的字 ——
+ * 不排掉的话，一个「先跑斜杠命令、命令再触发了 skill」的会话，首条消息会
+ * 变成这行路径说明。只按**开头**判定：正文中间提到这句话是在提问，不能误杀。
+ */
+const SKILL_INJECT_PREFIX = 'Base directory for this skill:';
+
+/** compaction（上下文压缩）后 claude 注入的续接摘要。实测原文开头。 */
+const COMPACTION_PREFIX = 'This session is being continued from a previous conversation';
+
+/** 斜杠命令回显里的命令名与参数（两者可能分布在同一段文本的不同行）。 */
+const COMMAND_NAME_RE = /<command-name>([\s\S]*?)<\/command-name>/;
+const COMMAND_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
 
 /**
  * 匹配一整段包裹块。收尾用 `\1` 要求**同名标签闭合**，否则 `<command-name>…`
@@ -114,11 +133,33 @@ const SYNTHETIC_BLOCK = new RegExp(
  * 空串 / 纯空白同样返回 true（它也不是用户敲的话）。调用方本来就先过滤空白，
  * 这里保持同一判据，免得两处规则各自漂移。
  *
+ * Skill 工具注入的「Base directory for this skill: …」也算合成 —— 它是工具
+ * 写给模型的说明，不是用户敲的字。只认**开头**，正文里引用它不算。
+ *
  * 只认**闭合**的块：截断的标签不剥（剥不干净就成了猜），那种半行本来就过不了
  * JSON.parse，交给上面那层挡。
  */
 export function isSyntheticUserText(text: string): boolean {
+  if (text.trim().startsWith(SKILL_INJECT_PREFIX)) return true;
+  if (text.trim().startsWith(COMPACTION_PREFIX)) return true;
   return text.replace(SYNTHETIC_BLOCK, '').trim().length === 0;
+}
+
+/**
+ * 把一条「斜杠命令的合成 user 消息」还原成用户实际敲的那一行，例如 `/drive-fix 123`。
+ *
+ * 为什么单列一个函数：预览面板要显示用户输入，但 transcript 里的斜杠命令是
+ * claude 包起来的合成消息（`<command-name>` + `<command-args>`）。直接丢掉会让
+ * 用户看不到自己刚敲的命令；直接显示原文又是一屏标签。`parseConversationHead`
+ * 里那段兜底逻辑只有「取第一条非 /clear」的额外约束，不能直接复用。
+ *
+ * `/clear` 返回 undefined（它不是任务内容）。没有 `<command-name>` 也返回 undefined。
+ */
+export function commandEcho(text: string): string | undefined {
+  const name = (COMMAND_NAME_RE.exec(text)?.[1] ?? '').trim();
+  if (name.length === 0 || name === '/clear') return undefined;
+  const args = (COMMAND_ARGS_RE.exec(text)?.[1] ?? '').trim();
+  return `${name} ${args}`.trim();
 }
 
 /**
@@ -127,12 +168,20 @@ export function isSyntheticUserText(text: string): boolean {
  * 「原文」= 只压平空白、不压缩语义（见 condense）—— 用户要认的是「上次在聊的
  * 那个」，任何改写都会让这段话变得不像他自己敲的。
  *
+ * 首条输入就是斜杠命令的会话，**没有任何真实用户文本** —— claude 把命令包成
+ * `<command-name>` / `<command-args>` 的合成消息，而且这类会话永不生成 ai-title。
+ * 于是命令名本身成了唯一还能给出人话的来源，这里对它做**兜底**（优先级低于真实
+ * 文本，与出现顺序无关）：取第一条非 `/clear` 的命令（`/clear` 不是任务名），
+ * 有参数就拼在后面。
+ *
  * 容错是契约：末行多半被截断、某些行类型不熟悉 —— 一律跳过，绝不抛错。
  * 解析不出来就返回空对象，**绝不编造**。
  */
 export function parseConversationHead(text: string): { cwd?: string; firstMessage?: string } {
   let cwd: string | undefined;
   let firstMessage: string | undefined;
+  /** 斜杠命令兜底（见上方注释）。只由 isSidechain !== true 的 user 记录填。 */
+  let commandFallback: string | undefined;
 
   for (const raw of text.split('\n')) {
     if (raw.length === 0) continue;
@@ -149,21 +198,32 @@ export function parseConversationHead(text: string): { cwd?: string; firstMessag
       cwd = rec.cwd;
     }
     // 跳过子代理（isSidechain）的消息 —— 那不是用户敲的，认不出终端
-    if (firstMessage === undefined && rec.type === 'user' && rec.isSidechain !== true) {
+    if (rec.type === 'user' && rec.isSidechain !== true) {
       const msg = rec.message as { content?: unknown } | undefined;
       const t = msg === undefined ? undefined : firstText(msg.content);
       // 斜杠命令的合成包裹消息也不是用户敲的 —— 跳过它继续往下扫，
       // 而不是就此认定「这个会话没有首条消息」（见 isSyntheticUserText）。
-      if (t !== undefined && t.trim().length > 0 && !isSyntheticUserText(t)) {
-        firstMessage = condense(t);
+      if (t !== undefined && t.trim().length > 0) {
+        if (!isSyntheticUserText(t)) {
+          if (firstMessage === undefined) firstMessage = condense(t);
+        } else if (commandFallback === undefined) {
+          const name = (COMMAND_NAME_RE.exec(t)?.[1] ?? '').trim();
+          // `/clear` 不是任务名，不能拿它当标题；其余命令（含带参的 /drive-fix）照收。
+          if (name.length > 0 && name !== '/clear') {
+            const args = (COMMAND_ARGS_RE.exec(t)?.[1] ?? '').trim();
+            commandFallback = condense(`${name} ${args}`.trim());
+          }
+        }
       }
     }
     if (cwd !== undefined && firstMessage !== undefined) break;
   }
 
+  // 真实文本优先；没有它才退回命令兜底（两者都没有则保持 undefined）。
+  const first = firstMessage ?? commandFallback;
   return {
     ...(cwd !== undefined ? { cwd } : {}),
-    ...(firstMessage !== undefined ? { firstMessage } : {}),
+    ...(first !== undefined ? { firstMessage: first } : {}),
   };
 }
 

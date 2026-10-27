@@ -12,6 +12,16 @@ import { ActivityTracker } from './activityTracker';
 import { TaskTitleCache } from './taskTitles';
 import { sessionNameFor } from './core/tmux';
 import { Log } from './log';
+import { findConversationFile } from './conversationFiles';
+import { expandHome } from './core/paths';
+import { SessionPreviewController } from './sessionPreview';
+import { SocietyStore } from './societyStore';
+import { SocietyTreeProvider, SocietyTreeItem, RoleTreeItem } from './societyTree';
+import { SocietyCommands } from './societyCommands';
+import { writeGlobalRoster } from './roster';
+import { ensureSendScript } from './messaging';
+import { ensureTaskScript } from './taskLine';
+import { ensureDevRequestScript } from './devRequest';
 
 let pollTimer: NodeJS.Timeout | undefined;
 let activityTimer: NodeJS.Timeout | undefined;
@@ -126,6 +136,12 @@ function activateInner(context: vscode.ExtensionContext, log: Log): void {
   // 二级行首那条竖线是同一批颜色、同一个目录下的两批文件）。
   const manager = new TerminalManager(store, tmux, titles, () => provider.refresh(), colorIcons);
 
+  // 会话正文预览面板。**控制器进订阅表**（面板本身不进）：面板被用户关掉
+  // 之后控制器仍然可用，下一次右键还能重建一个；而扩展卸载时要靠 dispose()
+  // 解除 fs.watchFile，否则它会拖着一个已死的 webview 继续每秒 stat 文件。
+  const previewController = new SessionPreviewController(context.extensionUri);
+  context.subscriptions.push(previewController);
+
   // 把清单里已有的颜色**先落盘再渲染**：`iconFor` 只拼路径、不同步读盘
   // （渲染路径不能有 IO），文件不到位时那一行的竖线会短暂空着 —— 不报错，
   // 只是看起来「颜色丢了」。这里在第一次 getChildren 之前把这一批补上，
@@ -171,6 +187,74 @@ function activateInner(context: vscode.ExtensionContext, log: Log): void {
     showCollapseAll: false,
   });
   context.subscriptions.push(batchView);
+
+  // society（协作模式）视图。数据层与终端清单解耦：society.json 独立于
+  // terminals.json，角色通过 terminalEntryId 关联到终端条目，起终端仍复用
+  // manager.openSession。视图默认隐藏，靠 societyEnter/societyLeave 切 setContext。
+  const societyFile = path.join(context.globalStorageUri.fsPath, 'society.json');
+  const societyStore = new SocietyStore(
+    societyFile,
+    () => {
+      void vscode.window.showWarningMessage(
+        `society 清单文件无法解析，原始内容已保留为 ${societyFile}.corrupt。`,
+      );
+    },
+  );
+  const societyProvider = new SocietyTreeProvider(societyStore);
+  const societyCommands = new SocietyCommands(societyStore, store, manager);
+  const societyView = vscode.window.createTreeView('tmuxTerminals.society', {
+    treeDataProvider: societyProvider,
+  });
+  context.subscriptions.push(societyView);
+  // 初始上下文设为 false：默认进终端清单模式。设一次让 key 明确存在，
+  // 而不是靠 undefined（falsy）兜底。
+  void vscode.commands.executeCommand('setContext', 'tmuxTerminals.societyMode', false);
+
+  // 全局身份表：把「角色 → 终端条目 → tmux 会话/对话」的实时快照渲染成
+  // <rootDir>/.society/global.md，供各 AI 角色找彼此时读。写失败只告警不阻断
+  // 调用方（典型是存活轮询）—— 身份表是辅助物，坏了不致命。
+  const writeRosters = async (alive?: ReadonlySet<string>): Promise<void> => {
+    const aliveSet = alive ?? new Set(await tmux.listSessions());
+    const entries = await store.load();
+    societyProvider.updateEntries(entries);
+    for (const s of societyStore.load()) {
+      try {
+        writeGlobalRoster(s, entries, aliveSet);
+        ensureSendScript(s.rootDir);
+        ensureTaskScript(s.rootDir);
+        ensureDevRequestScript(s.rootDir);
+        await societyCommands.processDevRequests(s);
+      } catch (err) {
+        log.warn(`写 society 辅助文件失败（${s.name}）：${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  };
+
+  // society 侧边栏的独立轮询。society 模式下 list 视图隐藏、上面的 poll 停了，
+  // 但这棵树要显示「忙/空闲」「最后一条消息」和全局身份表，必须有自己的心跳。
+  // 与 poll 共用 pollInterval 配置；view 不可见时同样不装定时器。
+  let societyTimer: NodeJS.Timeout | undefined;
+  const pollSociety = async (): Promise<void> => {
+    await writeRosters();
+    societyProvider.refresh();
+  };
+  const restartSocietyPolling = (): void => {
+    if (societyTimer) clearInterval(societyTimer);
+    societyTimer = undefined;
+    const interval = cfg().get<number>('pollInterval', 10000);
+    if (interval > 0 && societyView.visible) {
+      societyTimer = setInterval(() => void pollSociety(), interval);
+    }
+    void pollSociety();
+  };
+  context.subscriptions.push(
+    societyView.onDidChangeVisibility((e) => {
+      if (e.visible) restartSocietyPolling();
+      else if (societyTimer) { clearInterval(societyTimer); societyTimer = undefined; }
+    }),
+    new vscode.Disposable(() => { if (societyTimer) clearInterval(societyTimer); }),
+  );
+  restartSocietyPolling();
 
   // v1→v2 迁移前先备份一次用户数据。只在文件真的是 v1 形态时备份，且
   // 已有 .bak 不覆盖 —— 第一次的备份才是原始数据。备份失败只静默：读文件
@@ -229,6 +313,7 @@ function activateInner(context: vscode.ExtensionContext, log: Log): void {
     const sessionList = await tmux.listSessions();
     lastPollSessions = sessionList.length;
     provider.setAlive(new Set(sessionList));
+    await writeRosters(new Set(sessionList));
     const entries = await store.load();
     lastPollEntries = entries.length;
     // 这一拍**还要观测并改绑**。`fresh` 首启（0.1.6）把「绑定天然可信」
@@ -551,6 +636,49 @@ function activateInner(context: vscode.ExtensionContext, log: Log): void {
     }
   });
 
+  reg('tmuxTerminals.previewSession', async (arg: unknown) => {
+    // 1) 从右键菜单传进来的会话行直接取
+    const it = sessionItem(arg);
+    let entry = it?.entry;
+    let slot = it?.slot;
+
+    // 2) 从命令面板调用时没有实参：用当前活动终端反查它属于哪个槽。
+    //    宿主重载后 terminalManager 的内存 Map 已清空，反查会失败 —— 此时**绝不按
+    //    显示名猜槽 id**（猜错就会预览到别人的对话），提示用户改用右键。
+    if (slot === undefined) {
+      const term = vscode.window.activeTerminal;
+      const slotId = term === undefined ? undefined : manager.slotIdForTerminal(term);
+      if (slotId !== undefined) {
+        for (const e of await store.load()) {
+          const s = e.sessions.find((x) => x.id === slotId);
+          if (s !== undefined) { entry = e; slot = s; break; }
+        }
+      }
+    }
+
+    if (entry === undefined || slot === undefined) {
+      void vscode.window.showInformationMessage('请从侧边栏的会话行右键执行「预览会话内容」。');
+      return;
+    }
+
+    // liveSessionId = 亲眼看到正在跑的会话；conversationId = 下次要接回的会话。
+    // 预览当然要看「现在正在跑的那条」。
+    const id = slot.liveSessionId ?? slot.conversationId;
+    if (id === undefined || id.length === 0) {
+      void vscode.window.showInformationMessage('这个会话还没有对话记录。');
+      return;
+    }
+
+    const home = os.homedir();
+    const file = await findConversationFile(home, id, expandHome(entry.cwd, home));
+    if (file === undefined) {
+      void vscode.window.showInformationMessage('找不到这条对话的记录文件。');
+      return;
+    }
+
+    await previewController.show({ file, title: `预览 · ${entry.name}` });
+  });
+
   reg('tmuxTerminals.add', async () => {
     await manager.addEntryInteractive();
     provider.refresh();
@@ -693,6 +821,17 @@ function activateInner(context: vscode.ExtensionContext, log: Log): void {
     await poll();
   });
 
+  reg('tmuxTerminals.restartAll', async () => {
+    await manager.restartAll();
+    await poll();
+  });
+
+  reg('tmuxTerminals.clearAllAutoRestore', async () => {
+    await manager.clearAllAutoRestore();
+    provider.refresh();
+    batchProvider.refresh();
+  });
+
   reg('tmuxTerminals.refresh', async () => {
     await reconcileNow(); // 触发点之一：用户按 ⟳「只重查存活状态」
     await poll();
@@ -753,6 +892,50 @@ function activateInner(context: vscode.ExtensionContext, log: Log): void {
     batchProvider.clear();
     await poll();
     provider.refresh();
+  });
+
+  // ---- society 协作模式 ----
+  // 进入/退出协作视图：只切上下文，视图的显示由 package.json 里 views 的 when 决定。
+  reg('tmuxTerminals.societyEnter', async () => {
+    await vscode.commands.executeCommand('setContext', 'tmuxTerminals.societyMode', true);
+  });
+  reg('tmuxTerminals.societyLeave', async () => {
+    await vscode.commands.executeCommand('setContext', 'tmuxTerminals.societyMode', false);
+  });
+
+  reg('tmuxTerminals.societyCreate', async () => {
+    await societyCommands.createSociety();
+    societyProvider.refresh();
+    await writeRosters();
+  });
+
+  // 角色创建会同时改 terminals.json（store.append）与 society.json（societyStore.update），
+  // 所以两个树都要刷。manager 起终端时已自带 entry 树的 refresh，这里只补 society 树。
+  reg('tmuxTerminals.societyAddRole', async (arg: unknown) => {
+    if (arg instanceof SocietyTreeItem) {
+      await societyCommands.addRole(arg.society);
+      societyProvider.refresh();
+      await writeRosters();
+    }
+  });
+
+  reg('tmuxTerminals.societyOpenRole', async (arg: unknown) => {
+    if (arg instanceof RoleTreeItem) await societyCommands.openRole(arg.role);
+  });
+
+  reg('tmuxTerminals.societyRecover', async (arg: unknown) => {
+    if (arg instanceof SocietyTreeItem) {
+      await societyCommands.recoverSociety(arg.society);
+      await writeRosters();
+    }
+  });
+
+  reg('tmuxTerminals.societyRemoveRole', async (arg: unknown) => {
+    if (arg instanceof RoleTreeItem) {
+      await societyCommands.removeRole(arg.society, arg.role);
+      societyProvider.refresh();
+      await writeRosters();
+    }
   });
 
   // 激活收尾汇总。**放在真正的最末尾**（而不是三行轮询启动之后）：命令是

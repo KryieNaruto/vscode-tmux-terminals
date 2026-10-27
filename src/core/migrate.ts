@@ -107,6 +107,7 @@ export function migrateEntry(raw: unknown, index: number): TerminalEntry | undef
       id, name, cwd, profile,
       ...opt('model', model),
       ...opt('color', color),
+      ...opt('systemPromptFile', nonEmpty(o.systemPromptFile)),
       sessions: slots,
       autoRestore: o.autoRestore === true,
       order: typeof o.order === 'number' ? o.order : index,

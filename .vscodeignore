@@ -8,3 +8,4 @@ out/test/**
 **/*.map
 tsconfig.json
 .mocharc.json
+scripts/**

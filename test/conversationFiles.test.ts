@@ -319,6 +319,46 @@ describe('readFirstMessage —— 读头部取首条真实用户消息（标题�
     assert.strictEqual(await readFirstMessage(file), undefined);
   });
 
+  it('★ 首条真实消息落在 64 KB 之后（前面是大 attachment）→ 放大窗口后仍能读到', async () => {
+    // 实测有会话前 68 KB 全是 attachment 记录，固定 64 KB 窗口直接读到 undefined。
+    const home = await mk({
+      [`-ssd-foo/${UUID}.jsonl`]: [
+        line({ type: 'attachment', cwd: '/ssd/foo', attachment: { pad: 'x'.repeat(70 * 1024) } }),
+        userLine('<command-name>/clear</command-name>', '/ssd/foo'),
+        userLine('把那个 bug 修了', '/ssd/foo'),
+      ].join('\n'),
+    });
+    const file = path.join(home, '.claude', 'projects', '-ssd-foo', `${UUID}.jsonl`);
+    assert.strictEqual(await readFirstMessage(file), '把那个 bug 修了');
+  });
+
+  it('只有斜杠命令（/drive-fix + args）→ 用命令本身兜底，不返回 undefined', async () => {
+    // 这类会话没有真实用户文本、claude 也不生成 ai-title；命令名是唯一的人话来源。
+    const home = await mk({
+      [`-ssd-foo/${UUID}.jsonl`]: [
+        line({ type: 'attachment', cwd: '/ssd/foo' }),
+        userLine(
+          '<command-name>/drive-fix</command-name>\n<command-args>bug-460 461</command-args>',
+          '/ssd/foo',
+        ),
+      ].join('\n'),
+    });
+    const file = path.join(home, '.claude', 'projects', '-ssd-foo', `${UUID}.jsonl`);
+    assert.strictEqual(await readFirstMessage(file), '/drive-fix bug-460 461');
+  });
+
+  it('Skill 注入的 "Base directory for this skill: …" 不能当首条消息', async () => {
+    const home = await mk({
+      [`-ssd-foo/${UUID}.jsonl`]: [
+        line({ type: 'attachment', cwd: '/ssd/foo' }),
+        userLine('<command-name>/drive-fix</command-name>', '/ssd/foo'),
+        userLine('Base directory for this skill: /x/y', '/ssd/foo'),
+      ].join('\n'),
+    });
+    const file = path.join(home, '.claude', 'projects', '-ssd-foo', `${UUID}.jsonl`);
+    assert.strictEqual(await readFirstMessage(file), '/drive-fix');
+  });
+
   it('文件不存在 → undefined，不抛（读盘失败即这条来源不存在）', async () => {
     const home = await mk({});
     const file = path.join(home, '.claude', 'projects', '-ssd-foo', `${UUID}.jsonl`);

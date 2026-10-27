@@ -2,7 +2,7 @@
   "name": "vscode-tmux-terminals",
   "displayName": "Tmux Terminals",
   "description": "一键恢复 Remote-SSH 断开后的终端工作区",
-  "version": "0.2.15",
+  "version": "0.2.28",
   "publisher": "KryieNaruto",
   "license": "MIT",
   "repository": {
@@ -36,11 +36,18 @@
       "tmuxTerminals": [
         {
           "id": "tmuxTerminals.list",
-          "name": "终端清单"
+          "name": "终端清单",
+          "when": "!tmuxTerminals.societyMode"
         },
         {
           "id": "tmuxTerminals.batch",
-          "name": "批量操作"
+          "name": "批量操作",
+          "when": "!tmuxTerminals.societyMode"
+        },
+        {
+          "id": "tmuxTerminals.society",
+          "name": "协作社会",
+          "when": "tmuxTerminals.societyMode"
         }
       ]
     },
@@ -111,6 +118,16 @@
         "icon": "$(history)"
       },
       {
+        "command": "tmuxTerminals.restartAll",
+        "title": "重启全部参与恢复的终端",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "tmuxTerminals.clearAllAutoRestore",
+        "title": "取消全部「参与全部恢复」",
+        "icon": "$(circle-slash)"
+      },
+      {
         "command": "tmuxTerminals.refresh",
         "title": "刷新状态",
         "icon": "$(refresh)"
@@ -157,6 +174,46 @@
       {
         "command": "tmuxTerminals.batchToggleFolder",
         "title": "切换文件夹选中（内部）"
+      },
+      {
+        "command": "tmuxTerminals.previewSession",
+        "title": "预览会话内容",
+        "icon": "$(preview)"
+      },
+      {
+        "command": "tmuxTerminals.societyEnter",
+        "title": "协作视图",
+        "icon": "$(organization)"
+      },
+      {
+        "command": "tmuxTerminals.societyLeave",
+        "title": "终端清单",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "tmuxTerminals.societyCreate",
+        "title": "新建 society",
+        "icon": "$(add)"
+      },
+      {
+        "command": "tmuxTerminals.societyAddRole",
+        "title": "添加角色",
+        "icon": "$(person-add)"
+      },
+      {
+        "command": "tmuxTerminals.societyOpenRole",
+        "title": "打开角色终端",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "tmuxTerminals.societyRecover",
+        "title": "一键恢复",
+        "icon": "$(history)"
+      },
+      {
+        "command": "tmuxTerminals.societyRemoveRole",
+        "title": "删除角色",
+        "icon": "$(trash)"
       }
     ],
     "menus": {
@@ -167,13 +224,43 @@
           "group": "navigation@1"
         },
         {
-          "command": "tmuxTerminals.add",
+          "command": "tmuxTerminals.restartAll",
           "when": "view == tmuxTerminals.list",
           "group": "navigation@2"
         },
         {
+          "command": "tmuxTerminals.clearAllAutoRestore",
+          "when": "view == tmuxTerminals.list",
+          "group": "navigation@3"
+        },
+        {
+          "command": "tmuxTerminals.add",
+          "when": "view == tmuxTerminals.list",
+          "group": "navigation@4"
+        },
+        {
           "command": "tmuxTerminals.refresh",
           "when": "view == tmuxTerminals.list",
+          "group": "navigation@5"
+        },
+        {
+          "command": "tmuxTerminals.societyEnter",
+          "when": "view == tmuxTerminals.list",
+          "group": "navigation@6"
+        },
+        {
+          "command": "tmuxTerminals.societyLeave",
+          "when": "view == tmuxTerminals.society",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tmuxTerminals.societyCreate",
+          "when": "view == tmuxTerminals.society",
+          "group": "navigation@2"
+        },
+        {
+          "command": "tmuxTerminals.societyRecover",
+          "when": "view == tmuxTerminals.society",
           "group": "navigation@3"
         },
         {
@@ -254,6 +341,11 @@
           "group": "2_edit@6"
         },
         {
+          "command": "tmuxTerminals.previewSession",
+          "when": "view == tmuxTerminals.list && (viewItem == sessionAlive || viewItem == sessionDead)",
+          "group": "2_view@1"
+        },
+        {
           "command": "tmuxTerminals.killSession",
           "when": "view == tmuxTerminals.list && viewItem == terminal",
           "group": "1_close@1"
@@ -267,6 +359,26 @@
           "command": "tmuxTerminals.delete",
           "when": "view == tmuxTerminals.list && viewItem == terminal",
           "group": "3_danger@2"
+        },
+        {
+          "command": "tmuxTerminals.societyAddRole",
+          "when": "view == tmuxTerminals.society && viewItem == society",
+          "group": "inline@1"
+        },
+        {
+          "command": "tmuxTerminals.societyRecover",
+          "when": "view == tmuxTerminals.society && viewItem == society",
+          "group": "inline@2"
+        },
+        {
+          "command": "tmuxTerminals.societyOpenRole",
+          "when": "view == tmuxTerminals.society && viewItem == societyRole",
+          "group": "inline@1"
+        },
+        {
+          "command": "tmuxTerminals.societyRemoveRole",
+          "when": "view == tmuxTerminals.society && viewItem == societyRole",
+          "group": "3_danger@1"
         }
       ],
       "commandPalette": [
@@ -306,13 +418,16 @@
     "watch": "tsc -watch -p ./",
     "test": "npm run compile && mocha \"out/test/**/*.test.js\"",
     "e2e": "npm run compile && node test/e2e-harness.js",
-    "package": "vsce package"
+    "package": "vsce package",
+    "copy:katex": "node scripts/copy-katex.js",
+    "vscode:prepublish": "npm run compile && npm run copy:katex"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.6",
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^2.22.0",
+    "katex": "0.16.21",
     "mocha": "^10.3.0",
     "typescript": "^5.3.3"
   }

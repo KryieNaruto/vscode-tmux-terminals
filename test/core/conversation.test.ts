@@ -159,6 +159,12 @@ describe('isSyntheticUserText —— 斜杠命令的合成包裹消息', () => {
     assert.strictEqual(isSyntheticUserText(`${CAVEAT}\n顺便把那个 bug 也修了`), false);
   });
 
+  it('Skill 工具注入的 "Base directory for this skill: …" → 合成', () => {
+    assert.strictEqual(isSyntheticUserText('Base directory for this skill: /ssd/x/y'), true);
+    // 只按 trim 后开头判：正文中间引用这句是在提问，不能误杀
+    assert.strictEqual(isSyntheticUserText('这句里的 Base directory for this skill: /x 是什么？'), false);
+  });
+
   it('空串 / 纯空白同样算「不是用户敲的话」', () => {
     assert.strictEqual(isSyntheticUserText(''), true);
     assert.strictEqual(isSyntheticUserText('  \n\t '), true);

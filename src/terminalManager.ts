@@ -1077,6 +1077,51 @@ export class TerminalManager {
     })();
   }
 
+  /**
+   * 一键重启**所有参与「全部恢复」的终端**：杀掉它们的全部 tmux 会话，再走
+   * 与 `restoreAll` 完全相同的重建路径。
+   *
+   * 为什么是「杀 + 恢复」而不是别的：
+   *  - `killSlot` **不动 store**，槽与 `conversationId` 原样保留，所以重建后
+   *    `openSession → resolveLaunchSpec` 自然带 `--resume` 接回**同一条对话**；
+   *  - 真正卡死的往往是 tmux 会话本身（pane 僵住、前台进程挂住），只重启
+   *    claude 救不回来 —— 用户要的是「全推倒重来」。
+   *
+   * 先杀完整批再统一拉起：边杀边拉会让 `openSession` 趁别的槽还没杀完时
+   * attach 到旧会话上，重启就变成了一半。
+   *
+   * 破坏性（会话里的进程会终止，包括正在跑的编译）→ 必须先过确认框。
+   */
+  async restartAll(): Promise<void> {
+    const entries = (await this.store.load()).filter((e) => e.autoRestore);
+    if (entries.length === 0) {
+      void vscode.window.showInformationMessage('没有标记为「参与全部恢复」的条目。');
+      return;
+    }
+    const total = entries.reduce((n, e) => n + e.sessions.length, 0);
+    if (total === 0) {
+      void vscode.window.showInformationMessage(
+        '标记为「参与全部恢复」的条目下都没有会话，没有可重启的终端。',
+      );
+      return;
+    }
+    const pick = await vscode.window.showWarningMessage(
+      `重启 ${entries.length} 个参与「全部恢复」的终端下的 ${total} 个会话？\n` +
+      `其中正在运行的进程（包括编译）会被终止；会话槽与对话绑定保留，` +
+      `claude 会按绑定 --resume 接回原对话。`,
+      { modal: true },
+      '重启',
+    );
+    if (pick !== '重启') return;
+
+    for (const e of entries) {
+      for (const slot of e.sessions) {
+        await this.killSlot(sessionNameFor(slot.id));
+      }
+    }
+    this.restoreAll();
+  }
+
   // ---- 切模型 / 切 profile（运行中立即生效） ----
 
   /**
@@ -1655,6 +1700,17 @@ export class TerminalManager {
   }
 
   /**
+   * 删条目但不弹确认框（确认由调用方负责）。society 删除角色复用：角色删除时
+   * 已经弹过「删除角色」确认，这里再弹「删除终端」会重复打断。
+   */
+  async removeEntryQuietly(entry: TerminalEntry): Promise<void> {
+    for (const slot of entry.sessions) {
+      await this.killSlot(sessionNameFor(slot.id));
+    }
+    await this.store.remove(entry.id);
+  }
+
+  /**
    * 删除整个终端条目：**递归杀掉其下每一个会话**，然后移除条目。
    *
    * 「远端 tmux 会话不受影响」是 0.1.8 的行为，本轮**反过来了** —— 删了条目
@@ -1793,6 +1849,35 @@ export class TerminalManager {
 
   async toggleAutoRestore(entry: TerminalEntry): Promise<void> {
     await this.store.update(entry.id, { autoRestore: !entry.autoRestore });
+  }
+
+  /**
+   * 一键取消**所有**条目的「参与全部恢复」标记。
+   *
+   * 逐条走 `store.update` 而不是「load → 改 → save」：`update` 在存储锁内
+   * 重新读盘再写，N 次串行虽然多几次写，但不会与其它入口的并发写互相覆盖。
+   */
+  async clearAllAutoRestore(): Promise<void> {
+    const all = await this.store.load();
+    const marked = all.filter((e) => e.autoRestore);
+    if (marked.length === 0) {
+      void vscode.window.showInformationMessage('当前没有标记为「参与全部恢复」的条目。');
+      return;
+    }
+    const pick = await vscode.window.showWarningMessage(
+      `取消全部 ${marked.length} 个条目的「参与全部恢复」？\n` +
+      `取消后「全部恢复」与「重启全部」都不会再处理它们；仍可右键单个条目重新勾选。`,
+      { modal: true },
+      '取消全部',
+    );
+    if (pick !== '取消全部') return;
+
+    for (const e of marked) {
+      await this.store.update(e.id, { autoRestore: false });
+    }
+    void vscode.window.showInformationMessage(
+      `已取消 ${marked.length} 个条目的「参与全部恢复」。`,
+    );
   }
 
   // ---- 输入辅助 ----

@@ -21,8 +21,12 @@ import {
  */
 
 /**
- * 头部读取上限。实测首条用户消息落在 ~20 KB 处（前面是体积较大的
- * attachment 行），64 KB 留了 3 倍余量。
+ * 头部读取的**默认**窗口（给 cwd 定位 / 列表用）。
+ *
+ * 注意它不再是「首条用户消息一定在窗口内」的保证：实测有会话的前 68 KB 全是
+ * attachment 记录，首条真实用户消息落在 ~70 KB。故 readFirstMessage 会按
+ * `[HEAD_BYTES, 256 KB, 1 MB]` 逐步放大窗口；这个常量仍是 cwd 定位与列表的
+ * 默认窗口，不要为了那个极端情形把它整体调大（会让 293 个文件白读几百 MB）。
  */
 const HEAD_BYTES = 64 * 1024;
 
@@ -104,13 +108,23 @@ export async function readTail(file: string, bytes: number): Promise<string> {
 }
 
 /**
- * 读一条对话的**首条真实用户消息**（跳过 `/clear` 之类合成包裹的命令回显），
- * 只读文件头部 HEAD_BYTES。
+ * 读一条对话的**首条真实用户消息**（跳过 `/clear` 之类合成包裹的命令回显；
+ * 首条输入就是斜杠命令的会话退回命令本身，见 parseConversationHead）。
  *
  * **为什么要它**：首条输入是斜杠命令的会话（比如用户按 `/clear` 开新任务），
  * claude **永不生成** ai-title —— 本机实测 12/12 条这类 transcript 里 ai-title
  * 出现 0 次，于是这些槽没有名字可显示。首条用户消息是唯一还能给出人话的来源，
  * 而且它就是用户自己敲的字，不算「把不知道伪装成知道」。
+ *
+ * **为什么要逐步放大窗口**：实测首条真实消息会落在 64 KB 之后（前面全是
+ * attachment 记录，可达 68 KB）。固定 64 KB 会直接读到 undefined、退化成
+ * 「未命名会话」。先按 HEAD_BYTES 读（绝大多数文件在第一次就命中），读不到再
+ * 放大到 256 KB / 1 MB —— 只有少数异常文件会多读。
+ *
+ * EOF 判据用 `Buffer.byteLength(text)` 而**不是** `text.length`：后者是字符数，
+ * 中文时远小于字节数，会把「窗口读满了」误判成「文件读完了」，从而提前放弃
+ * 放大窗口。byteLength 还原出来就是实际读到的字节数（末字被截断时可能多出
+ * 1~2 字节，只会让它更保守地继续读），不必为此改 readHead 的签名。
  *
  * 注意【两套窗口不要混】：`ai-title` 是**追加**记录、必须读尾部；首条用户消息
  * 一定在头部。两者各读各的文件窗口。
@@ -120,7 +134,13 @@ export async function readTail(file: string, bytes: number): Promise<string> {
  */
 export async function readFirstMessage(file: string): Promise<string | undefined> {
   try {
-    return parseConversationHead(await readHead(file, HEAD_BYTES)).firstMessage;
+    for (const bytes of [HEAD_BYTES, 256 * 1024, 1024 * 1024]) {
+      const text = await readHead(file, bytes);
+      const first = parseConversationHead(text).firstMessage;
+      if (first !== undefined) return first;
+      if (Buffer.byteLength(text, 'utf8') < bytes) return undefined; // 已读到 EOF，再放大也是同样内容
+    }
+    return undefined;
   } catch {
     return undefined; // 文件读不到 = 这条来源不存在
   }

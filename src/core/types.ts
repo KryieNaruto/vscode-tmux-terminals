@@ -81,6 +81,12 @@ export interface TerminalEntry {
   /** 空/未设 = 用该 profile 的默认模型 */
   model?: string;
   /**
+   * 可选：claude 启动时经 `--append-system-prompt-file` 注入的文本文件**绝对路径**。
+   * 仅 society 角色条目使用 —— 角色的 CLAUDE.md 埋在 cwd 的 `.society/roles/<id>/`
+   * 子目录里，claude 启动不会自动加载它，必须显式注入。
+   */
+  systemPromptFile?: string;
+  /**
    * 二级行首竖线的颜色（`#rrggbb`，小写）。未设 = 中性竖线。
    * 只由 setColorInteractive 写入，且**必过 normalizeHexColor** —— 否则
    * 同一个颜色会在清单里出现两种写法、图标也会落成两个文件。
